@@ -50,6 +50,23 @@ pi install git:github.com/italian-brainrot/my-pi-extensions
 pi install git:github.com/italian-brainrot/my-pi-extensions@v1.0.0   # pinned tag
 ```
 
+## Concurrent pi processes share the agent directory
+
+Every pi you start loads the same installed extensions against the same agent directory: the
+interactive session, a `pi -p` from a script, an RPC session, and the nested pi a `subagent` call
+spawns. Nothing in the install chain separates them — there is no per-session or per-project scope to
+enable. That is invisible until an extension keeps state under the agent directory.
+
+`pi-bg-tasks` does exactly that, with its job metadata in `<agent-dir>/bg-tasks`. Without ownership
+markers every process adopts every live sidecar it finds there, so a nested pi stopped the commands
+its parent session was running (fixed in 0.1.1; the behaviour is documented in the
+[package README](../packages/pi-bg-tasks/README.md)). Each sidecar now records `ownerPid`, and
+adoption, shutdown, and log pruning all skip entries another live process owns.
+
+The same rule applies to anything added later: mark what you write with its owner, and leave other
+owners alone. `adoptJobs` and `pruneRetention` in `packages/pi-bg-tasks/src/index.ts` are the working
+example, and `packages/pi-bg-tasks/test/cross-process.test.ts` is how it is guarded.
+
 ## Dependencies: peers, never copies
 
 Pi provides these modules to extensions:

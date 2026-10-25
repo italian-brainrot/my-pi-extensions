@@ -77,8 +77,9 @@ they return only the task text.
 
 ### Background jobs survive a reload
 
-Job state (pid and log path) is written next to the log, so `/reload`, `/new`, `/resume`, and
-`/fork` re-adopt jobs that are still alive and `bg_stop` and `bg_wait` keep working afterwards.
+Job state (pid, log path, and owning process) is written next to the log, so `/reload`, `/new`,
+`/resume`, and `/fork` re-adopt jobs that are still alive and `bg_stop` and `bg_wait` keep working
+afterwards.
 
 | Setting                    | Default              | Effect                                                                                                 |
 | -------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -86,6 +87,28 @@ Job state (pid and log path) is written next to the log, so `/reload`, `/new`, `
 
 Logs live in `<agent-dir>/bg-tasks` and are pruned when older than 3 days, or beyond the newest
 100 of them. A job that this runtime is still tracking is never pruned.
+
+### Commands belong to the session that started them
+
+`<agent-dir>/bg-tasks` is shared by every pi process: a nested `pi -p`, an RPC session, and the
+`pi -p` that `subagent` spawns all load this extension against the same directory. Each sidecar
+records the pid of the process that started the command, and:
+
+- a session ignores commands another live session owns — it does not adopt them, stop them, or prune
+  their logs and metadata;
+- a session **does** take over commands whose owning process is gone (the dev server a crashed session
+  left behind), claims them, and stops them at its own shutdown;
+- a session that re-adopts commands it started itself — after a crash, where the old process died
+  without stopping them — claims their sidecars so it can stop them next time.
+
+Sidecars written before 0.1.1 carry no marker, and the process table answers the same question for
+them: a command whose parent process is still alive belongs to that runtime, one reparented to init
+lost its owner. Where the process table cannot be read, an unmarked command is left alone rather than
+guessed at.
+
+Before 0.1.1 there was no ownership information, so every runtime adopted everything it found: a
+nested pi killed its parent session's running commands when it exited. If you see that on an older
+version, upgrade.
 
 ### Variables available to commands
 

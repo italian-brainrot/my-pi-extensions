@@ -8,10 +8,10 @@ test harness, shared tooling, and a single install for the whole set.
 
 ## Extensions
 
-| Package                                 | What it does                                                                                         | Adds                                                                                     |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, and stay reachable across reloads. | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
-| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.    | `subagent`                                                                               |
+| Package                                 | What it does                                                                                                                                  | Adds                                                                                     |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them. | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
+| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                             | `subagent`                                                                               |
 
 Read each package's README for parameters, environment variables, and behaviour details.
 

@@ -34,6 +34,12 @@ extension entry so one install loads the set.
    workflow.
 8. **Do not touch my personal Pi configuration** (`~/.pi/agent/settings.json`,
    `~/.pi/agent/extensions/`) unless I ask. Development runs through `npm run dev`.
+9. **The agent directory is shared by every pi process.** A nested `pi -p`, an RPC session, and a
+   `subagent` child all load these extensions against the same `<agent-dir>`. Anything written under
+   it must say which process owns it, and must leave entries owned by another live process alone —
+   never assume you are the only writer. `pi-bg-tasks` records `ownerPid` in its sidecars for this
+   reason (and reads the parent process out of `/proc` for sidecars written before that field
+   existed); `adoptJobs` and `pruneRetention` are the places to look.
 
 ## Layout worth knowing
 
@@ -51,6 +57,12 @@ extension entry so one install loads the set.
 
 - `pi-bg-tasks` **replaces the built-in `bash` tool**; its tests spawn real processes. Timing
   assertions need margin for CI.
+- `pi-bg-tasks` keeps a per-runtime job registry, and a command outlives the call that started it, so
+  the shutdown contract matters twice over: a real kill must be observable through `bg_wait`,
+  `bg_stop`, the log, and the process table; a session swap (`/new`, `/resume`, `/fork`) must leave
+  running commands running; and a session swap must not leave two lifetimes of cleanup racing over
+  the same command (the SIGTERM grace timer is deliberately ref'd, and the next `session_start`
+  cancels a pending kill). `test/lifecycle.test.ts` covers all three.
 - `pi-subagent` spawns a nested `pi`; tests use `test/fixtures/fake-pi.mjs` and override
   `process.argv[1]` through `withPiArgv`.
 - Both read configuration at module load, so a second `loadExtension()` in one test file needs

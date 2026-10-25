@@ -96,6 +96,16 @@ per-component costs, and that context size is the largest single response rather
   real `pi` session with `npm run dev`.
 - **Kill timers keep the process alive.** `pi-bg-tasks` deliberately does not unref its SIGTERM grace
   timer, so a worker can sit for a few seconds after stopping a job. Vitest's teardown allows it.
+- **Behaviour that lives per runtime needs a second process.** A cross-session bug — one pi process
+  reaching into another's state — cannot be reproduced inside one runtime, because each load has its
+  own module registry. Spawn a fixture that loads the same entry in its own process:
+  `packages/pi-bg-tasks/test/fixtures/foreign-runtime.mjs` drives `test/cross-process.test.ts`.
+- **`kill(pid, 0)` says yes to a zombie.** A signalled child stays in the process table until its
+  parent reaps it, and killing a zombie succeeds. So a liveness assertion can pass on a command that
+  was already killed. `isAlive` in `test/helpers/wait.ts` reads `/proc/<pid>/stat` and treats `Z` as
+  finished (the extension does the same). Run helper processes with `spawn` + await `close`, not
+  `spawnSync`: `spawnSync` blocks this runtime's event loop, its children are not reaped, and every
+  killed job looks alive.
 - **Timings are assertions too.** Prefer `waitFor` polling to fixed sleeps, and give timing-based
   assertions (the blocking mutex test) a margin wide enough for a loaded CI runner.
 - **Do not add a build step.** Sources are TypeScript loaded through jiti; Vitest transforms them for
