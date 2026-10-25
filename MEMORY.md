@@ -26,7 +26,8 @@
    the event and assert on what it changed.
 5. **Every behaviour change needs a test** in the owning package. Model-facing text (tool
    descriptions, result text, injected prompt text) is part of the interface: change it deliberately
-   and assert it.
+   and assert it — but import prompt text from the extension instead of copying it into a test, and
+   assert the structure around it (order, tags, placement), so rewording is an edit and not a failure.
 6. **READMEs document behaviour**, not code structure: what each tool does, its parameters,
    environment variables, and failure modes. Update the package README and the root table together.
 7. **The agent directory is shared by every pi process.** A nested `pi -p`, an RPC session, and a
@@ -70,17 +71,23 @@
   cancels a pending kill). `test/lifecycle.test.ts` covers all three.
 - `pi-subagent` spawns a nested `pi`; tests use `test/fixtures/fake-pi.mjs` and override
   `process.argv[1]` through `withPiArgv`.
-- `pi-memory` registers no tools: it handles `before_agent_start`, appends `<agent-dir>/MEMORY.md`
-  and every ancestor `MEMORY.md` to `systemPromptOptions.contextFiles` (which is what renders
-  `<project_instructions>` blocks inside `<project_context>`), and is a complete no-op when no such
-  file exists. It re-reads the files on every run rather than caching them, so edits land on the next
-  prompt as a prompt-section delta. Its injected note is asserted verbatim in
-  `test/injection.test.ts`, and one test asserts Pi's own `loadProjectContextFiles` still does not
-  return `MEMORY.md` — if that ever changes, the extension has to be rethought, not patched.
-- Pi's own section rendering is not exported, so no unit test can assert the final prompt text. The
-  cheap end-to-end check is a scratch directory with a canary line in its `MEMORY.md` and
-  `pi --no-session -p "quote the line that starts with CANARY… and its path; no tools"`: the line
-  comes back with the file's absolute path inside a `project_instructions` block, and the same run
-  in a directory with no `MEMORY.md` reports no such block at all — that is the no-op contract.
+- `pi-memory` registers no tools: it handles `before_agent_start` and writes the `MEMORY.md` it finds
+  (`<agent-dir>` plus every ancestor) into `systemPromptOptions.sections.assistant_memory`, which Pi
+  renders as its own section (last, after `<cwd>`) holding one `<memory path="…">` block per file,
+  with `MEMORY_NOTE` as the section's lead-in line outside those tags. Never `contextFiles`: that
+  would put the notes in the `<project_instructions>` tag holding the user's `AGENTS.md`. The section
+  is rewritten every run and deleted when a run finds nothing, so a file emptied or deleted
+  mid-session stops being injected, and a no-op run touches no prompt options at all. Files are
+  re-read every run, so an edit lands as a delta of that section alone. One test asserts Pi's own
+  `loadProjectContextFiles` still does not return `MEMORY.md` — if that ever changes, the extension
+  has to be rethought, not patched. `test/injection.test.ts` imports `MEMORY_NOTE` and `SECTION_NAME`
+  from `src/index.ts`: keep prompt wording out of the test file, assert placement instead.
+- The cheap end-to-end check is a scratch directory with a canary line in its `MEMORY.md` and
+  `pi --no-session -e ./packages/pi-memory/src/index.ts -p "print verbatim every part of your system
+  prompt between and including the tags whose name contains memory or instructions; no tools"`: the
+  `<assistant_memory>` section comes back with the note ahead of a `<memory path="/abs/MEMORY.md">`
+  block, `<project_instructions>` holds only `AGENTS.md`, and the same run in a directory with no
+  `MEMORY.md` reports no memory section at all — that is the no-op contract. Pi's section rendering
+  is not exported, so no unit test can assert the final prompt text.
 - All three read configuration at module load, so a second `loadExtension()` in one test file needs
   `vi.resetModules()` first.

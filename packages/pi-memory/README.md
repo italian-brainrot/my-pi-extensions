@@ -1,7 +1,8 @@
 # pi-memory
 
-Puts a **`MEMORY.md`** into the system prompt the way Pi puts `AGENTS.md` there — inside
-`<project_context>` — and tells the assistant that this file is its own to keep current.
+Puts a **`MEMORY.md`** into the system prompt beside the user's `AGENTS.md`, in a `<memory path="…">`
+block of its own rather than in the `<project_instructions>` tag that holds the spec, and tells the
+assistant that this file is its own to keep current.
 
 The split it exists for: `AGENTS.md` is yours. You write the spec there, and you can say "do not
 edit this file". `MEMORY.md` is the assistant's. Whatever it wants the next session to know —
@@ -11,7 +12,10 @@ loads it back on the next run.
 ## What it adds
 
 No tools, no commands, no widgets. It listens for `before_agent_start` (the event Pi fires before
-every run) and appends the memory files it finds to the prompt's project-context files.
+every run) and writes the memory files it finds into a prompt section of its own,
+`<assistant_memory>`. Keeping them out of Pi's project-context files is the point: the user's spec
+and the assistant's notes carry different tags, and editing the notes patches only the memory
+section instead of re-sending the spec with it.
 
 ## Install
 
@@ -41,31 +45,35 @@ It does nothing until you create the file. To turn it on for a repository:
 echo "# Notes" > MEMORY.md
 ```
 
-The next run injects it. In the system prompt the block appears after the `AGENTS.md` block:
+The next run injects it. In the system prompt it is a section apart from the project context that
+holds `AGENTS.md`:
 
 ```text
-<project_instructions path="/repo/MEMORY.md">
-Note from the pi-memory extension: this file is the assistant's own memory, injected from this path
-at the start of every run, and this note is not part of the file. Keep it up to date as you work:
-record what future sessions need (decisions, constraints, gotchas, commands, invariants), delete
-what is stale or wrong, and keep it short, because it is loaded into every later session. Use the
-normal file tools on this path to change it.
+<assistant_memory>
+Assistant-maintained memory. This file is owned by you (the assistant) and is automatically injected
+into system message. Keep it up to date, and keep it short, because it is loaded into every later
+session. Use the normal file tools on this path to change it.
 
+<memory path="/repo/MEMORY.md">
 # Notes
 …
-</project_instructions>
+</memory>
+</assistant_memory>
 ```
 
 That note is added by the extension at load time; it is not stored in the file, and `read` of the
-path shows the file exactly as it is on disk. The note comes first so the model reads the ownership
-rules before the notes themselves, and it names the path so the assistant knows what to edit.
+path shows the file exactly as it is on disk. It opens the section, outside the `<memory>` tags and
+before them, the way Pi's own "Project-specific instructions and guidelines:" line opens
+`<project_context>`, and each block names the path it came from so the assistant knows what to edit.
+Pi puts an extension's section at the end of the prompt, after `<cwd>`, so the assistant reads its
+own notes last.
 
 ### Which files are loaded, and in what order
 
 Pi resolves `AGENTS.md` from the agent directory and from the current directory's ancestors;
 `MEMORY.md` is resolved the same way, and the blocks appear in that order:
 
-| Scope                  | Path                                   | Position in the prompt  |
+| Scope                  | Path                                   | Position in the section |
 | ---------------------- | -------------------------------------- | ----------------------- |
 | Global (this install)  | `<agent-dir>/MEMORY.md`                | first                   |
 | Repository and parents | `MEMORY.md` in each ancestor directory | middle, outermost first |
@@ -91,7 +99,7 @@ Read when the extension loads, so changes need a restart rather than `/reload`.
 
 | Situation                                      | What happens                                                                                                             |
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| No `MEMORY.md` in any scope                    | The extension changes nothing — it is a no-op, and no file is ever created.                                              |
+| No `MEMORY.md` in any scope                    | The extension changes nothing — it is a no-op, the section is absent, and no file is ever created.                       |
 | `MEMORY.md` is empty or whitespace only        | Skipped.                                                                                                                 |
 | `MEMORY.md` is a directory, or cannot be read  | Skipped.                                                                                                                 |
 | The file is larger than `PI_MEMORY_MAX_BYTES`  | Injected up to the limit, cut at a line boundary, with `[… pi-memory truncated this file at N of M bytes …]` at the end. |
@@ -117,5 +125,7 @@ PI_MEMORY_DEBUG=1 npm run dev
 
 Tests drive the extension through the `before_agent_start` event the harness records
 (`test/helpers/extension.ts`) and assert against real files in a temp directory: discovery order,
-deduplication, re-reading between runs, empty and unreadable files, truncation, and the exact
-model-facing note. See [docs/testing.md](../../docs/testing.md).
+deduplication, re-reading between runs, empty and unreadable files, truncation, and the shape of the
+section — the note ahead of the `<memory>` tags, one block per file, paths as attributes. The note's
+wording is imported from `src/index.ts` rather than repeated in a test, so rewording it is an edit
+to the extension, not a test failure. See [docs/testing.md](../../docs/testing.md).

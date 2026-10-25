@@ -49,6 +49,12 @@ Rules worth keeping, from Pi's own [extension docs](https://github.com/earendil-
   rather than returning a replacement `systemPrompt`, so Pi can diff the sections and append a
   transcript delta instead of rewriting the prompt for every run.
 
+- `contextFiles` always render as `<project_instructions path="…">` inside `<project_context>`, which
+  is what Pi loads `AGENTS.md` into. Text that should carry its own tag goes in `sections`, which Pi
+  wraps in `<name>…</name>` and places after the built-in sections; the name must match
+  `/^[a-z][a-z0-9_-]*$/` and is shared with every other extension, so own it and rewrite it on every
+  run rather than appending to it.
+
 - Do not start processes, timers, watchers, or sockets in the factory. Some Pi invocations load
   extensions without starting a session. Start them from `session_start` or from the tool that
   needs them, and clean up in `session_shutdown`.

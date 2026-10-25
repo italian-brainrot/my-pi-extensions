@@ -4,6 +4,46 @@ Notable changes to the repository and to each package. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version scheme is
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Affected packages: `pi-memory`, `pi-subagent` (formatting only).
+
+### Changed
+
+- **`pi-memory` injects `MEMORY.md` as its own prompt section instead of as project context.**
+  Appending it to `systemPromptOptions.contextFiles` made the assistant's notes another
+  `<project_instructions path="…">` block inside `<project_context>`, indistinguishable from the
+  user's `AGENTS.md` and re-sent whenever either file changed. The extension now writes
+  `systemPromptOptions.sections.assistant_memory`, which Pi renders as its own section near the end
+  of the prompt:
+
+  ```text
+  <assistant_memory>
+  Assistant-maintained memory. … Use the normal file tools on this path to change it.
+
+  <memory path="/repo/MEMORY.md">
+  # Notes
+  …
+  </memory>
+  </assistant_memory>
+  ```
+
+  One `<memory path="…">` block per memory file, in the same discovery order as before, and the note
+  opens the section outside those tags and ahead of them — the position Pi's own lead-in line has
+  inside `<project_context>`. An edit to the notes now patches just that section; `project_context`
+  and the user's spec are untouched. A run that finds nothing to inject removes the section and
+  otherwise leaves the prompt options alone, so a `MEMORY.md` deleted or emptied mid-session stops
+  being injected on the next run.
+
+- **The pi-memory tests stopped repeating the model-facing note.** Rewording `MEMORY_NOTE` had
+  broken two of them for no behavioural reason. They now import it from the extension and assert
+  what must actually hold: that it opens the section, that it is outside the `<memory>` tags, that
+  each file's text is inside them. 27 tests, up from 22, with the new ones covering the section
+  boundary (nothing about memory reaches `contextFiles`), the section being removed, a no-op run
+  leaving the prompt options untouched, and another extension's prompt section being left alone.
+- Re-ran the formatter over `pi-subagent`'s tool description, which a manual edit had left in a shape
+  `npm run lint` rejects.
+
 ## [0.2.0] - 2026-10-25
 
 Affected packages: `pi-memory` (new), and the repository's own context files.

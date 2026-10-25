@@ -82,9 +82,12 @@ call in `withPiArgv(fakePi, …)`.
 system prompt registers no tool, so the harness's `emit` is the whole interface: fire
 `before_agent_start` with the `systemPromptOptions` Pi would pass, and assert on what the handler
 left behind. `packages/pi-memory/test/injection.test.ts` is the worked example: which scopes are
-injected and in which order, the shape of each entry against what Pi's own `loadProjectContextFiles`
-returns (and that Pi still does not load `MEMORY.md` itself), deduplication through a symlink,
-re-reading between two runs, and the exact injected note — that text is the feature.
+injected and in which order, the shape of the section it owns against what Pi's own
+`loadProjectContextFiles` returns (and that Pi still does not load `MEMORY.md` itself), deduplication
+through a symlink, re-reading between two runs, and where the model-facing note sits relative to the
+`<memory>` tags. Import prompt text from the extension instead of copying it into a test: assert the
+structure that has to hold, so rewording the text stays a deliberate edit to the extension rather
+than a test failure.
 
 **Assert on cost and usage numbers where they are the feature.** The subagent's value is that token
 and cost totals from a nested process reach Pi's session accounting, so the tests assert sums,
