@@ -106,6 +106,12 @@ them: a command whose parent process is still alive belongs to that runtime, one
 lost its owner. Where the process table cannot be read, an unmarked command is left alone rather than
 guessed at.
 
+Before this, the damage was not limited to background jobs: a sidecar is written the moment a command
+starts, foreground calls included, so a nested pi adopted the command that was running it and
+SIGTERM'd its own parent as it exited — `pi -p` inside a `bash` call killed the `bash` call, which
+arrived as `Command terminated by signal SIGTERM` with no timeout anywhere near the limit. If you run
+a pi from a script, from a Makefile, or from an agent's shell, that is the failure you are avoiding.
+
 Before 0.1.1 there was no ownership information, so every runtime adopted everything it found: a
 nested pi killed its parent session's running commands when it exited. If you see that on an older
 version, upgrade.

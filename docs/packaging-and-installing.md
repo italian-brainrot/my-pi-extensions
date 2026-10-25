@@ -60,8 +60,11 @@ enable. That is invisible until an extension keeps state under the agent directo
 `pi-bg-tasks` does exactly that, with its job metadata in `<agent-dir>/bg-tasks`. Without ownership
 markers every process adopts every live sidecar it finds there, so a nested pi stopped the commands
 its parent session was running (fixed in 0.1.1; the behaviour is documented in the
-[package README](../packages/pi-bg-tasks/README.md)). Each sidecar now records `ownerPid`, and
-adoption, shutdown, and log pruning all skip entries another live process owns.
+[package README](../packages/pi-bg-tasks/README.md)). The sharpest version of that is circular: the
+sidecar for a running foreground command is written before the command even starts, so a `bash` call
+that launches a pi had its own sidecar adopted by the pi it launched, and the pi killed its parent
+command on the way out. Each sidecar now records `ownerPid`, and adoption, shutdown, and log pruning
+all skip entries another live process owns.
 
 The same rule applies to anything added later: mark what you write with its owner, and leave other
 owners alone. `adoptJobs` and `pruneRetention` in `packages/pi-bg-tasks/src/index.ts` are the working

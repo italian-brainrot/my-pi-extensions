@@ -21,6 +21,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 let ext: LoadedExtension;
 
+function text(result: any): string {
+  return result.content.map((part: any) => part.text).join("");
+}
+
 beforeAll(async () => {
   ext = await loadExtension({ packageDir: packageDir("pi-bg-tasks") });
 });
@@ -216,6 +220,23 @@ describe("other pi sessions sharing the agent dir", () => {
       }
       parentShell.kill("SIGKILL");
     }
+  });
+
+  it("does not kill the very command that started it", async () => {
+    // The case that made this bug look random: any bash command that itself launches a pi (a nested
+    // `pi -p`, a script that runs pi, the subagent tool) registers a sidecar for its own wrapper.
+    // The nested runtime used to adopt that sidecar and, at shutdown, SIGTERM the command running
+    // it — the tool result came back as "Command terminated by signal SIGTERM" with no timeout
+    // anywhere near its limit. The fixture stands in for the nested pi; it is started by this
+    // session's own bash tool, so this session is its parent exactly as in the real failure.
+    const result = await ext.callTool("bash", {
+      command: `node ${JSON.stringify(foreignRuntime)} ${JSON.stringify(extensionEntry)}`,
+      timeout: 60,
+    });
+
+    expect(result.details.status, `the nested runtime killed its own parent: ${text(result)}`).toBe("completed");
+    const seen = JSON.parse(text(result).trim().split("\n").pop() ?? "{}");
+    expect(seen.sidecarsBefore.length, "the wrapper's sidecar should have been visible to the nested runtime").toBeGreaterThan(0);
   });
 
   it("does not prune another session's files, even past the retention age", async () => {

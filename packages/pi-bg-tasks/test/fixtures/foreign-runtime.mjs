@@ -9,6 +9,10 @@
  *
  * Usage: node foreign-runtime.mjs <path-to-extension-entry>
  * The agent dir comes from PI_CODING_AGENT_DIR. Prints which sidecars it saw before and after.
+ *
+ * Most tests spawn it from the test process. The last one spawns it through the extension's own bash
+ * tool, which reproduces the circular failure: the nested runtime used to adopt the sidecar of the
+ * command running it and kill that command at shutdown.
  */
 
 import { readdirSync } from "node:fs";

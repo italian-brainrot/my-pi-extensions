@@ -23,13 +23,21 @@ Affected packages: `pi-bg-tasks`.
   can still stop them at shutdown. Sidecars written before this field existed carry no marker, so the
   process table answers the same question for them: a command whose parent process is alive belongs
   to that runtime, and one reparented to init lost its owner.
+
+  The exposure was not limited to background jobs. A sidecar is written the moment a command starts,
+  foreground calls included, so a nested pi also adopted the command that was running it and killed
+  its own parent on exit — `pi -p` inside a `bash` call killed the `bash` call. That self-killing
+  loop is where the symptom came from: three verification commands in one session (`pi --no-session
+  -p`, `pi --mode rpc`) died at 33s, 0.4s, and 4s, with no timeout anywhere near those limits.
 - **Liveness checks no longer count an un-reaped child as running.** A signalled child is a zombie
   until its parent reaps it, and `kill(pid, 0)` succeeds against a zombie, which would have pinned an
   adopted job to "running" (and hidden the bug above from the first regression test).
 
-Five new tests in `packages/pi-bg-tasks/test/cross-process.test.ts` run a second runtime as a real
-process against the same agent directory; four of the five fail against the previous
-implementation, including the one that guards this bug directly.
+Six new tests in `packages/pi-bg-tasks/test/cross-process.test.ts` run a second runtime as a real
+process against the same agent directory; five of the six fail against the previous implementation,
+including the one that guards this bug directly — a nested runtime started by a `bash` call kills
+that very call, which the assertion reports as `the nested runtime killed its own parent: Command
+terminated by signal SIGTERM`.
 
 ### Added
 

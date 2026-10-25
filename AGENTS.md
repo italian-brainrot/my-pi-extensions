@@ -39,7 +39,9 @@ extension entry so one install loads the set.
    it must say which process owns it, and must leave entries owned by another live process alone —
    never assume you are the only writer. `pi-bg-tasks` records `ownerPid` in its sidecars for this
    reason (and reads the parent process out of `/proc` for sidecars written before that field
-   existed); `adoptJobs` and `pruneRetention` are the places to look.
+   existed); `adoptJobs` and `pruneRetention` are the places to look. Note that every `bash` call —
+   foreground included — has a sidecar while it runs, so the worst case is a nested runtime killing
+   the command that launched it; `test/cross-process.test.ts` guards exactly that.
 
 ## Layout worth knowing
 
