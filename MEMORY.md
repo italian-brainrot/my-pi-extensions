@@ -1,50 +1,6 @@
 # Assistant notes for my-pi-extensions
 
-## Commands
-
-| Command                                 | Use                                                                        |
-| --------------------------------------- | -------------------------------------------------------------------------- |
-| `npm run check`                         | Manifest check, typecheck, lint, tests. Run it before declaring work done. |
-| `npm test`                              | Vitest suite (spawns real processes; ~30s).                                |
-| `npm run typecheck`                     | `tsc --noEmit`.                                                            |
-| `npm run fmt` / `npm run lint`          | Biome fixes / Biome check. Biome is the formatter; do not hand-format.     |
-| `npm run manifest`                      | Regenerate the root `pi.extensions` list from `packages/*`.                |
-| `npm run new -- pi-x --description "…"` | Scaffold a new extension package.                                          |
-| `npm run dev`                           | Run Pi with these extensions loaded from source.                           |
-
-## Rules
-
-1. **One package per extension**, named `pi-<thing>`, with `src/index.ts`, `test/`, `README.md`, and a
-   `pi.extensions` entry in its own `package.json`. Run `npm run manifest` after adding one.
-2. **Pi-provided modules are peers.** `@earendil-works/pi-*` and `typebox` go in `peerDependencies`
-   with `"*"`, never in `dependencies` (a bundled copy creates duplicate Pi registries). Versions for
-   typechecking live in the root `devDependencies` and must match the installed Pi.
-3. **No build step.** Sources are TypeScript, loaded through jiti. Typecheck only.
-4. **Tests drive behaviour through registered tools**, using `test/helpers/extension.ts`. Do not
-   export internals just to test them, and do not mock the tool layer. An extension that registers no
-   tool at all (`pi-memory`) is driven the same way through the lifecycle event it handles: `emit`
-   the event and assert on what it changed.
-5. **Every behaviour change needs a test** in the owning package. Model-facing text (tool
-   descriptions, result text, injected prompt text) is part of the interface: change it deliberately
-   and assert it — but import prompt text from the extension instead of copying it into a test, and
-   assert the structure around it (order, tags, placement), so rewording is an edit and not a failure.
-6. **READMEs document behaviour**, not code structure: what each tool does, its parameters,
-   environment variables, and failure modes. Update the package README and the root table together.
-7. **The agent directory is shared by every pi process.** A nested `pi -p`, an RPC session, and a
-   `subagent` child all load these extensions against the same `<agent-dir>`. Anything written under
-   it must say which process owns it, and must leave entries owned by another live process alone —
-   never assume you are the only writer. `pi-bg-tasks` records `ownerPid` in its sidecars for this
-   reason (and reads the parent process out of `/proc` for sidecars written before that field
-   existed); `adoptJobs` and `pruneRetention` are the places to look. Note that every `bash` call —
-   foreground included — has a sidecar while it runs, so the worst case is a nested runtime killing
-   the command that launched it; `test/cross-process.test.ts` guards exactly that.
-8. **Keep `MEMORY.md` current, and leave `AGENTS.md` to the user.** This file is where a session
-   writes what it learned; `AGENTS.md` holds only the sections the user wrote, and a request in it
-   not to modify that file is honoured. Write memory notes here as you work — decisions, constraints,
-   gotchas, commands, invariants — and prune them; `pi-memory` re-reads this file before every run,
-   so what you save reaches the next prompt.
-
-## Layout worth knowing
+## Layout
 
 - `packages/<name>/src/index.ts` — the extension. Single file is fine; split when a file grows past
   ~700 lines and you have tests that make the split safe.

@@ -24,7 +24,7 @@ Subagent tool which uses the same model as current session. Currenly locally I c
 
 ### pi-memory
 
-Injects MEMORY.md into system message after AGENTS.md. The workflow is - I manually write AGENTS.md with the spec, and the agent can use MEMORY.md for anything else.
+Injects MEMORY.md into system message after AGENTS.md. The workflow is - I manually write AGENTS.md with the spec, and the agent can use MEMORY.md for anything else. The memory should only affect new sessions, there should be no retroactive changes to context.
 
 ## Pi docs
 
