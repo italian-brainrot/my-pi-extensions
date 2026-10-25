@@ -43,11 +43,8 @@ const DEBUG = /^(1|true|yes|on)$/i.test(process.env.PI_MEMORY_DEBUG ?? "");
 
 /** Model-facing text that opens every injected file. Part of the extension's interface. */
 const MEMORY_NOTE =
-  "Note from the pi-memory extension: this file is the assistant's own memory, injected from this " +
-  "path at the start of every run, and this note is not part of the file. Keep it up to date as you " +
-  "work: record what future sessions need (decisions, constraints, gotchas, commands, invariants), " +
-  "delete what is stale or wrong, and keep it short, because it is loaded into every later session. " +
-  "Use the normal file tools on this path to change it.";
+  "Assistant-maintained memory. This file is owned by you (the assistant) and is automatically injected into system message. " +
+  "Keep it up to date, and keep it short, because it is loaded into every later session. Use the normal file tools on this path to change it.";
 
 function configuredFilename(): string {
   const value = (process.env.PI_MEMORY_FILENAME ?? "").trim();
