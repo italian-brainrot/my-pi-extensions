@@ -1,0 +1,32 @@
+{
+  "name": "pi-subagent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: delegate a prompt to a subagent running the same model in an isolated process.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "subagent",
+    "delegation",
+    "context"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

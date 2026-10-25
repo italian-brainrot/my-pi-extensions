@@ -1,0 +1,30 @@
+{
+  "name": "pi-bg-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: background bash tasks with a per-command timeout, plus bg_stop and bg_wait.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "bash",
+    "background",
+    "tasks"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

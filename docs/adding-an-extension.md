@@ -1,0 +1,111 @@
+# Adding an extension
+
+## 1. Scaffold it
+
+```bash
+npm run new -- pi-wordcount --description "Count words in the files a session touched"
+```
+
+That creates `packages/pi-wordcount/` with a `package.json` (Pi manifest, peer dependencies, npm
+metadata), `src/index.ts`, `test/extension.test.ts`, and `README.md`, then rewrites the root
+manifest. Add the new package to the table in the root README.
+
+## 2. Write the extension
+
+An extension is a module with a default export that receives the Pi extension API:
+
+```ts
+import { Type } from "typebox";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+export default function (pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: "wordcount",
+    label: "Word count",
+    description: "Count words in a file. Describe what the model should expect back.",
+    parameters: Type.Object({ path: Type.String({ description: "File to count" }) }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { path } = params as { path: string };
+      return { content: [{ type: "text", text: `…${path}` }], details: { path } };
+    },
+  });
+
+  pi.on("session_start", () => {
+    /* start session-scoped work here */
+  });
+
+  pi.on("session_shutdown", async () => {
+    /* stop it here; the handler must be idempotent */
+  });
+}
+```
+
+Rules worth keeping, from Pi's own [extension docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md):
+
+- Do not start processes, timers, watchers, or sockets in the factory. Some Pi invocations load
+  extensions without starting a session. Start them from `session_start` or from the tool that
+  needs them, and clean up in `session_shutdown`.
+- `/reload` replaces the runtime: module state is gone, so anything that must survive a reload
+  belongs on disk (`<agent-dir>/<package-name>/…` is the pattern `pi-bg-tasks` uses). A handler
+  must not reuse state captured before `await ctx.reload()`.
+- Model-facing text is an interface. Descriptions, parameter descriptions, and result text are what
+  the model reads; keep them accurate and put the details there rather than in a chat reply.
+- Anything that can be configured should read one clearly named environment variable or settings
+  key, documented in the package README.
+
+## 3. Conventions every package follows
+
+`npm test` enforces most of these (`test/repo.test.ts`), and `npm run manifest` enforces the
+manifest entry.
+
+| Rule                                                                                  | Why                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Package name matches its directory and starts with `pi-`.                             | Predictable install paths, and the root manifest is generated from the directory.                                                                                             |
+| `"pi": { "extensions": ["./src/index.ts"] }` in the package manifest.                 | Lets the package be installed on its own, and lets tests load it the way Pi does.                                                                                             |
+| Every entry file exists and is listed in the root manifest.                           | `pi install <repo>` loads everything, or nothing.                                                                                                                             |
+| Host packages (`@earendil-works/pi-*`, `typebox`) are `peerDependencies: "*"` only.   | A physical copy bypasses Pi's module mapping and creates duplicate registries and classes. Pi warns about it. Pin the version in the root `devDependencies` for typechecking. |
+| `files: ["src", "README.md"]`, `keywords` include `pi-package`, `pi-extension`, `pi`. | Correct tarball, gallery discovery.                                                                                                                                           |
+| `private: true` until publishing is real.                                             | Nothing reaches npm by accident.                                                                                                                                              |
+| A README with install, usage, and a configuration table.                              | Documented behaviour is the contract.                                                                                                                                         |
+| At least one test under `test/`, driven through the shared harness.                   | Behaviour, not implementation.                                                                                                                                                |
+| Tool names do not collide with another package in this repo.                          | Pi reports a collision instead of silently replacing a tool.                                                                                                                  |
+
+## 4. Test it
+
+Add tests next to the package, using the harness — see [docs/testing.md](./testing.md). The short
+version:
+
+```ts
+import { loadExtension, packageDir } from "../../../test/helpers/extension.ts";
+
+const ext = await loadExtension({ packageDir: packageDir("pi-wordcount") });
+const result = await ext.callTool("wordcount", { path: "README.md" });
+```
+
+The harness gives each test file a fresh module instance, a temp agent dir, and a temp working
+directory, so an extension that writes files or spawns processes is tested against real files and
+real processes. Only the model is missing.
+
+Then add the package to `EXPECTED` in `test/load.test.ts` — the tools and lifecycle events it
+registers. That file asserts what Pi sees when it loads the repository, so a new package without an
+entry fails with a message saying exactly what to add.
+
+## 5. Verify
+
+```bash
+npm run check          # manifest --check, typecheck, lint, tests
+npm run dev            # load it in a real pi session, then /reload after edits
+```
+
+`npm run check` failing is a normal part of the loop: Biome reformats, `npm run fmt` fixes files, and
+the manifest script rewrites the root list when you add a package.
+
+## 6. Install it for real
+
+```bash
+pi install .                       # whole repository
+pi install ./packages/pi-wordcount # just this package
+```
+
+Then `pi list` to confirm, and `/reload` (or a new session) to load it.

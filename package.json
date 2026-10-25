@@ -1,0 +1,44 @@
+{
+  "name": "my-pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Monorepo of my Pi coding-agent extensions: one package per extension, one repo.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "pi": {
+    "extensions": [
+      "./packages/pi-bg-tasks/src/index.ts",
+      "./packages/pi-subagent/src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "npm run manifest -- --check && npm run typecheck && npm run lint && npm run test",
+    "dev": "node scripts/dev.mjs",
+    "fmt": "biome check --write .",
+    "install:personal": "pi install .",
+    "lint": "biome check .",
+    "manifest": "node scripts/sync-manifest.mjs",
+    "new": "node scripts/new-extension.mjs",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "uninstall:personal": "pi remove ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.3",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@types/node": "^22.19.19",
+    "typebox": "^1.3.27",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

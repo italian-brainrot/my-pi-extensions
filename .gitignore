@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build and tooling output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local state
+*.log
+.DS_Store
+.pi/settings.local.json
+.pi/agent/
