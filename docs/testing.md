@@ -78,6 +78,14 @@ the sleeps short and always clean up: end each test by stopping what it started,
 test reads back. The extension finds its entry point through `process.argv[1]`, so tests wrap the
 call in `withPiArgv(fakePi, …)`.
 
+**Assert on the prompt an extension produces, not on how it built it.** An extension that shapes the
+system prompt registers no tool, so the harness's `emit` is the whole interface: fire
+`before_agent_start` with the `systemPromptOptions` Pi would pass, and assert on what the handler
+left behind. `packages/pi-memory/test/injection.test.ts` is the worked example: which scopes are
+injected and in which order, the shape of each entry against what Pi's own `loadProjectContextFiles`
+returns (and that Pi still does not load `MEMORY.md` itself), deduplication through a symlink,
+re-reading between two runs, and the exact injected note — that text is the feature.
+
 **Assert on cost and usage numbers where they are the feature.** The subagent's value is that token
 and cost totals from a nested process reach Pi's session accounting, so the tests assert sums,
 per-component costs, and that context size is the largest single response rather than the sum.

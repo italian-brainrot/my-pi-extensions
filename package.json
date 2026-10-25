@@ -1,6 +1,6 @@
 {
   "name": "my-pi-extensions",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Monorepo of my Pi coding-agent extensions: one package per extension, one repo.",
@@ -11,6 +11,7 @@
   "pi": {
     "extensions": [
       "./packages/pi-bg-tasks/src/index.ts",
+      "./packages/pi-memory/src/index.ts",
       "./packages/pi-subagent/src/index.ts"
     ]
   },

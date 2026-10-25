@@ -11,9 +11,16 @@ test harness, shared tooling, and a single install for the whole set.
 | Package                                 | What it does                                                                                                                                  | Adds                                                                                     |
 | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them. | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
+| [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, as the assistant's own notes, and tells it to keep that file current. | none — it changes the prompt, not the tool list                                          |
 | [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                             | `subagent`                                                                               |
 
 Read each package's README for parameters, environment variables, and behaviour details.
+
+### Context files in this repository
+
+`AGENTS.md` is the spec, and only the user writes it. `MEMORY.md` is what the assistant writes as it
+works — decisions, gotchas, commands, what broke and why — and `pi-memory` injects it beside
+`AGENTS.md`, in the same `<project_context>` section, and tells the assistant to keep it current. Every Pi session in this checkout gets both.
 
 ## Use them
 
@@ -72,12 +79,16 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 
 ```text
 package.json              workspace root + Pi manifest listing every extension entry
+AGENTS.md                 how to work here, written by the user (Pi injects it)
+MEMORY.md                 how the work actually goes, written by you (pi-memory injects it)
 packages/
   pi-bg-tasks/
     package.json          Pi manifest (pi.extensions), peer dependencies, npm metadata
     src/index.ts          the extension
     test/*.test.ts        behaviour tests
     README.md             user-facing documentation
+  pi-memory/
+    ...
   pi-subagent/
     ...
 test/

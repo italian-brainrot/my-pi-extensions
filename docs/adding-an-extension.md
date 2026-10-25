@@ -43,6 +43,12 @@ export default function (pi: ExtensionAPI): void {
 
 Rules worth keeping, from Pi's own [extension docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md):
 
+- An extension does not have to register anything visible. Handling `before_agent_start` and editing
+  `event.systemPromptOptions` — `sections`, `promptGuidelines`, `contextFiles` — is a complete
+  extension; that is how `pi-memory` adds a memory file to the prompt. Edit the structured options
+  rather than returning a replacement `systemPrompt`, so Pi can diff the sections and append a
+  transcript delta instead of rewriting the prompt for every run.
+
 - Do not start processes, timers, watchers, or sockets in the factory. Some Pi invocations load
   extensions without starting a session. Start them from `session_start` or from the tool that
   needs them, and clean up in `session_shutdown`.
@@ -89,7 +95,8 @@ real processes. Only the model is missing.
 
 Then add the package to `EXPECTED` in `test/load.test.ts` — the tools and lifecycle events it
 registers. That file asserts what Pi sees when it loads the repository, so a new package without an
-entry fails with a message saying exactly what to add.
+entry fails with a message saying exactly what to add. An extension that adds no tools (`pi-memory`
+changes the system prompt instead) is listed with `tools: []`.
 
 ## 5. Verify
 

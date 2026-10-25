@@ -4,6 +4,41 @@ Notable changes to the repository and to each package. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version scheme is
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-25
+
+Affected packages: `pi-memory` (new), and the repository's own context files.
+
+### Added
+
+- **`pi-memory`**, an extension with no tools: it handles `before_agent_start` and appends
+  `MEMORY.md` to `systemPromptOptions.contextFiles`, which is the list Pi renders as
+  `<project_instructions path="…">` blocks inside `<project_context>`. So the assistant gets a file
+  of its own beside the user's `AGENTS.md`, in the same section, with a note in front of it saying
+  that keeping that file current is part of the job and naming the path to edit.
+
+  It is a no-op unless the file exists, so it is opt-in per directory and never writes anything:
+  missing, empty, unreadable, or a directory named `MEMORY.md` all change nothing. Discovery follows
+  Pi's own `AGENTS.md` rules — `<agent-dir>/MEMORY.md` first, then ancestors from the outermost in,
+  the working directory's last — and a file reached twice (a symlink, or an agent directory inside
+  the searched tree) is injected once. Each run re-reads the files rather than caching them at
+  startup, which is what lets an edit made mid-session reach the model on the next prompt as a
+  section delta instead of a replaced prompt; a file larger than `PI_MEMORY_MAX_BYTES` (16 KiB by
+  default) is cut on a line boundary and says so.
+
+  22 tests cover the scopes and their order, the shape Pi expects (`loadProjectContextFiles` is the
+  reference, and one test fails if Pi ever starts loading `MEMORY.md` itself), re-reading between
+  runs, deduplication, the skip cases, truncation, and the injected note verbatim.
+- The repository's own split, which the package exists to make possible: `AGENTS.md` keeps only the
+  section the user wrote, and the commands, rules, layout, and per-extension notes a previous session
+  had put in it now live in `MEMORY.md`. From the next session on, both are injected here — the
+  user's spec as Pi loads it, these notes as `pi-memory` loads them.
+
+### Changed
+
+- `test/load.test.ts` now expects a package that registers no tools (`pi-memory` is listed with
+  `tools: []`), and `docs/adding-an-extension.md` and `docs/testing.md` describe the event-driven
+  kind of extension and how to test one.
+
 ## [0.1.1] - 2026-10-25
 
 Affected packages: `pi-bg-tasks`.

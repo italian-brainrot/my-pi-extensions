@@ -1,0 +1,26 @@
+{
+  "name": "pi-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension: inject MEMORY.md into the system prompt and tell the assistant to keep it up to date.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "memory"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
