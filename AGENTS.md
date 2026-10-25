@@ -1,8 +1,13 @@
-# Working in this repository
+# my-pi-extensions
 
-This is a monorepo of my [Pi](https://pi.dev) extensions. Each extension is a package under
-`packages/`, and the repository itself is also a Pi package: the root `package.json` lists every
-extension entry so one install loads the set.
+## User's guide
+
+This is a collection of Pi coding-agent extensions that are mostly being developed by you (the AI), and are being used by you directly if you are running in pi.
+
+- All code in this repo was written by you in previous sessions, and you have full control over all code, dependencies, tooling, etc.
+- You will keep working on this repo in future sessions, so ensure maintainability.
+- You should be very proactive with maintaining this project, if you encounter a difficulty, make sure to improve the code or the tooling so that future sessions will not encounter it. This includes improving logging, tests, development documentation, and setting up development tools. It is also completely acceptable to add and change dependencies as well do big rewrites if necessary.
+- You can edit everything except this section, this section is written by the user.
 
 ## Commands
 
@@ -30,10 +35,6 @@ extension entry so one install loads the set.
    descriptions, result text) is part of the interface: change it deliberately and assert it.
 6. **READMEs document behaviour**, not code structure: what each tool does, its parameters,
    environment variables, and failure modes. Update the package README and the root table together.
-7. **Do not publish.** Packages stay `private: true` until there is an npm scope and a publish
-   workflow.
-8. **Do not touch my personal Pi configuration** (`~/.pi/agent/settings.json`,
-   `~/.pi/agent/extensions/`) unless I ask. Development runs through `npm run dev`.
 9. **The agent directory is shared by every pi process.** A nested `pi -p`, an RPC session, and a
    `subagent` child all load these extensions against the same `<agent-dir>`. Anything written under
    it must say which process owns it, and must leave entries owned by another live process alone —
@@ -53,7 +54,7 @@ extension entry so one install loads the set.
 - `test/load.test.ts` loads every package through Pi's own loader; `test/repo.test.ts` enforces
   packaging conventions. If you change packaging, expect to update those.
 - Extensions keep state on disk under `<agent-dir>/bg-tasks` (see `pi-bg-tasks`); tests point
-  `PI_CODING_AGENT_DIR` at a temp directory, so nothing of mine is touched by the suite.
+  `PI_CODING_AGENT_DIR` at a temp directory.
 
 ## Notes on the extensions
 
@@ -69,10 +70,3 @@ extension entry so one install loads the set.
   `process.argv[1]` through `withPiArgv`.
 - Both read configuration at module load, so a second `loadExtension()` in one test file needs
   `vi.resetModules()` first.
-
-## How they reach my sessions
-
-This repository is installed in my personal Pi settings as a local package (`pi install .`, visible in
-`pi list`), so editing a file here and running `/reload` is enough. The copies that used to sit in
-`~/.pi/agent/extensions/` were retired to `~/.pi/agent/retired-extensions-2026-10-25/` on 2026-10-25.
-Do not put files back there: they would load alongside the package and claim the `bash` tool twice.
