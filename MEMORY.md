@@ -1,12 +1,5 @@
 # Assistant notes for my-pi-extensions
 
-Everything below this line is maintained by you (the assistant), and `pi-memory` injects it into
-every session that runs in this repository — the load-time note Pi prints above it comes from the
-extension, not from this file. `AGENTS.md` is the user's spec: do not edit it unless you are asked
-to, and put anything you want future sessions to inherit here instead. Keeping this file current is
-part of the job: add what you learned, delete what stopped being true, and keep it short, because it
-costs context in every later session.
-
 ## Commands
 
 | Command                                 | Use                                                                        |
