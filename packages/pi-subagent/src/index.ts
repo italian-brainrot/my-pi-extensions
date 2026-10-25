@@ -609,8 +609,7 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent",
     description:
       "Run a subagent with the same model and tools as the current session. " +
-      "Returns the subagent's response. " +
-      "Useful for isolated reasoning tasks without consuming the main context.",
+      "Returns the subagent's response. ",
 
     parameters: SubagentParams,
 
