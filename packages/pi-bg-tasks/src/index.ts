@@ -288,12 +288,75 @@ function writeMeta(job: BgJob): void {
   try {
     writeFileSync(
       job.metaPath,
-      JSON.stringify({ id: job.id, pid: job.pid, cwd: job.cwd, command: job.command, logPath: job.logPath, startedAt: job.startedAt }),
+      JSON.stringify({
+        id: job.id,
+        pid: job.pid,
+        cwd: job.cwd,
+        command: job.command,
+        logPath: job.logPath,
+        startedAt: job.startedAt,
+        // Who wrote this. The agent dir is shared by every pi process, and a job belongs to the
+        // session that started it: see isOwnedByAnotherSession().
+        ownerPid: process.pid,
+      }),
       "utf8",
     );
   } catch {
     // Metadata is only needed to re-adopt after a reload; losing it is not fatal.
   }
+}
+
+/** What a sidecar records about a job, as written by writeMeta() and read back by adoptJobs(). */
+interface JobMeta {
+  id?: unknown;
+  pid?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  startedAt?: unknown;
+  logPath?: unknown;
+  ownerPid?: unknown;
+}
+
+/** Parse a sidecar; undefined when it cannot be read or is not valid JSON. */
+function readMeta(metaPath: string): JobMeta | undefined {
+  try {
+    return JSON.parse(readFileSync(metaPath, "utf8")) as JobMeta;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when a sidecar's command belongs to another live runtime, and is therefore not ours to
+ * adopt, stop, or prune.
+ *
+ * Every pi process shares `<agent-dir>/bg-tasks`: an interactive session, a nested `pi -p` (print
+ * or RPC mode, including the one the subagent tool spawns), and any other pi started against the
+ * same agent directory all load this extension, and each keeps its own job registry. A nested pi
+ * used to adopt whatever sidecars it found and kill them on shutdown, taking out commands another
+ * session was still waiting on.
+ *
+ * `ownerPid` names the owning runtime and is rewritten whenever a runtime adopts a job, so
+ * ownership survives a reload and stays correct after a takeover. Two cases have no usable marker:
+ * a pid recycled by an unrelated live process, and a sidecar written before `ownerPid` existed.
+ * Both are answered from the process table — a command whose parent process is still alive belongs
+ * to that runtime, one reparented to init lost its owner, and one whose parent is this process is
+ * ours to pick up after a reload. Where the process table cannot be read, an unmarked job is left
+ * alone rather than guessed at.
+ */
+function isOwnedByAnotherSession(meta: JobMeta | undefined): boolean {
+  const ownerPid = typeof meta?.ownerPid === "number" ? meta.ownerPid : undefined;
+  if (ownerPid !== undefined) return isManagedByOtherProcess(ownerPid);
+
+  const info = procStateAndParent(typeof meta?.pid === "number" ? meta.pid : -1);
+  if (info === "absent") return false;
+  if (info === undefined || !Number.isFinite(info.ppid)) return true;
+  if (info.ppid <= 1) return false;
+  return isManagedByOtherProcess(info.ppid);
+}
+
+function isManagedByOtherProcess(pid: number): boolean {
+  return pid !== process.pid && isAlive(pid);
 }
 
 /**
@@ -412,14 +475,45 @@ function killJob(job: BgJob): void {
 
 // ── Re-adopting jobs after reload or session replacement ─────────────────────
 
+/**
+ * The process-table fields that matter, read from `/proc/<pid>/stat`. The format is
+ * "pid (comm) state ppid …", and comm can contain spaces and parentheses, so the interesting
+ * fields start after the last closing paren.
+ *
+ * Three outcomes, and the difference matters: the process exists and is readable, it is gone
+ * ("absent"), or the question cannot be answered (not Linux, or a process we cannot read).
+ */
+function procStateAndParent(pid: number): { state: string; ppid: number } | "absent" | undefined {
+  if (pid <= 0) return "absent";
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const ppid = Number(fields[1]);
+    return { state: fields[0] ?? "", ppid: Number.isFinite(ppid) ? ppid : Number.NaN };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined;
+  }
+}
+
+/**
+ * A process signalled but not yet reaped is a zombie: it still answers signal 0, but its command is
+ * over. Counting it as running pins an adopted job to "running" forever, and hid the cross-session
+ * kill from the first version of the regression test.
+ */
+function isZombie(pid: number): boolean {
+  const info = procStateAndParent(pid);
+  return typeof info === "object" && info.state === "Z";
+}
+
 function isAlive(pid: number): boolean {
   if (pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+  return !isZombie(pid);
 }
 
 function pruneRetention(): void {
@@ -434,6 +528,16 @@ function pruneRetention(): void {
   const now = Date.now();
   const logs: { name: string; id: string; mtimeMs: number }[] = [];
 
+  // Jobs another live pi session owns are off-limits to us, however old their files look.
+  const foreignIds = new Set<string>();
+  for (const name of names) {
+    if (!name.endsWith(META_SUFFIX)) continue;
+    const id = name.slice(0, -META_SUFFIX.length);
+    if (id.startsWith("bg-") && isOwnedByAnotherSession(readMeta(join(LOG_DIR, name)))) {
+      foreignIds.add(id);
+    }
+  }
+
   for (const name of names) {
     const path = join(LOG_DIR, name);
     let mtimeMs: number;
@@ -446,9 +550,10 @@ function pruneRetention(): void {
     const id = name.endsWith(".log") ? name.slice(0, -4) : name.endsWith(META_SUFFIX) ? name.slice(0, -META_SUFFIX.length) : undefined;
     if (!id?.startsWith("bg-")) continue;
 
-    // Never touch files that belong to a job this runtime is still tracking.
+    // Never touch files that belong to a job this runtime is still tracking, or to one another
+    // session is still running.
     const tracked = jobs.get(id);
-    if (tracked?.status === "running") continue;
+    if (tracked?.status === "running" || foreignIds.has(id)) continue;
 
     if (now - mtimeMs > RETENTION_MS) {
       unlinkQuietly(path);
@@ -503,13 +608,19 @@ function adoptJobs(): void {
     if (!id.startsWith("bg-") || jobs.has(id)) continue;
 
     const metaPath = join(LOG_DIR, name);
-    let meta: { pid?: unknown; command?: unknown; cwd?: unknown; startedAt?: unknown; logPath?: unknown };
-    try {
-      meta = JSON.parse(readFileSync(metaPath, "utf8")) as typeof meta;
-    } catch {
+    const meta = readMeta(metaPath);
+    if (!meta) {
       unlinkQuietly(metaPath);
       continue;
     }
+
+    // Another live pi process owns this command and will report and stop it itself. Adopting it
+    // here would mean this session's shutdown kills a command a different session is waiting on —
+    // which is exactly what a nested pi (print mode, RPC mode, or the subagent tool) used to do to
+    // its parent. Ownership comes from ownerPid, or, for a sidecar written before that field
+    // existed, from the process table. A command whose owner has died is fair game: taking it over
+    // is how a dev server left behind by a crashed session can still be stopped.
+    if (isOwnedByAnotherSession(meta)) continue;
 
     const pid = typeof meta.pid === "number" ? meta.pid : Number.NaN;
     if (!Number.isFinite(pid) || !isAlive(pid)) {
@@ -532,6 +643,8 @@ function adoptJobs(): void {
     };
     jobs.set(id, job);
     getDone(job);
+    // Claim the sidecar, so a later reload of this process finds the job again.
+    writeMeta(job);
   }
 
   enforceRegistryCap();

@@ -1,6 +1,6 @@
 {
   "name": "my-pi-extensions",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Monorepo of my Pi coding-agent extensions: one package per extension, one repo.",
@@ -34,6 +34,7 @@
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "^22.19.19",
+    "jiti": "^2.7.0",
     "typebox": "^1.3.27",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"

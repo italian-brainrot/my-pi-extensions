@@ -1,6 +1,6 @@
 {
   "name": "pi-bg-tasks",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Pi extension: background bash tasks with a per-command timeout, plus bg_stop and bg_wait.",

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { type LoadedExtension, loadExtension, makeTempDir, packageDir } from "../../../test/helpers/extension.ts";
@@ -35,6 +35,10 @@ describe("reload and re-adoption", () => {
     vi.resetModules();
     const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: first.agentDir });
     await second.emit({ type: "session_start", reason: "reload" });
+
+    // Adoption claims the sidecar, so the job is now owned by this runtime and the next reload
+    // will find it again.
+    expect(JSON.parse(readFileSync(metaPath, "utf8")).ownerPid).toBe(process.pid);
 
     const stop = await second.callTool("bg_stop", { task_id: job.id, reason: "reload test" });
     expect(text(stop)).toContain(`Task ${job.id} stopped`);
