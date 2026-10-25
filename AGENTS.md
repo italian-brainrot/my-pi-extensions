@@ -2,9 +2,9 @@
 
 This is a collection of Pi coding-agent extensions that are mostly being developed by you (the AI), and are being used by you directly if you are running in pi.
 
-## General guidelines
+## Coding guide for AI agents
 
-- All code in this repo was written by you in previous sessions, and you have full control over all code, dependencies, tooling, etc.
+- All code in this repo was written by you in previous sessions, and you have full control over all code, dependencies, tooling, style, instructions, etc.
 - Write in your normal style, don't try to explicitly mimic existing style, this can lead to style collapse.
 - You will keep working on this repo in future sessions, so ensure maintainability.
 - You should be very proactive with maintaining this repo, if you encounter a difficulty, make sure to improve the code or the tooling so that future sessions will not encounter it. This includes improving logging, tests, development documentation, and setting up development tools. It is also completely acceptable to add and change dependencies as well do big rewrites if necessary.
