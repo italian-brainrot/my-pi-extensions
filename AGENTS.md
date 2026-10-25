@@ -55,3 +55,10 @@ extension entry so one install loads the set.
   `process.argv[1]` through `withPiArgv`.
 - Both read configuration at module load, so a second `loadExtension()` in one test file needs
   `vi.resetModules()` first.
+
+## How they reach my sessions
+
+This repository is installed in my personal Pi settings as a local package (`pi install .`, visible in
+`pi list`), so editing a file here and running `/reload` is enough. The copies that used to sit in
+`~/.pi/agent/extensions/` were retired to `~/.pi/agent/retired-extensions-2026-10-25/` on 2026-10-25.
+Do not put files back there: they would load alongside the package and claim the `bash` tool twice.
