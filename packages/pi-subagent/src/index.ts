@@ -607,7 +607,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "Run a subagent with the same model and tools as the current session. " + "Returns the subagent's response. ",
+    description: "Run a subagent with the same model and tools as the current session. " + "Returns the subagent's response.",
 
     parameters: SubagentParams,
 
