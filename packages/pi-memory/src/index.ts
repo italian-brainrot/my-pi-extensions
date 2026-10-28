@@ -1,37 +1,47 @@
 /**
  * pi-memory — MEMORY.md in the system prompt, kept up to date by the assistant.
  *
- * Pi injects the project's `AGENTS.md` (or `CLAUDE.md`) into the `<project_context>` section of
- * the system prompt, and that file belongs to the user: it is where they write the spec for a
+ * Pi injects the project's `AGENTS.md` (or `CLAUDE.md`) into the `<project_context>` section of the
+ * system prompt, and that file belongs to the user: it is where they write the spec for a
  * repository. This extension adds a second file with the same discovery rules and the opposite
  * ownership: `MEMORY.md` is the assistant's, so what a session learns can be written down where
  * later sessions will read it without rewriting the user's spec.
  *
- * What happens on each run (`before_agent_start`):
- *   - look for `<agent-dir>/MEMORY.md`, then for `MEMORY.md` in the cwd and every ancestor up to
- *     the filesystem root, in the order Pi uses for `AGENTS.md`: global first, outermost ancestor
- *     next, the cwd's own file last and therefore closest to the end of the section;
- *   - write them into `systemPromptOptions.sections["assistant_memory"]`, which Pi renders as its
+ * What happens per session (`before_agent_start`, the event Pi fires before every run):
+ *   - the first run of a session reads the memory files and remembers the result; every later run in
+ *     that session reuses it. Like Pi's own context files, MEMORY.md is a startup input: an edit
+ *     made while the session is running — by whoever the file's owner is — does not move the prompt,
+ *     and so cannot arrive as a system-prompt delta or show up retroactively in the transcript;
+ *   - `session_start` forgets what was remembered. That event opens every session boundary: a new
+ *     session, a resumed one, a fork, and `/reload`. Each reads MEMORY.md again on its first run, the
+ *     way Pi re-reads its own context files, while a session that keeps running does not;
+ *   - the discovery order is Pi's for `AGENTS.md`: `<agent-dir>/MEMORY.md` first (global scope), then
+ *     `MEMORY.md` in the cwd's ancestors from the outermost in, ending with the cwd's own file, so
+ *     the closest file is closest to the end of the section;
+ *   - the files go into `systemPromptOptions.sections["assistant_memory"]`, which Pi renders as its
  *     own prompt section holding one `<memory path="…">` block per file — deliberately not
- *     `contextFiles`, because those blocks are `<project_instructions>` and would put the
- *     assistant's notes in the same tag as the user's `AGENTS.md`;
- *   - open the section with a short model-facing note saying that the file is the assistant's to
+ *     `contextFiles`, because those render as `<project_instructions>` and would put the assistant's
+ *     notes in the same kind of tag as the user's `AGENTS.md`;
+ *   - the section opens with a short model-facing note saying that MEMORY.md is the assistant's to
  *     maintain, outside the tags, the way Pi opens `<project_context>` with its own lead-in line;
  *   - change nothing when there is no such file, when it is empty, or when it cannot be read.
  *
- * Files are re-read for every run rather than cached at startup, so an edit made during a session
- * reaches the model on its next prompt as a delta of just this section — the user's `AGENTS.md`
- * section is untouched — and a file created mid-session is picked up by the run that follows.
+ * A section whose text never changes is what the transcript needs: Pi diffs prompt sections against
+ * the system message it is replaying and only patches what differs, so a stable section is written
+ * once and left alone. Re-reading and re-rendering MEMORY.md on each run would make every run look
+ * like a prompt change (invalidating the upstream prompt cache each time it does) and would insert
+ * an edit into the transcript after the messages it describes.
  *
- * Configuration, read at startup, so changes need a restart rather than `/reload`:
+ * Configuration, read when the extension module loads, so changes need a restart rather than
+ * `/reload`:
  *   PI_MEMORY_FILENAME   the file name to look for (default `MEMORY.md`)
  *   PI_MEMORY_MAX_BYTES  most bytes injected per file (default 16384)
- *   PI_MEMORY_DEBUG=1    write one line per run to stderr about what was injected
+ *   PI_MEMORY_DEBUG=1    write lines to stderr about what was injected and when
  */
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -44,11 +54,17 @@ const FILENAME = configuredFilename();
 const MAX_BYTES = configuredMaxBytes();
 const DEBUG = /^(1|true|yes|on)$/i.test(process.env.PI_MEMORY_DEBUG ?? "");
 
+/**
+ * How many sessions' memory to remember. Each entry is one session's rendered section, so the cap
+ * costs little; eviction only protects a long-lived process that keeps swapping sessions.
+ */
+const SNAPSHOT_LIMIT = 16;
+
 function configuredFilename(): string {
   const value = (process.env.PI_MEMORY_FILENAME ?? "").trim();
   if (!value) return DEFAULT_FILENAME;
-  // A search name is a single directory entry, the same kind of thing Pi looks for when it
-  // searches for AGENTS.md. A path would silently match nothing, so keep the default and say so.
+  // A search name is a single directory entry, the same kind of thing Pi looks for when it searches
+  // for AGENTS.md. A path would silently match nothing, so keep the default and say so.
   if (value.includes("/") || value.includes("\\") || value.includes("\0")) {
     process.stderr.write(`pi-memory: ignoring PI_MEMORY_FILENAME "${value}", which is not a file name; using "${DEFAULT_FILENAME}".\n`);
     return DEFAULT_FILENAME;
@@ -94,9 +110,9 @@ function memoryFileIn(dir: string): string | undefined {
 }
 
 /**
- * Every memory file in scope, in injection order: the agent directory's (global, the same scope
- * as a global AGENTS.md), then ancestors from the outermost in, ending with the cwd's own.
- * Duplicates — symlinks, or an agent directory inside the walked tree — are dropped.
+ * Every memory file in scope, in injection order: the agent directory's (global, the same scope as a
+ * global AGENTS.md), then ancestors from the outermost in, ending with the cwd's own. Duplicates —
+ * symlinks, or an agent directory inside the walked tree — are dropped.
  */
 function findMemoryFiles(cwd: string): string[] {
   const found: string[] = [];
@@ -126,23 +142,23 @@ function findMemoryFiles(cwd: string): string[] {
   return found;
 }
 
-// ── Injection ────────────────────────────────────────────────────────────────
+// ── Rendering ────────────────────────────────────────────────────────────────
 
 /**
  * The prompt section this extension owns. Pi wraps its content in `<assistant_memory>…
- * </assistant_memory>`, and the memory files inside it get their own `<memory path="…">` tags —
- * the same two-level shape Pi uses for `<project_context>` and `<project_instructions>`.
+ * </assistant_memory>`, and the memory files inside it get their own `<memory path="…">` tags — the
+ * same two-level shape Pi uses for `<project_context>` and `<project_instructions>`.
  */
 export const SECTION_NAME = "assistant_memory";
 
 /**
  * Model-facing text that opens the section, outside the `<memory>` tags, the way Pi's lead-in line
- * opens `<project_context>`. Part of the extension's interface; tests assert where it goes, not
- * what it says, so rewording it is a deliberate edit and not a test failure.
+ * opens `<project_context>`. Part of the extension's interface; tests assert where it goes, not what
+ * it says, so rewording it is a deliberate edit and not a test failure.
  */
 export const MEMORY_NOTE =
-  "Assistant-maintained memory. This file is owned by you (the assistant) and is automatically injected into system message. " +
-  "Keep it up to date, and keep it short, because it is loaded into every later session. Use the normal file tools on this path to change it.";
+  "Assistant-maintained memory. This file is owned by you (the assistant) and is injected at the start of every session. " +
+  "Keep it up to date, and keep it short. Use the normal file tools on these paths to change it; edits land in later sessions, not this one.";
 
 function readMemory(path: string): string | undefined {
   try {
@@ -182,52 +198,121 @@ function renderMemory(path: string, raw: string): string | undefined {
   return `<memory path="${path}">\n${text}${marker}\n</memory>`;
 }
 
+/**
+ * Render one session's whole section, or undefined when it has no memory in it. A file Pi already
+ * loaded as project context is left out, so the same file is never in the prompt twice.
+ */
+function renderSection(cwd: string, contextFiles: ReadonlyArray<{ path: string }>): string | undefined {
+  const alreadyInPrompt = new Set(contextFiles.map((file) => canonical(file.path)));
+  const blocks: string[] = [];
+
+  for (const path of findMemoryFiles(cwd)) {
+    if (alreadyInPrompt.has(canonical(path))) {
+      debugLog(`skipping ${path}: already in the prompt as project context`);
+      continue;
+    }
+
+    const raw = readMemory(path);
+    if (raw === undefined) {
+      debugLog(`skipping ${path}: could not be read`);
+      continue;
+    }
+
+    const block = renderMemory(path, raw);
+    if (block === undefined) {
+      debugLog(`skipping ${path}: empty`);
+      continue;
+    }
+
+    blocks.push(block);
+    alreadyInPrompt.add(canonical(path));
+    debugLog(`injected ${path} (${Buffer.byteLength(block, "utf8")} bytes)`);
+  }
+
+  if (blocks.length === 0) {
+    debugLog(`no ${FILENAME} in scope for ${cwd}`);
+    return undefined;
+  }
+  debugLog(`${blocks.length} ${FILENAME} added to <${SECTION_NAME}> for ${cwd}`);
+
+  return [MEMORY_NOTE, ...blocks].join("\n\n");
+}
+
+// ── Per-session snapshots ────────────────────────────────────────────────────
+
+/**
+ * What each session's first run rendered, keyed by the session file that identifies it. Values are
+ * the section text, or undefined when that session's scope had no memory at all, which is a key
+ * worth keeping: it says the search already happened, and that this session will stay quiet about
+ * memory no matter what the file now holds.
+ *
+ * A key is dropped by `session_start`, which is how `/reload` of the same session, and `/new`,
+ * `/resume`, and `/fork` of a different one, all read the files again.
+ */
+const bySession = new Map<string, string | undefined>();
+
+/** What identifies a session for snapshot purposes, or undefined when the context has no session. */
+function sessionKey(ctx: ExtensionContext): string | undefined {
+  const file = ctx.sessionManager?.getSessionFile?.();
+  if (typeof file === "string" && file) return `file:${file}`;
+  const id = ctx.sessionManager?.getSessionId?.();
+  return typeof id === "string" && id ? `id:${id}` : undefined;
+}
+
+/** The session's section, rendering it on the first run of that session and keeping it afterward. */
+function sectionForSession(ctx: ExtensionContext, cwd: string, contextFiles: ReadonlyArray<{ path: string }>): string | undefined {
+  const key = sessionKey(ctx);
+  if (key === undefined) {
+    // Nothing to key a session by: render, but do not remember it, which is the pre-session state of
+    // a hand-built context rather than a real run.
+    debugLog("no session file or id in the context; rendering memory without caching it");
+    return renderSection(cwd, contextFiles);
+  }
+
+  if (!bySession.has(key)) {
+    bySession.set(key, renderSection(cwd, contextFiles));
+    if (bySession.size > SNAPSHOT_LIMIT) {
+      for (const oldest of bySession.keys()) {
+        bySession.delete(oldest);
+        break;
+      }
+    }
+  }
+
+  return bySession.get(key);
+}
+
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI): void {
+  pi.on("session_start", (event, ctx) => {
+    // A session boundary is where MEMORY.md is read again, and this event opens all of them: startup,
+    // `/new`, `/resume`, `/fork`, and `/reload`. Forgetting what this session had means its next run
+    // renders from what the files hold now, which is where Pi re-reads its own context files.
+    const key = sessionKey(ctx);
+    if (key === undefined) return undefined;
+    bySession.delete(key);
+    debugLog(`${event.reason}: forgot the memory of ${key}`);
+    return undefined;
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
     const options = event.systemPromptOptions;
     if (!options) return undefined;
 
-    // Pi does not load MEMORY.md itself, but another extension might, into project context; a file
-    // already in the prompt is not put in it twice. Read only: a run with nothing to inject must not
-    // touch anything.
+    // Pi rebuilds the prompt options for every run and diffs the sections that come out of them
+    // against the transcript, so the same text every run is what leaves the prompt, and the model's
+    // cache, alone. Read only: a session with no memory in scope must not touch anything.
     const contextFiles = Array.isArray(options.contextFiles) ? options.contextFiles : [];
-    const alreadyInjected = new Set(contextFiles.map((file: { path: string }) => canonical(file.path)));
+    const section = sectionForSession(ctx, ctx.cwd, contextFiles);
 
-    const blocks: string[] = [];
-    for (const path of findMemoryFiles(ctx.cwd)) {
-      if (alreadyInjected.has(canonical(path))) {
-        debugLog(`skipping ${path}: already in the prompt as project context`);
-        continue;
-      }
-
-      const raw = readMemory(path);
-      if (raw === undefined) {
-        debugLog(`skipping ${path}: could not be read`);
-        continue;
-      }
-
-      const block = renderMemory(path, raw);
-      if (block === undefined) {
-        debugLog(`skipping ${path}: empty`);
-        continue;
-      }
-
-      blocks.push(block);
-      alreadyInjected.add(canonical(path));
-      debugLog(`injected ${path} (${Buffer.byteLength(block, "utf8")} bytes)`);
-    }
-
-    // The section is this extension's to own: it is rewritten every run, and removed when there is
-    // nothing to put in it, so a file deleted or emptied mid-session stops being injected.
-    if (blocks.length === 0) {
+    if (section === undefined) {
+      // A run that remembers no memory must not look like it changed the prompt: an empty section
+      // here would be a prompt delta.
       if (options.sections) delete options.sections[SECTION_NAME];
-      if (DEBUG) debugLog(`no ${FILENAME} in scope for ${ctx.cwd}`);
     } else {
       if (!options.sections || typeof options.sections !== "object") options.sections = {};
-      options.sections[SECTION_NAME] = [MEMORY_NOTE, ...blocks].join("\n\n");
-      if (DEBUG) debugLog(`${blocks.length} ${FILENAME} added to <${SECTION_NAME}> for ${ctx.cwd}`);
+      options.sections[SECTION_NAME] = section;
     }
 
     return undefined;

@@ -6,6 +6,10 @@
  * from the extension itself rather than being copied here, so rewording it is an edit to the
  * extension, not a test failure; what is pinned down is where the note sits relative to the tags.
  *
+ * MEMORY.md is a startup input: each session reads it once, on its first run, and keeps that
+ * rendering for as long as that session lasts. `run()` gives each call its own session unless a test
+ * passes one, which is how the difference between the same session and a new one gets exercised.
+ *
  * Assertions are scoped to paths inside each test's own sandbox: the extension searches the whole
  * ancestor chain up to the filesystem root, so a MEMORY.md belonging to the machine running the
  * tests must not make these fail.
@@ -38,16 +42,19 @@ interface PromptOptions {
 interface PromptState {
   files: ContextFile[];
   sections: Record<string, string>;
+  sessionId: string;
 }
 
 let cwd: TempDir;
 let agentDir: TempDir;
 let ext: LoadedExtension;
+let sessions = 0;
 
 beforeEach(async () => {
   cwd = makeTempDir("pi-memory-cwd-");
   agentDir = makeTempDir("pi-memory-agent-");
   ext = await loadExtension({ packageDir: packageDir("pi-memory"), cwd: cwd.path, agentDir: agentDir.path });
+  sessions = 0;
 });
 
 afterEach(() => {
@@ -56,8 +63,12 @@ afterEach(() => {
   agentDir?.dispose();
 });
 
-/** Run one turn and return the prompt options as the extension left them. */
-async function run(startingFiles: ContextFile[] = [], runCwd: string = cwd.path): Promise<PromptState> {
+/**
+ * Run one turn and return the prompt options as the extension left them. `session` is what makes
+ * this run part of an existing session; omit it for a session nobody has run yet.
+ */
+async function run(startingFiles: ContextFile[] = [], runCwd: string = cwd.path, session?: string): Promise<PromptState> {
+  const id = session ?? `session-${++sessions}`;
   const event = {
     type: "before_agent_start",
     messageType: "user",
@@ -65,23 +76,33 @@ async function run(startingFiles: ContextFile[] = [], runCwd: string = cwd.path)
     systemPrompt: "",
     systemPromptOptions: { cwd: runCwd, contextFiles: startingFiles.map((file) => ({ ...file })), sections: {} },
   };
-  await ext.emit(event, ext.makeContext({ cwd: runCwd }));
-
+  await ext.emit(event, ext.makeContext({ cwd: runCwd, sessionId: id, sessionFile: join(agentDir.path, "sessions", `${id}.jsonl`) }));
   return {
     files: event.systemPromptOptions.contextFiles as ContextFile[],
     sections: event.systemPromptOptions.sections as Record<string, string>,
+    sessionId: id,
   };
 }
 
+/** Begin a session boundary for `session`, the way Pi's `/reload`, `/new`, or `/resume` would. */
+async function sessionStart(session: string, reason = "reload"): Promise<void> {
+  await ext.emit({ type: "session_start", reason }, sessionContext(session));
+}
+
+/** The context one run of `session` gets; the same file path means the same session. */
+function sessionContext(session: string) {
+  return ext.makeContext({ cwd: cwd.path, sessionId: session, sessionFile: join(agentDir.path, "sessions", `${session}.jsonl`) });
+}
+
 /** The memory section for one run, or undefined when the run left no memory in the prompt. */
-async function section(startingFiles: ContextFile[] = [], runCwd: string = cwd.path): Promise<string | undefined> {
-  const state = await run(startingFiles, runCwd);
+async function section(startingFiles: ContextFile[] = [], runCwd: string = cwd.path, session?: string): Promise<string | undefined> {
+  const state = await run(startingFiles, runCwd, session);
   return state.sections[SECTION_NAME];
 }
 
 /** The memory section for one run, failing the test when the run injected nothing. */
-async function sectionOf(startingFiles: ContextFile[] = [], runCwd: string = cwd.path): Promise<string> {
-  const text = await section(startingFiles, runCwd);
+async function sectionOf(startingFiles: ContextFile[] = [], runCwd: string = cwd.path, session?: string): Promise<string> {
+  const text = await section(startingFiles, runCwd, session);
   if (text === undefined) throw new Error(`the run injected no <${SECTION_NAME}> section`);
   return text;
 }
@@ -116,10 +137,10 @@ function write(dir: string, name: string, text: string): string {
 }
 
 describe("pi-memory", () => {
-  it("registers a before_agent_start handler and nothing else", () => {
+  it("registers a before_agent_start and a session_start handler, and nothing else", () => {
     expect([...ext.tools.keys()]).toEqual([]);
-    expect([...ext.handlers.keys()]).toEqual(["before_agent_start"]);
-    expect(ext.calls.map((call) => call.prop)).toEqual(["on"]);
+    expect([...ext.handlers.keys()]).toEqual(["session_start", "before_agent_start"]);
+    expect(ext.calls.map((call) => call.prop)).toEqual(["on", "on"]);
   });
 
   it("does nothing when no MEMORY.md exists", async () => {
@@ -132,14 +153,14 @@ describe("pi-memory", () => {
   });
 
   it("leaves the prompt options untouched when there is nothing to inject", async () => {
-    // A no-op run must not look like it changed the prompt, even in the shape of the options: Pi
+    // A no-memory run must not look like it changed the prompt, even in the shape of the options: Pi
     // diffs sections against the transcript, so an empty section here would be a prompt delta.
     const agentsPath = write(cwd.path, "AGENTS.md", "# spec\n");
     const options: PromptOptions = { cwd: cwd.path, contextFiles: [{ path: agentsPath, content: "# spec" }] };
 
     await ext.emit(
       { type: "before_agent_start", messageType: "user", prompt: "hello", systemPrompt: "", systemPromptOptions: options },
-      ext.makeContext(),
+      ext.makeContext({ sessionId: "quiet-session", sessionFile: join(agentDir.path, "sessions", "quiet-session.jsonl") }),
     );
 
     expect(options).toEqual({ cwd: cwd.path, contextFiles: [{ path: agentsPath, content: "# spec" }] });
@@ -254,35 +275,6 @@ describe("pi-memory", () => {
     expect(blocks(state.sections[SECTION_NAME] ?? "")).toEqual([]);
   });
 
-  it("re-reads the file for every run, so an edit reaches the next prompt", async () => {
-    const path = write(cwd.path, "MEMORY.md", "- first version\n");
-
-    expect(blocks(await sectionOf())[0]?.body).toBe("- first version");
-    writeFileSync(path, "- second version\n");
-    expect(only(await sectionOf(), [cwd.path]).body).toBe("- second version");
-  });
-
-  it("picks up a MEMORY.md created during the session", async () => {
-    expect(await section()).toBeUndefined();
-
-    write(cwd.path, "MEMORY.md", "- written mid-session\n");
-
-    expect(only(await sectionOf(), [cwd.path]).body).toBe("- written mid-session");
-  });
-
-  it("drops the section when the MEMORY.md is deleted or emptied during the session", async () => {
-    const path = write(cwd.path, "MEMORY.md", "- was here\n");
-    expect(await section()).toBeDefined();
-
-    writeFileSync(path, "");
-
-    const state = await run();
-    expect(state.sections[SECTION_NAME]).toBeUndefined();
-
-    rmSync(path);
-    expect((await run()).sections[SECTION_NAME]).toBeUndefined();
-  });
-
   it("does not inject a MEMORY.md another extension already loaded", async () => {
     write(cwd.path, "MEMORY.md", "- mine\n");
 
@@ -299,7 +291,7 @@ describe("pi-memory", () => {
 
     await ext.emit(
       { type: "before_agent_start", messageType: "user", prompt: "hello", systemPrompt: "", systemPromptOptions: options },
-      ext.makeContext(),
+      ext.makeContext({ sessionId: "no-sections", sessionFile: join(agentDir.path, "sessions", "no-sections.jsonl") }),
     );
 
     expect(options.sections?.[SECTION_NAME]).toContain("<memory path=");
@@ -318,7 +310,7 @@ describe("pi-memory", () => {
 
     await ext.emit(
       { type: "before_agent_start", messageType: "user", prompt: "hello", systemPrompt: "", systemPromptOptions: options },
-      ext.makeContext(),
+      ext.makeContext({ sessionId: "another-section", sessionFile: join(agentDir.path, "sessions", "another-section.jsonl") }),
     );
 
     expect(options.sections?.other_extension).toBe("someone else's section");
@@ -326,10 +318,9 @@ describe("pi-memory", () => {
   });
 
   it("adds a section that Pi does not produce, and Pi still does not read MEMORY.md", async () => {
-    // The whole feature rests on Pi leaving MEMORY.md out of the project-context files it loads, and
-    // on `sections` being a place to put what is left out. If Pi starts loading MEMORY.md itself,
-    // this fails on purpose: the extension would need to become a rewrite of that section, not a
-    // second one.
+    // The whole feature rests on Pi leaving MEMORY.md out of the project-context files it loads. If
+    // Pi starts loading MEMORY.md itself, this fails on purpose: the extension would need to become a
+    // rewrite of that part of Pi, not a section of its own.
     const agentsPath = write(cwd.path, "AGENTS.md", "# spec\n");
     const memoryPath = write(cwd.path, "MEMORY.md", "- note\n");
 
@@ -340,5 +331,88 @@ describe("pi-memory", () => {
     expect(fromPi.map((file) => file.path)).not.toContain(memoryPath);
     expect(state.files.map((file) => file.path)).toEqual(fromPi.map((file) => file.path));
     expect(only(state.sections[SECTION_NAME]!, [cwd.path]).body).toBe("- note");
+  });
+});
+
+describe("MEMORY.md within one session", () => {
+  it("gives every run of a session the same section, so Pi patches nothing after the first", async () => {
+    write(cwd.path, "MEMORY.md", "- first version\n");
+    const session = "one-session";
+
+    const first = await sectionOf([], cwd.path, session);
+    writeFileSync(join(cwd.path, "MEMORY.md"), "- rewritten mid-session\n");
+    const second = await sectionOf([], cwd.path, session);
+
+    // Pi only patches the sections that differ, so identical text means no new system message and no
+    // upstream prompt-cache break.
+    expect(second).toBe(first);
+    expect(only(second, [cwd.path]).body).toBe("- first version");
+  });
+
+  it("reads MEMORY.md once per session, so an edit mid-session reaches the model later", async () => {
+    const path = write(cwd.path, "MEMORY.md", "- first version\n");
+
+    // The same session, two runs.
+    expect(only(await sectionOf([], cwd.path, "same"), [cwd.path]).body).toBe("- first version");
+    writeFileSync(path, "- second version\n");
+    expect(only(await sectionOf([], cwd.path, "same"), [cwd.path]).body).toBe("- first version");
+
+    // A new session reads it again, and reads what the file holds now.
+    expect(only(await sectionOf([], cwd.path, "next"), [cwd.path]).body).toBe("- second version");
+  });
+
+  it("ignores a MEMORY.md that appears during the session, and one that disappears", async () => {
+    expect(await section([], cwd.path, "empty-to-full")).toBeUndefined();
+    const path = write(cwd.path, "MEMORY.md", "- written mid-session\n");
+    expect(await section([], cwd.path, "empty-to-full")).toBeUndefined();
+
+    expect(only(await sectionOf([], cwd.path, "full-to-empty"), [cwd.path]).body).toBe("- written mid-session");
+    writeFileSync(path, "");
+    expect(only(await sectionOf([], cwd.path, "full-to-empty"), [cwd.path]).body).toBe("- written mid-session");
+    rmSync(path);
+    expect(only(await sectionOf([], cwd.path, "full-to-empty"), [cwd.path]).body).toBe("- written mid-session");
+  });
+
+  it("keeps each session's own rendering when sessions are swapped", async () => {
+    const path = write(cwd.path, "MEMORY.md", "- old session\n");
+
+    const oldSection = await sectionOf([], cwd.path, "old");
+    writeFileSync(path, "- new session\n");
+
+    // A session Pi starts for you — /new, /resume, /fork — is a different session, so it reads the
+    // file as it stands then. The session already running keeps what it started with.
+    expect(only(await sectionOf([], cwd.path, "new"), [cwd.path]).body).toBe("- new session");
+    expect(only(await sectionOf([], cwd.path, "old"), [cwd.path]).body).toBe("- old session");
+    expect(only(oldSection, [cwd.path]).body).toBe("- old session");
+  });
+
+  it("reads MEMORY.md again when a session boundary reopens it, as /reload does", async () => {
+    const path = write(cwd.path, "MEMORY.md", "- first version\n");
+    const reopened = "reopened";
+    const running = "still-running";
+
+    expect(only(await sectionOf([], cwd.path, reopened), [cwd.path]).body).toBe("- first version");
+    expect(only(await sectionOf([], cwd.path, running), [cwd.path]).body).toBe("- first version");
+
+    writeFileSync(path, "- second version\n");
+    await sessionStart(reopened);
+
+    // Pi re-reads AGENTS.md on /reload, and MEMORY.md behaves the same way: the session that starts
+    // now reads the files again, and the one already running keeps what it started with.
+    expect(only(await sectionOf([], cwd.path, reopened), [cwd.path]).body).toBe("- second version");
+    expect(only(await sectionOf([], cwd.path, running), [cwd.path]).body).toBe("- first version");
+  });
+
+  it("replaces a session's memory when the sessions it remembers run out", async () => {
+    const path = write(cwd.path, "MEMORY.md", "- old\n");
+
+    const remembered = await sectionOf([], cwd.path, "remembered");
+    // Enough unrelated sessions to push the first one out of the snapshots it is kept in.
+    for (let i = 0; i < 32; i++) await section([], cwd.path, `filler-${i}`);
+
+    writeFileSync(path, "- new\n");
+
+    expect(only(remembered, [cwd.path]).body).toBe("- old");
+    expect(only(await sectionOf([], cwd.path, "remembered"), [cwd.path]).body).toBe("- new");
   });
 });

@@ -8,11 +8,11 @@ test harness, shared tooling, and a single install for the whole set.
 
 ## Extensions
 
-| Package                                 | What it does                                                                                                                                    | Adds                                                                                     |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them.   | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
-| [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, in a prompt section of its own, and tells it to keep that file current. | none — it changes the prompt, not the tool list                                          |
-| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                               | `subagent`                                                                               |
+| Package                                 | What it does                                                                                                                                                               | Adds                                                                                     |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them.                              | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
+| [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, in a prompt section of its own, reads it once per session, and tells it to keep that file current. | none — it changes the prompt, not the tool list                                          |
+| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                                                          | `subagent`                                                                               |
 
 Read each package's README for parameters, environment variables, and behaviour details.
 
@@ -21,7 +21,8 @@ Read each package's README for parameters, environment variables, and behaviour 
 `AGENTS.md` is the spec, and only the user writes it. `MEMORY.md` is what the assistant writes as it
 works — decisions, gotchas, commands, what broke and why — and `pi-memory` injects it beside
 `AGENTS.md` in a section of its own (`<assistant_memory>`, with one `<memory path="…">` block per
-file), and tells the assistant to keep it current. Every Pi session in this checkout gets both.
+file), and tells the assistant to keep it current. Every Pi session in this checkout gets both, and
+each session reads `MEMORY.md` once, the way Pi reads `AGENTS.md`.
 
 ## Use them
 

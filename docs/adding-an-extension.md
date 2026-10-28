@@ -55,6 +55,12 @@ Rules worth keeping, from Pi's own [extension docs](https://github.com/earendil-
   `/^[a-z][a-z0-9_-]*$/` and is shared with every other extension, so own it and rewrite it on every
   run rather than appending to it.
 
+- A section Pi sees as changed becomes a transcript delta: the new text is replayed ahead of the
+  messages that already followed it, and the provider's prompt cache breaks from there down. So decide
+  when a section is allowed to change, and hold it still the rest of the way. `pi-memory` renders its
+  section once per session and re-renders it only at a session boundary (`session_start`), because
+  Pi re-reads `AGENTS.md` on `/reload` but never between two runs of one session.
+
 - Do not start processes, timers, watchers, or sockets in the factory. Some Pi invocations load
   extensions without starting a session. Start them from `session_start` or from the tool that
   needs them, and clean up in `session_shutdown`.
