@@ -29,8 +29,8 @@ Injects MEMORY.md into system message after AGENTS.md. The workflow is - I manua
 
 ## Pi docs
 
-- Main documentation: /home/jj/.nvm/versions/node/v26.9.0/lib/node_modules/@earendil-works/pi-coding-agent/README.md
-- Additional docs: /home/jj/.nvm/versions/node/v26.9.0/lib/node_modules/@earendil-works/pi-coding-agent/docs
-- Examples: /home/jj/.nvm/versions/node/v26.9.0/lib/node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)
+- Main documentation: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/README.md
+- Additional docs: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/docs
+- Examples: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)
 
 Note that exact path might change with updates.
