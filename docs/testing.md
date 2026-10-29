@@ -34,7 +34,7 @@ afterAll(() => ext?.dispose());
   a Proxy: `registerTool`, `on`, `registerCommand`, and friends are captured, and any other member
   throws with a message telling you to add it to the harness, so tests never silently skip a code
   path the extension added;
-- exposes `tools`, `handlers`, and `calls` for assertions;
+- exposes `tools`, `commands`, `handlers`, `sent`, and `calls` for assertions;
 - `callTool(name, params, { signal, onUpdate, context })` runs a registered tool's `execute` with a
   hand-built `ExtensionToolContext`; `context` overrides land on the context, which is how you set
   `model`, `thinkingLevel`, `cwd`, `sessionId`, or `sessionFile`;
@@ -44,6 +44,10 @@ afterAll(() => ext?.dispose());
   ```ts
   await ext.emit({ type: "session_shutdown", reason: "quit" });
   ```
+- `runCommand(name, args, context)` runs a registered slash command's handler, and `ext.sent` collects
+  what the extension sent back into the session with `pi.sendUserMessage`. `pi-takeover` is the package
+  that uses both most: a tool queues work, and a command is the only context Pi lets replace a session
+  from, so the queue is tested through the tool and the replacement through the command.
 - `dispose()` restores the environment and removes the temp directories.
 
 Options: `{ packageDir, entry, cwd, agentDir, env }`. Reusing `agentDir` across two loads models a
@@ -51,6 +55,26 @@ reload: the same on-disk configuration with a fresh runtime.
 
 Two small helpers come with it: `test/helpers/wait.ts` (`waitFor`, `isAlive`) for watching real
 processes, and `test/helpers/env.ts` (`withEnv`) for scoping environment variables.
+
+## Driving a real Pi
+
+Unit tests fake the parts Pi would otherwise provide. Where the behaviour _is_ Pi's — a session being
+replaced, a system prompt reaching a model, a transcript being written — a faked part proves the shape
+of the call and nothing more. `packages/pi-takeover/test/session.test.ts` therefore starts a real
+`pi --mode rpc` (the one pinned in `devDependencies`) in a temporary agent dir and working dir, with
+`-ne` so nothing outside the test loads, and talks the protocol by hand.
+
+The model is `packages/<package>/test/fixtures/fake-model.ts`: an extension registering a `fake`
+provider whose `streamSimple` answers from rules matched against the transcript it was shown, and
+appends what every call was shown to `PI_FAKE_LOG`. Rules rather than a turn counter because Pi builds a
+fresh extension instance per session, so anything counted in the fixture restarts when a session does.
+Reading the log is how a test sees the context of a session it did not start.
+
+The same fixture drives the manual version, which prints the whole flow instead of asserting on it:
+
+```bash
+npm run smoke -- pi-takeover
+```
 
 ## Repo-level tests
 

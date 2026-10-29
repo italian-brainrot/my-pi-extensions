@@ -16,6 +16,11 @@ const EXPECTED = [
   { package: "pi-bg-tasks", tools: ["bash", "bg_stop", "bg_wait"], events: ["session_shutdown", "session_start"] },
   { package: "pi-memory", tools: [], events: ["before_agent_start", "session_start"] },
   { package: "pi-subagent", tools: ["subagent"], events: [] },
+  {
+    package: "pi-takeover",
+    tools: ["takeover"],
+    events: ["agent_settled", "before_agent_start", "input", "session_shutdown", "session_start"],
+  },
 ];
 
 const rootManifest = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8"));

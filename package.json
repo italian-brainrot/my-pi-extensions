@@ -12,7 +12,8 @@
     "extensions": [
       "./packages/pi-bg-tasks/src/index.ts",
       "./packages/pi-memory/src/index.ts",
-      "./packages/pi-subagent/src/index.ts"
+      "./packages/pi-subagent/src/index.ts",
+      "./packages/pi-takeover/src/index.ts"
     ]
   },
   "scripts": {
@@ -23,6 +24,7 @@
     "lint": "biome check .",
     "manifest": "node scripts/sync-manifest.mjs",
     "new": "node scripts/new-extension.mjs",
+    "smoke": "node scripts/extension-smoke.mjs",
     "test": "vitest --run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

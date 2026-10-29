@@ -1,0 +1,28 @@
+{
+  "name": "pi-takeover",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Replace the running agent with a fresh session carrying a handoff prompt",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "takeover"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

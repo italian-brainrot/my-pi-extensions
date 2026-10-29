@@ -61,6 +61,14 @@ Rules worth keeping, from Pi's own [extension docs](https://github.com/earendil-
   section once per session and re-renders it only at a session boundary (`session_start`), because
   Pi re-reads `AGENTS.md` on `/reload` but never between two runs of one session.
 
+- Not every context can do everything. A tool's `execute` gets an `ExtensionToolContext`; waiting for
+  the agent, starting a new session, forking, switching sessions, and `/reload` belong to the
+  `ExtensionCommandContext` Pi hands to command handlers. A tool that needs one of those reaches it by
+  queueing work and dispatching an extension command at a safe boundary — `pi.sendUserMessage("/my-command", {
+  expandPromptTemplates: true })` from an event handler, which Pi runs as the command. A captured `pi`
+  or context also goes stale the moment the session is replaced; use the context a replacement hands
+  back, and read anything you will need from the old one before the call. `pi-takeover` is the example.
+
 - Do not start processes, timers, watchers, or sockets in the factory. Some Pi invocations load
   extensions without starting a session. Start them from `session_start` or from the tool that
   needs them, and clean up in `session_shutdown`.
@@ -115,7 +123,12 @@ changes the system prompt instead) is listed with `tools: []`.
 ```bash
 npm run check          # manifest --check, typecheck, lint, tests
 npm run dev            # load it in a real pi session, then /reload after edits
+npm run smoke          # drive it with a scripted model against a real pi, and print the result
 ```
+
+`npm run smoke` needs a scenario in `scripts/extension-smoke.mjs` and a `test/fixtures/fake-model.ts`
+in the package. Writing them is worth it for any extension whose behaviour depends on Pi's own
+lifecycle — sessions, prompts, the system prompt — rather than on what the tool returns.
 
 `npm run check` failing is a normal part of the loop: Biome reformats, `npm run fmt` fixes files, and
 the manifest script rewrites the root list when you add a package.

@@ -13,6 +13,7 @@ test harness, shared tooling, and a single install for the whole set.
 | [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them.                              | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
 | [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, in a prompt section of its own, reads it once per session, and tells it to keep that file current. | none — it changes the prompt, not the tool list                                          |
 | [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                                                          | `subagent`                                                                               |
+| [`pi-takeover`](./packages/pi-takeover) | Ends the running agent and starts a fresh one on a handoff prompt, so an implement/review loop can run unattended with one live session at a time.                         | `takeover`, `/takeover`, `/takeover-cancel`                                              |
 
 Read each package's README for parameters, environment variables, and behaviour details.
 
@@ -75,6 +76,7 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 | `npm run manifest`                         | Rewrite the root `pi.extensions` list from the packages. `--check` in CI.                     |
 | `npm run new -- pi-name --description "…"` | Scaffold a new extension package, test, README, and manifest entry.                           |
 | `npm run dev`                              | Pi with the repo's extensions loaded from source.                                             |
+| `npm run smoke -- pi-takeover`             | Drive a real Pi with a scripted model, and print what happened.                               |
 | `npm run install:personal`                 | `pi install .` — add this repo to your personal Pi settings.                                  |
 
 ## Layout
@@ -92,6 +94,7 @@ packages/
   pi-memory/
     ...
   pi-subagent/
+  pi-takeover/
     ...
 test/
   helpers/extension.ts    shared harness: load an extension with a recording pi API

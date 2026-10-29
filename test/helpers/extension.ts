@@ -25,11 +25,28 @@ export interface RecordedCall {
   args: unknown[];
 }
 
+/** A command registered with `pi.registerCommand`. */
+export interface RegisteredCommand {
+  name: string;
+  description?: string;
+  handler: (args: string, ctx: any) => Promise<void> | void;
+}
+
+/** A message an extension sent back into the session with `pi.sendUserMessage`. */
+export interface SentMessage {
+  content: unknown;
+  options?: unknown;
+}
+
 export interface LoadedExtension {
   /** The recording stand-in handed to the extension factory. */
   api: ExtensionAPI;
   /** Tools the extension registered, by tool name. */
   tools: Map<string, ToolDefinition>;
+  /** Commands the extension registered, by command name. */
+  commands: Map<string, RegisteredCommand>;
+  /** Messages the extension sent into the session through `pi.sendUserMessage`. */
+  sent: SentMessage[];
   /** Event handlers registered with `pi.on(event, handler)`. */
   handlers: Map<string, Array<(event: any, ctx: any) => unknown>>;
   /** Every `pi.*` member the extension touched, in order. Fails loudly for unknown members. */
@@ -38,6 +55,8 @@ export interface LoadedExtension {
   cwd: string;
   /** Run a registered tool's execute with a default context. */
   callTool(name: string, params: unknown, options?: CallOptions): Promise<any>;
+  /** Run a registered command's handler with a hand-built command context. */
+  runCommand(name: string, args?: string, context?: Partial<Record<string, unknown>>): Promise<void>;
   /** Build a tool context; every field is overridable per test. */
   makeContext(overrides?: Partial<Record<string, unknown>>): ExtensionToolContext;
   /** Deliver an event to every handler registered for its type, in registration order. */
@@ -95,6 +114,8 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   }
 
   const tools = new Map<string, ToolDefinition>();
+  const commands = new Map<string, RegisteredCommand>();
+  const sent: SentMessage[] = [];
   const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
   const calls: RecordedCall[] = [];
 
@@ -123,6 +144,13 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
             };
           };
         case "registerCommand":
+          return (name: string, options: { description?: string; handler: (args: string, ctx: any) => Promise<void> | void }) => {
+            commands.set(name, { name, ...options });
+          };
+        case "sendUserMessage":
+          return (content: unknown, options?: unknown) => {
+            sent.push({ content, options });
+          };
         case "registerShortcut":
         case "registerFlag":
         case "registerMessageRenderer":
@@ -157,12 +185,21 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   const loaded: LoadedExtension = {
     api,
     tools,
+    commands,
+    sent,
     handlers,
     calls,
     agentDir,
     cwd,
     makeContext(overrides) {
       return makeToolContext({ cwd, agentDir, ...overrides });
+    },
+    async runCommand(name, args = "", context) {
+      const command = commands.get(name);
+      if (!command) {
+        throw new Error(`Command "${name}" is not registered. Registered: ${[...commands.keys()].join(", ") || "none"}.`);
+      }
+      await command.handler(args, loaded.makeContext(context));
     },
     async callTool(name, params, callOptions = {}) {
       const tool = tools.get(name);
