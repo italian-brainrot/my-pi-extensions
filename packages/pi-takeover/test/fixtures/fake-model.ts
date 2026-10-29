@@ -91,9 +91,21 @@ export default function (pi: ExtensionAPI): void {
         contextWindow: 200_000,
         maxTokens: 1024,
       },
+      // A second model to switch to, so a test can see whether a takeover carries a session-scoped
+      // model selection over to the session it starts.
+      {
+        id: "other",
+        name: "Fake scripted model, second one",
+        api: "fake",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200_000,
+        maxTokens: 1024,
+      },
     ],
 
-    streamSimple: (model: Model<any>, context: TranscriptContext, _options?: SimpleStreamOptions) => {
+    streamSimple: (model: Model<any>, context: TranscriptContext, options?: SimpleStreamOptions) => {
       const messages = Array.isArray(context.messages) ? context.messages : [];
       const users = messages.filter((message: any) => message?.role === "user");
       const lastUser = users.length > 0 ? textOf(users[users.length - 1]) : "";
@@ -105,6 +117,8 @@ export default function (pi: ExtensionAPI): void {
           `${JSON.stringify({
             call,
             cwd: process.cwd(),
+            model: `${model.provider}/${model.id}`,
+            reasoning: options?.reasoning,
             userCount: users.length,
             lastUser,
             systemTakeoverSection: messages.filter((m: any) => m?.role === "system").map((m: any) => m?.sections?.takeover ?? null),

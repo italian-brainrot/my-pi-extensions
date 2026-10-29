@@ -25,8 +25,18 @@ Pi facts that took digging, in case the extension has to change:
   empty. A scripted model checks `message.sections.takeover`.
 - Replacing a session does not disturb `pi-bg-tasks` jobs: shutdown reason is `new`, and those survive
   everything but `quit`.
+- A replacement session picks its model from settings, so a model the agent switched to (session-scoped,
+  like everything Pi's `/model` does) is lost. `setModel`/`setThinkingLevel` are on the **API**, not on
+  any ctx, so only the incoming session's own extension instance can apply them: the outgoing one records
+  `{provider, id, thinkingLevel}` in the lineage entry, and the new session reads it at its `session_start`
+  with `reason: "new"`. That event fires before `withSession` runs (rebindSession → bindExtensions), so the
+  model is right before the handoff prompt is sent. `ctx.modelRegistry.find(provider, id)` gives the Model.
+  Guard on `reason === "new"`: on a resume, the session's own later choice has to win.
+- In `--mode rpc` each stdin line starts its own async handler, so a slow command (`set_model` checks auth)
+  can finish after the one sent after it. Wait for each reply before sending the next.
 
-Tests: `npm run test -- --run packages/pi-takeover`. `test/session.test.ts` drives the real
+Tests: `npx vitest --run packages/pi-takeover` (the `test` script already passes `--run`, so
+`npm run test -- --run …` duplicates the flag and vitest refuses). `test/session.test.ts` drives the real
 `node_modules/.bin/pi --mode rpc` with `test/fixtures/fake-model.ts`, which answers from rules matched
 against the transcript it is shown and logs what every call was given. `npm run smoke -- pi-takeover`
 prints the same flow for reading rather than asserting.

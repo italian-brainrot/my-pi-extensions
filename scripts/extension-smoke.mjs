@@ -39,6 +39,11 @@ const SCENARIOS = {
       { respond: { toolCall: { name: "takeover", arguments: { prompt: "REVIEW: check the change and report blockers." } } } },
     ],
     env: { PI_TAKEOVER_DEBUG: process.env.PI_TAKEOVER_DEBUG ?? "1" },
+    // A model switch first: it belongs to the session that made it, so a takeover has to carry it over.
+    setup: [
+      { id: "model", type: "set_model", provider: "fake", modelId: "other" },
+      { id: "thinking", type: "set_thinking_level", level: "medium" },
+    ],
     sessions: true,
   },
 };
@@ -82,6 +87,8 @@ const child = spawn(pi, ["--mode", "rpc", "--model", "fake/fake", "-ne", "-e", e
 });
 
 let buffer = "";
+/** Ids of the rpc commands this script has seen the answer to, so the next one can wait for its turn. */
+const answered = new Set();
 child.stdout.on("data", (chunk) => {
   buffer += chunk.toString("utf8");
   const lines = buffer.split("\n");
@@ -99,6 +106,7 @@ child.stdout.on("data", (chunk) => {
     }
 
     if (record.type === "message_update") continue;
+    if (record.type === "response" && record.id) answered.add(String(record.id));
 
     const detail =
       record.type === "message_end"
@@ -139,6 +147,10 @@ function describeSessions() {
       console.log(`  parent: ${entries[0]?.parentSession ?? "none"}`);
       console.log(`  entries: ${entries.map((entry) => (entry.type === "message" ? entry.message?.role : entry.type)).join(", ")}`);
       console.log(`  name: ${entries.find((entry) => entry.type === "session_info")?.name ?? "none"}`);
+      const selection = entries
+        .filter((entry) => entry.type === "model_change" || entry.type === "thinking_level_change")
+        .map((entry) => (entry.type === "model_change" ? `${entry.provider}/${entry.modelId}` : `thinking:${entry.thinkingLevel}`));
+      console.log(`  selection: ${selection.join(" -> ")}`);
       for (const entry of entries) {
         if (entry.type === "custom") console.log(`  ${entry.customType}: ${JSON.stringify(entry.data).slice(0, 220)}`);
       }
@@ -146,7 +158,16 @@ function describeSessions() {
   }
 }
 
-setTimeout(() => {
+setTimeout(async () => {
+  // RPC answers commands as they arrive rather than one after another, so each one is waited for:
+  // `set_model` picks a thinking level of its own, and it must not land after a level set here.
+  for (const command of scenario.setup ?? []) {
+    child.stdin.write(`${JSON.stringify(command)}\n`);
+    const deadline = Date.now() + 8000;
+    while (!answered.has(String(command.id)) && Date.now() < deadline) {
+      await new Promise((resolveStep) => setTimeout(resolveStep, 50));
+    }
+  }
   child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: scenario.prompt })}\n`);
 }, 1200);
 

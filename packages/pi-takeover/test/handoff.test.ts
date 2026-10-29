@@ -2,7 +2,8 @@
  * The apply step: a queued handoff replacing one session with another.
  *
  * Pi's `newSession()` is faked here — the point is what pi-takeover asks Pi to do and what it writes
- * while asking. `session.test.ts` runs the same flow against a real Pi process.
+ * while asking, including the model selection it hands across the boundary. `session.test.ts` runs the
+ * same flow against a real Pi process.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -25,6 +26,8 @@ afterEach(async () => {
   const { rmSync } = await import("node:fs");
   rmSync(join(ext.agentDir, "takeover"), { recursive: true, force: true });
   ext.sent.length = 0;
+  ext.modelsSet.length = 0;
+  ext.thinkingLevelsSet.length = 0;
 });
 
 /** What a faked `newSession()` recorded. */
@@ -251,5 +254,126 @@ describe("applying a handoff", () => {
     expect(notices.join(" ")).toContain("No handoff is queued");
     expect(notices.join(" ")).toContain("No takeover chain in progress");
     expect(existsSync(join(ext.agentDir, "takeover", "pending.json"))).toBe(false);
+  });
+});
+
+/**
+ * The incoming session, seeing itself the way Pi shows it: a branch with its own initial model change
+ * and the lineage entry the handoff wrote. `findModel` decides whether the model the handoff carried is
+ * in this session's catalogue.
+ */
+function incomingContext(
+  entryData: unknown,
+  options: { current?: { provider: string; id: string }; find?: (provider: string, id: string) => unknown; notices?: string[] } = {},
+) {
+  const sessionManager = {
+    getSessionId: () => "incoming",
+    getSessionFile: () => INCOMING,
+    getSessionDir: () => join(INCOMING, ".."),
+    getBranch: () => [
+      {
+        type: "model_change",
+        id: "m1",
+        parentId: null,
+        provider: options.current?.provider ?? "fake",
+        modelId: options.current?.id ?? "small",
+      },
+      { type: "custom", id: "t1", parentId: "m1", customType: "takeover", data: entryData },
+    ],
+  };
+
+  return ext.makeContext({
+    sessionFile: INCOMING,
+    sessionManager,
+    model: { provider: options.current?.provider ?? "fake", id: options.current?.id ?? "small", api: "test" },
+    modelRegistry: {
+      find: options.find ?? ((provider: string, id: string) => ({ provider, id, api: "test" })),
+    },
+    ...(options.notices ? { hasUI: true, ui: { notify: (message: string) => void options.notices?.push(message) } } : undefined),
+  });
+}
+
+const CARRIED = { position: 1, maxChain: 12, prompt: HANDOFF, model: { provider: "acme", id: "large", thinkingLevel: "high" } };
+
+describe("the model a takeover hands on", () => {
+  it("records what the session it replaced was running on", async () => {
+    const replacement: Replacement = { entries: [], sent: [], calls: 0 };
+    await queue();
+
+    const { overrides } = outgoingContext(replacement);
+    overrides.model = { provider: "acme", id: "large", api: "test" };
+    overrides.thinkingLevel = "high";
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    expect(replacement.entries[0]!.data.model).toEqual({ provider: "acme", id: "large", thinkingLevel: "high" });
+  });
+
+  it("puts the incoming session back on the model the handoff carried", async () => {
+    await ext.emit({ type: "session_start", reason: "new", previousSessionFile: OUTGOING }, incomingContext(CARRIED));
+
+    expect(ext.modelsSet).toEqual([{ provider: "acme", id: "large", api: "test" }]);
+    expect(ext.thinkingLevelsSet).toEqual(["high"]);
+  });
+
+  it("leaves the model alone when the session picked its own since", async () => {
+    // A resume of a takeover session: the transcript says which model the session last used, and that
+    // outranks what the handoff carried.
+    await ext.emit({ type: "session_start", reason: "resume", previousSessionFile: OUTGOING }, incomingContext(CARRIED));
+
+    expect(ext.modelsSet).toEqual([]);
+    expect(ext.thinkingLevelsSet).toEqual([]);
+  });
+
+  it("leaves the model alone when the incoming session is already on it", async () => {
+    const ctx = incomingContext(
+      { ...CARRIED, model: { provider: "acme", id: "large", thinkingLevel: "medium" } },
+      { current: { provider: "acme", id: "large" } },
+    );
+    ctx.thinkingLevel = "medium";
+
+    await ext.emit({ type: "session_start", reason: "new", previousSessionFile: OUTGOING }, ctx);
+
+    expect(ext.modelsSet).toEqual([]);
+    expect(ext.thinkingLevelsSet).toEqual([]);
+  });
+  it("says so when the carried model is not usable here", async () => {
+    const notices: string[] = [];
+    const ctx = incomingContext(CARRIED, { find: () => undefined, notices });
+
+    await ext.emit({ type: "session_start", reason: "new", previousSessionFile: OUTGOING }, ctx);
+
+    expect(ext.modelsSet).toEqual([]);
+    expect(notices.join(" ")).toContain("acme/large");
+  });
+
+  it("says so when this session refuses the carried model", async () => {
+    const notices: string[] = [];
+    const ctx = incomingContext(CARRIED, { notices });
+    ext.modelSet.ok = false;
+
+    await ext.emit({ type: "session_start", reason: "new", previousSessionFile: OUTGOING }, ctx);
+
+    expect(ext.modelsSet).toHaveLength(1);
+    // The thinking level is not worth setting on a model that was never applied.
+    expect(ext.thinkingLevelsSet).toEqual([]);
+    expect(notices.join(" ")).toContain("credentials");
+    ext.modelSet.ok = true;
+  });
+
+  it("hands on nothing when the outgoing session had no model", async () => {
+    const replacement: Replacement = { entries: [], sent: [], calls: 0 };
+    await queue();
+
+    const { overrides } = outgoingContext(replacement);
+    overrides.model = undefined;
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    expect(replacement.entries[0]!.data.model).toBeUndefined();
+
+    await ext.emit(
+      { type: "session_start", reason: "new", previousSessionFile: OUTGOING },
+      incomingContext({ position: 1, maxChain: 12, prompt: HANDOFF }),
+    );
+    expect(ext.modelsSet).toEqual([]);
   });
 });

@@ -6,6 +6,10 @@
  * as the incoming session's first message, and the lineage section in that session's system prompt.
  * Nothing here touches the network, the user's agent dir, or a real model.
  *
+ * The session starts on one fake model and is switched to another, which is a selection Pi keeps to
+ * that session: every model call below, including the ones made by the sessions two takeovers later,
+ * has to be made on the model the chain started from.
+ *
  * The scripted model's rules are matched against the transcript it is shown, so they hold for a session
  * the test never started. Two takeovers run in a row, which is the shape of the implement/review loop
  * this extension exists for.
@@ -40,6 +44,8 @@ function piBinary(): string {
 
 interface ModelCall {
   call: number;
+  model: string;
+  reasoning?: string;
   lastUser: string;
   systemTakeoverSection: Array<string | null>;
 }
@@ -48,6 +54,7 @@ let agentDir: TempDir;
 let cwd: TempDir;
 let child: ChildProcessWithoutNullStreams;
 let stderr: string;
+let stdout: string;
 
 beforeAll(async () => {
   agentDir = makeTempDir("takeover-agent-");
@@ -85,6 +92,10 @@ beforeAll(async () => {
   child.stderr.on("data", (chunk: Buffer) => {
     stderr += chunk.toString("utf8");
   });
+  stdout = "";
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString("utf8");
+  });
 
   // Wait for the runtime to be up before sending anything: the first command is what proves it.
   const started = await new Promise<void>((resolveStart, rejectStart) => {
@@ -103,6 +114,24 @@ beforeAll(async () => {
   });
 
   await started;
+
+  // Move the session off the model it was started with, the way `/model` does: session-scoped, so Pi
+  // will not carry it into a new session by itself. RPC answers commands as they arrive rather than one
+  // after another, so each one is waited for: `set_model` picks a thinking level of its own, and it must
+  // not land after the level set here.
+  const ask = (request: Record<string, unknown>) => {
+    stdout = "";
+    child.stdin.write(`${JSON.stringify(request)}\n`);
+    return waitFor(
+      () => stdout.includes(`"id":"${String(request.id)}"`) && stdout.includes('"success":true'),
+      `${String(request.id)} to be answered`,
+      15_000,
+    );
+  };
+
+  await ask({ id: "model", type: "set_model", provider: "fake", modelId: "other" });
+  await ask({ id: "thinking", type: "set_thinking_level", level: "medium" });
+
   child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: "Implement the change, then hand it to a reviewer." })}\n`);
 });
 
@@ -154,6 +183,11 @@ describe("a takeover in a running pi", () => {
     expect(opening!.lastUser).toContain("Implement the change");
     expect(opening!.systemTakeoverSection).toEqual([null]);
 
+    // And the whole chain ran on the model the first session had chosen for itself: a replacement would
+    // otherwise have fallen back to the configured default.
+    expect(calls.every((entry) => entry.model === "fake/other")).toBe(true);
+    expect(calls.every((entry) => entry.reasoning === "medium")).toBe(true);
+
     const reviewer = calls.find((entry) => entry.lastUser === REVIEW);
     const merger = calls.find((entry) => entry.lastUser === MERGE);
     expect(reviewer?.systemTakeoverSection[0]).toContain("takeover #1 of 12");
@@ -181,7 +215,11 @@ describe("a takeover in a running pi", () => {
     expect(third[0]?.parentSession).toBeTruthy();
     const lineageOf = (entries: any[]) => entries.filter((entry) => entry.type === "custom" && entry.customType === "takeover");
     expect(lineageOf(second)).toHaveLength(1);
-    expect(lineageOf(second)[0].data).toMatchObject({ position: 1, prompt: REVIEW });
+    expect(lineageOf(second)[0].data).toMatchObject({
+      position: 1,
+      prompt: REVIEW,
+      model: { provider: "fake", id: "other", thinkingLevel: "medium" },
+    });
     expect(lineageOf(third)[0].data).toMatchObject({ position: 2, prompt: MERGE });
 
     const chain = JSON.parse(readFileSync(join(agentDir.path, "takeover", "chain.json"), "utf8"));

@@ -53,16 +53,26 @@ new work.
 ## What the new agent gets
 
 - the handoff prompt as its first message, verbatim;
+- the model and thinking level the session it replaced was running on, including one that agent had
+  switched to for itself;
 - a `<takeover>` section in its system prompt: its position in the chain, how many takeovers are left
   before the cap, and the path of the previous session file, which it is free to read if the handoff
   left something out;
-- a transcript marker (`↳ takeover #2 from <session>`, expandable) that the model never sees, so the
-  human can follow the chain;
+- a transcript marker (`↳ takeover #2 from <session>`, expandable, which also shows the model it put the
+  session on) that the model never sees, so the human can follow the chain;
 - a session name taken from the first line of the handoff (`takeover #2: REVIEW: …`).
 
 The replaced session is not deleted. Its transcript is complete, it is the parent of the new session,
 and `/resume` can go back to it. Nothing about the model, the terminal, or the working directory
 changes — the conversation is what changes.
+
+The model does not carry itself, though. A takeover is Pi's `/new`, and Pi gives a new session the
+configured default model: a switch made inside a session belongs to that session. So the outgoing
+session writes its selection into the lineage entry, and the incoming session reads it back and puts it
+on itself before its first message. If that model cannot be used in the new session — an extension that
+registers it did not load, or its provider has no credentials there — the session says so and runs on
+what it picked by itself. And a session that changed model after the handoff outranks it: resuming that
+session restores the session's own last choice, not the one the chain started with.
 
 ## Guard rails
 
@@ -103,8 +113,8 @@ State: `<agent-dir>/takeover/` — `pending.json`, `chain.json`, `discarded-*.md
 ## Development
 
 ```bash
-npm run test -- --run packages/pi-takeover       # queue, apply, and configuration tests
-npm run test -- --run packages/pi-takeover/test/session.test.ts
+npx vitest --run packages/pi-takeover       # queue, apply, and configuration tests
+npx vitest --run packages/pi-takeover/test/session.test.ts
 npm run smoke -- pi-takeover                     # a scripted model against a real pi, printed
 ```
 

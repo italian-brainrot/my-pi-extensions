@@ -51,6 +51,12 @@ export interface LoadedExtension {
   handlers: Map<string, Array<(event: any, ctx: any) => unknown>>;
   /** Every `pi.*` member the extension touched, in order. Fails loudly for unknown members. */
   calls: RecordedCall[];
+  /** Models the extension put on the session with `pi.setModel`, in order. */
+  modelsSet: any[];
+  /** What `pi.setModel` answers; `false` is the host refusing for lack of credentials. */
+  modelSet: { ok: boolean };
+  /** Thinking levels the extension set with `pi.setThinkingLevel`, in order. */
+  thinkingLevelsSet: unknown[];
   agentDir: string;
   cwd: string;
   /** Run a registered tool's execute with a default context. */
@@ -118,6 +124,9 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   const sent: SentMessage[] = [];
   const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
   const calls: RecordedCall[] = [];
+  const modelsSet: any[] = [];
+  const thinkingLevelsSet: unknown[] = [];
+  const modelSet = { ok: true };
 
   const api = new Proxy({} as ExtensionAPI, {
     get(_target, member: string) {
@@ -159,6 +168,18 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
           return () => () => {};
         case "getFlagValue":
           return () => undefined;
+        case "setModel":
+          // The host refuses when the provider has no credentials; a test decides what this returns.
+          return (model: unknown) => {
+            modelsSet.push(model);
+            return Promise.resolve(modelSet.ok);
+          };
+        case "setThinkingLevel":
+          return (level: unknown) => {
+            thinkingLevelsSet.push(level);
+          };
+        case "getThinkingLevel":
+          return () => undefined;
         default:
           throw new Error(
             `The extension used pi.${member}, which the test harness does not implement. ` +
@@ -189,6 +210,9 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
     sent,
     handlers,
     calls,
+    modelsSet,
+    modelSet,
+    thinkingLevelsSet,
     agentDir,
     cwd,
     makeContext(overrides) {
@@ -251,7 +275,12 @@ export function makeToolContext(options: { cwd: string; agentDir: string; [key: 
     hasUI: false,
     ui: undefined,
     sessionManager,
-    modelRegistry: {},
+    modelRegistry: {
+      // A catalogue that answers for anything: enough for an extension to look a recorded model up.
+      find: (provider: string, modelId: string) => ({ provider, id: modelId, api: "test" }),
+      getAll: () => [],
+      getAvailable: () => [],
+    },
     model: undefined,
     scopedModels: [],
     thinkingLevel: undefined,

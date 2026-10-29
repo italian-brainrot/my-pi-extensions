@@ -34,6 +34,12 @@
  * system prompt is rendered from it, so lineage survives a reload and a resume. It states the position
  * in the chain, the remaining budget, and the path of the previous session file.
  *
+ * The model survives as well, and only because it is carried. A replacement is Pi's `/new`, which
+ * resolves the model from settings, so a model the outgoing agent had switched to — session-scoped, the
+ * way Pi keeps it — would be gone in the next session. The outgoing one records its selection in the
+ * lineage entry; the incoming one applies it to itself at `session_start`, since `setModel` acts on the
+ * session whose `pi` it is called on and the outgoing session's handle is dead by then.
+ *
  * Configuration, read when the module loads, so a change needs a restart rather than `/reload`:
  *   PI_TAKEOVER_MAX_CHAIN  takeovers per chain before refusing more (default 12, 0 for unlimited)
  *   PI_TAKEOVER_CONFIRM=1  ask the user before applying a queued handoff
@@ -136,6 +142,15 @@ interface ChainState {
   updatedAt: string;
 }
 
+/** A model selection, in the form a session entry can hold and a later session can look up again. */
+type ThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
+
+interface ModelSelection {
+  provider: string;
+  id: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
 /** The lineage written into the incoming session, and read back out of it. */
 interface TakeoverEntry {
   handoffId: string;
@@ -145,6 +160,8 @@ interface TakeoverEntry {
   maxChain: number;
   fromSession?: string;
   prompt: string;
+  /** The model the session it replaced was running on. */
+  model?: ModelSelection;
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -331,6 +348,28 @@ function sessionNameFor(info: TakeoverEntry): string {
   return short ? `takeover #${info.position}: ${short}` : `takeover #${info.position}`;
 }
 
+/** The model a session is running on, as a lineage entry records it. */
+function selectionOf(ctx: ExtensionContext): ModelSelection | undefined {
+  const model = ctx.model;
+  if (!model || typeof model.provider !== "string" || typeof model.id !== "string") return undefined;
+
+  const thinkingLevel = ctx.thinkingLevel;
+  return { provider: model.provider, id: model.id, ...(thinkingLevel ? { thinkingLevel } : {}) };
+}
+
+function parseSelection(value: unknown): ModelSelection | undefined {
+  if (!value || typeof value !== "object") return undefined;
+
+  const { provider, id, thinkingLevel } = value as Record<string, unknown>;
+  if (typeof provider !== "string" || typeof id !== "string") return undefined;
+
+  return {
+    provider,
+    id,
+    ...(typeof thinkingLevel === "string" ? { thinkingLevel: thinkingLevel as ThinkingLevel } : {}),
+  };
+}
+
 /** This session's lineage: the last takeover entry on the current branch, if it has one. */
 function lineageOf(ctx: ExtensionContext): TakeoverEntry | undefined {
   const entries = ctx.sessionManager?.getBranch?.();
@@ -343,6 +382,8 @@ function lineageOf(ctx: ExtensionContext): TakeoverEntry | undefined {
     const data = entry.data as Partial<TakeoverEntry> | undefined;
     if (!data || typeof data.position !== "number") continue;
 
+    const model = parseSelection(data.model);
+
     return {
       handoffId: typeof data.handoffId === "string" ? data.handoffId : "",
       chainId: typeof data.chainId === "string" ? data.chainId : "",
@@ -350,7 +391,56 @@ function lineageOf(ctx: ExtensionContext): TakeoverEntry | undefined {
       maxChain: typeof data.maxChain === "number" ? data.maxChain : MAX_CHAIN,
       fromSession: typeof data.fromSession === "string" ? data.fromSession : undefined,
       prompt: typeof data.prompt === "string" ? data.prompt : "",
+      ...(model ? { model } : {}),
     };
+  }
+
+  return undefined;
+}
+
+/**
+ * Run the incoming session on the model the session it replaced was on.
+ *
+ * Only the incoming session can do this, and only before its first message: `setModel` acts on the
+ * session whose `pi` it is called on, and the outgoing session's `pi` was invalidated when that session
+ * was torn down. So the handoff carries the selection, and this runs at the `session_start` of the
+ * session holding the lineage entry — the new one, whose module instance has a `pi` of its own.
+ */
+async function carryModel(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const selection = lineageOf(ctx)?.model;
+  if (!selection) return undefined;
+
+  const current = ctx.model;
+  if (!current || current.provider !== selection.provider || current.id !== selection.id) {
+    const target = ctx.modelRegistry?.find?.(selection.provider, selection.id);
+    if (!target) {
+      notify(ctx, `Takeover cannot keep ${selection.provider}/${selection.id}: that model is not available here.`, "warning");
+      return undefined;
+    }
+
+    let applied = false;
+    try {
+      applied = await pi.setModel(target);
+    } catch (error) {
+      debugLog(`setting ${selection.provider}/${selection.id} failed: ${errorMessage(error)}`);
+    }
+
+    if (!applied) {
+      // Usually no credentials for that provider. The session still runs, on whatever it picked itself.
+      notify(ctx, `Takeover cannot keep ${selection.provider}/${selection.id}: no credentials for it here.`, "warning");
+      return undefined;
+    }
+
+    debugLog(`the takeover session runs on ${selection.provider}/${selection.id}`);
+  } else {
+    debugLog(`the takeover session was already on ${selection.provider}/${selection.id}`);
+  }
+
+  // A model switch picks a thinking level for the new model; the outgoing session's own level wins.
+  // `setThinkingLevel` clamps to what this model can do, as it does for any other level change.
+  if (selection.thinkingLevel && selection.thinkingLevel !== ctx.thinkingLevel) {
+    pi.setThinkingLevel(selection.thinkingLevel);
+    debugLog(`the takeover session thinks at ${selection.thinkingLevel}`);
   }
 
   return undefined;
@@ -397,6 +487,8 @@ async function applyTakeover(ctx: ExtensionCommandContext, options: { freshChain
     }
   }
 
+  const selection = selectionOf(ctx);
+
   const info: TakeoverEntry = {
     handoffId: handoff.id,
     chainId,
@@ -404,6 +496,7 @@ async function applyTakeover(ctx: ExtensionCommandContext, options: { freshChain
     maxChain: MAX_CHAIN,
     fromSession: ctx.sessionManager.getSessionFile(),
     prompt: handoff.prompt,
+    ...(selection ? { model: selection } : {}),
   };
 
   // Counted before the replacement, not after it: a takeover that fails halfway still has to move the
@@ -651,10 +744,16 @@ export default function (pi: ExtensionAPI): void {
     return undefined;
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     // A session boundary is where lineage is read again: a new session, a resumed one, and `/reload`
     // all look at their own entries on the next run.
     sectionBySession.delete(sessionKey(ctx));
+
+    // A replacement starts on the configured default model, so the incoming session has to be put back
+    // on the one the outgoing agent chose. This is the only place that can: the outgoing session's `pi`
+    // is dead, and this one's first message is sent once `session_start` handlers have finished.
+    if (event.reason === "new") return carryModel(pi, ctx);
+    return undefined;
   });
 
   pi.on("session_shutdown", (event, ctx) => {
@@ -701,6 +800,10 @@ export default function (pi: ExtensionAPI): void {
     const from = data?.fromSession ? basename(String(data.fromSession)).replace(/\.jsonl$/, "") : "a previous session";
 
     let text = `${theme.fg("accent", `↳ takeover #${data?.position ?? "?"}${limit}`)} ${theme.fg("dim", `from ${from}`)}`;
+    if (expanded && data?.model) {
+      const level = data.model.thinkingLevel ? ` at ${data.model.thinkingLevel}` : "";
+      text += `\n${theme.fg("dim", `model ${data.model.provider}/${data.model.id}${level}`)}`;
+    }
     if (expanded && data?.prompt) text += `\n${theme.fg("muted", data.prompt)}`;
 
     return new Text(text, 0, 0);
