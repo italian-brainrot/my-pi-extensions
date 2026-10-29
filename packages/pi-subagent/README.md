@@ -91,7 +91,7 @@ single subagent response rather than the sum.
 ```bash
 npm run dev          # pi with this repo's extensions loaded from source
 npm test             # the whole monorepo suite
-npm run test -- --run packages/pi-subagent
+npx vitest --run packages/pi-subagent
 ```
 
 Tests drive the tool against `test/fixtures/fake-pi.mjs`, a stand-in that speaks the same

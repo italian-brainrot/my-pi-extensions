@@ -6,7 +6,7 @@ network.
 
 ```bash
 npm test                                  # everything
-npm run test -- --run packages/pi-bg-tasks
+npx vitest --run packages/pi-bg-tasks    # one package (the `test` script already passes --run)
 npm run test:watch
 ```
 
@@ -34,7 +34,9 @@ afterAll(() => ext?.dispose());
   a Proxy: `registerTool`, `on`, `registerCommand`, and friends are captured, and any other member
   throws with a message telling you to add it to the harness, so tests never silently skip a code
   path the extension added;
-- exposes `tools`, `commands`, `handlers`, `sent`, and `calls` for assertions;
+- exposes `tools`, `commands`, `handlers`, `sent`, and `calls` for assertions, plus `modelsSet`,
+  `thinkingLevelsSet` and the mutable `modelSet.ok` (what `pi.setModel` answers, which is how a test
+  says the host refused a model) for extensions that change the model;
 - `callTool(name, params, { signal, onUpdate, context })` runs a registered tool's `execute` with a
   hand-built `ExtensionToolContext`; `context` overrides land on the context, which is how you set
   `model`, `thinkingLevel`, `cwd`, `sessionId`, or `sessionFile`;
@@ -126,9 +128,10 @@ per-component costs, and that context size is the largest single response rather
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in
   `dispose()`. Do not rely on env changes made after a load to affect module-level constants.
 - **The tool context is not Pi's.** The harness builds a context object, so features that need a real
-  session (UI dialogs, `executeTool`, `modelRegistry`) are unavailable. If an extension reaches for
-  them, the harness throws with instructions: either add a stub to the harness or cover that part in a
-  real `pi` session with `npm run dev`.
+  session (UI dialogs, `executeTool`) are unavailable; `modelRegistry` is a stub whose `find` answers
+  for any provider and id, which is enough to look a recorded model up but nothing else. If an
+  extension reaches for something missing, the harness throws with instructions: either add a stub to
+  the harness or cover that part in a real `pi` session with `npm run dev`.
 - **Kill timers keep the process alive.** `pi-bg-tasks` deliberately does not unref its SIGTERM grace
   timer, so a worker can sit for a few seconds after stopping a job. Vitest's teardown allows it.
 - **Behaviour that lives per runtime needs a second process.** A cross-session bug — one pi process
@@ -143,5 +146,9 @@ per-component costs, and that context size is the largest single response rather
   killed job looks alive.
 - **Timings are assertions too.** Prefer `waitFor` polling to fixed sleeps, and give timing-based
   assertions (the blocking mutex test) a margin wide enough for a loaded CI runner.
+- **RPC commands are not serialised.** `pi --mode rpc` starts each line it reads as its own async
+  handler, so a command that awaits (like `set_model`, which checks credentials) can finish after the
+  one sent right after it. Send the next command when the answer to the previous one arrives —
+  `packages/pi-takeover/test/session.test.ts` waits for each id before it prompts.
 - **Do not add a build step.** Sources are TypeScript loaded through jiti; Vitest transforms them for
   tests. `tsc --noEmit` is the only compiler in the loop.

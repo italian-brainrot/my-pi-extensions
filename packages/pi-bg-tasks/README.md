@@ -140,7 +140,7 @@ change needs `/reload`. On Windows, stopping a task uses `taskkill /T /F`.
 ```bash
 npm run dev          # pi with this repo's extensions loaded from source
 npm test             # the whole monorepo suite
-npm run test -- --run packages/pi-bg-tasks
+npx vitest --run packages/pi-bg-tasks
 ```
 
 The tests spawn real processes, so they cover timeout release, killing, re-adoption after a reload,

@@ -153,7 +153,7 @@ missing.
 ```bash
 npm run dev              # pi with this repo's extensions loaded from source
 npm test                 # the whole monorepo suite
-npm run test -- --run packages/pi-memory
+npx vitest --run packages/pi-memory
 PI_MEMORY_DEBUG=1 npm run dev
 ```
 
