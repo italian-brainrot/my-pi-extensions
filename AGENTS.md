@@ -22,11 +22,15 @@ A bash tool replacement which introduces background tasks and explicit control o
 
 ### pi-subagent
 
-Subagent tool which uses the same model as current session. Currenly disabled in pi.
+Subagent tool which uses the same model as current session. Currenly disabled in pi because there is not enough memory for KV cache from another concurrent conversation.
 
 ### pi-memory
 
 Injects MEMORY.md into system message after AGENTS.md. The workflow is - I manually write AGENTS.md with the spec, and the agent can use MEMORY.md for anything else.
+
+### pi-takeover
+
+Kills current session and starts a new one. Can be used for autonomous implement - review loop without concurrent conversations.
 
 ## Pi docs
 

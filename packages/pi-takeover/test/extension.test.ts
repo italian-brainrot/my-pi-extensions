@@ -196,9 +196,7 @@ describe("what the incoming session is told", () => {
     );
 
     const section = options.sections.takeover;
-    expect(section).toContain("takeover #3 of 12");
     expect(section).toContain("/tmp/previous.jsonl");
-    expect(section).toContain("9 takeovers left");
   });
 
   it("renders the same section on every run of that session", async () => {

@@ -315,23 +315,11 @@ function discardHandoff(reason: string): void {
 function renderSection(info: TakeoverEntry): string {
   const limit = info.maxChain > 0 ? ` of ${info.maxChain}` : "";
   const lines = [
-    `This session is takeover #${info.position}${limit} in a handoff chain: an earlier agent ended its ` +
-      "session, and the first prompt you were given is the only thing that carried over. Nothing else from " +
-      "that conversation is in your context.",
+    `You are spawned by an earlier agent via a takeover.`
   ];
 
   if (info.fromSession) {
     lines.push(`The previous session file is ${info.fromSession} — read it if the handoff left something out.`);
-  }
-
-  lines.push(
-    "When your part of the work is done, call the takeover tool with a prompt the next agent can act on " +
-      "by itself; it ends this session and starts that agent in your place.",
-  );
-
-  if (info.maxChain > 0) {
-    const remaining = Math.max(info.maxChain - info.position, 0);
-    lines.push(`${remaining} takeover${remaining === 1 ? "" : "s"} left in this chain before the cap.`);
   }
 
   return lines.join("\n\n");
@@ -606,7 +594,7 @@ interface TakeoverToolDetails {
 
 const TakeoverParams = Type.Object({
   prompt: Type.String({
-    description: "Everything the next agent needs: what to do, what is done, what is blocking. It sees none of this conversation.",
+    description: "Prompt to send to the next agent.",
     minLength: 1,
   }),
 });
@@ -616,8 +604,7 @@ const takeoverTool: ToolDefinition<typeof TakeoverParams, TakeoverToolDetails> =
   label: "Takeover",
   description:
     "End this session and hand the work to a fresh agent that starts with only your prompt. " +
-    "Call it once, as the last thing in a turn: the handoff is applied when the turn ends, not while it runs. " +
-    "It returns nothing about the next agent — that agent is a different session.",
+    "If running takeover loop, instruct it to also use takeover.",
   parameters: TakeoverParams,
 
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
