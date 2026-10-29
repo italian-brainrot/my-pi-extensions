@@ -22,7 +22,7 @@ A bash tool replacement which introduces background tasks and explicit control o
 
 ### pi-subagent
 
-Subagent tool which uses the same model as current session. Currenly locally I can only run one model concurrenly, so the tool is synchronous.
+Subagent tool which uses the same model as current session. Currenly disabled in pi.
 
 ### pi-memory
 
