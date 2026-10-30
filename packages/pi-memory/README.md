@@ -2,12 +2,18 @@
 
 Puts a **`MEMORY.md`** into the system prompt beside the user's `AGENTS.md`, in a `<memory path="…">`
 block of its own rather than in the `<project_instructions>` tag that holds the spec, and tells the
-assistant that this file is its own to keep current.
+assistant what that file is for.
 
 The split it exists for: `AGENTS.md` is yours. You write the spec there, and you can say "do not edit
-this file". `MEMORY.md` is the assistant's. Whatever it wants the next session to know — decisions,
-constraints, gotchas, commands, invariants — it writes there instead, and `pi-memory` loads it back on
-the next run.
+this file". `MEMORY.md` is the assistant's. Whatever the next session needs to know that `AGENTS.md`
+does not settle — decisions, constraints, gotchas, commands, invariants — goes there instead, and
+`pi-memory` loads it back on the next run.
+
+What the note asks for is a description of the system, not a record of the work. Left alone, an
+assistant with a scratch file keeps a diary: dated entries, what that session changed, how it tracked
+a bug down. That is history the transcript already holds and it costs prompt space in every session
+forever. So the note names the genre — present tense, no dates, only what the code and `AGENTS.md`
+leave unsettled, corrected in place rather than appended to. See the quoted text below.
 
 ## What it adds
 
@@ -55,9 +61,14 @@ holds `AGENTS.md`:
 
 ```text
 <assistant_memory>
-Assistant-maintained memory. This file is owned by you (the assistant) and is injected at the start of
-every session. Keep it up to date, and keep it short. Use the normal file tools on these paths to
-change it; edits land in later sessions, not this one.
+Assistant-maintained notes, owned by you, injected at the start of every session; edit these files
+with the normal file tools, and changes reach later sessions, not this one. Write the specification
+of the system as it stands now — what it is, how it works, what to run — covering what AGENTS.md and
+the code leave unsettled: invariants, constraints, interfaces, gotchas, and decisions with the reason
+behind them. This is not a diary: no dates, no log of what a session did, no retelling of how a
+problem was tracked down. Omit anything the next session can read off the code, the tests, or
+AGENTS.md, and rewrite or delete an entry when it stops being true instead of appending a correction;
+the file is only worth its prompt space while it is accurate and short.
 
 <memory path="/repo/MEMORY.md">
 # Notes

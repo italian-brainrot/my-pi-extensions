@@ -22,8 +22,9 @@
  *     own prompt section holding one `<memory path="…">` block per file — deliberately not
  *     `contextFiles`, because those render as `<project_instructions>` and would put the assistant's
  *     notes in the same kind of tag as the user's `AGENTS.md`;
- *   - the section opens with a short model-facing note saying that MEMORY.md is the assistant's to
- *     maintain, outside the tags, the way Pi opens `<project_context>` with its own lead-in line;
+ *   - the section opens with a short model-facing note, outside the tags, the way Pi opens
+ *     `<project_context>` with its own lead-in line. It owns the genre of the file: the assistant's
+ *     spec of the system, not a log of the sessions that worked on it;
  *   - change nothing when there is no such file, when it is empty, or when it cannot be read.
  *
  * A section whose text never changes is what the transcript needs: Pi diffs prompt sections against
@@ -155,10 +156,19 @@ export const SECTION_NAME = "assistant_memory";
  * Model-facing text that opens the section, outside the `<memory>` tags, the way Pi's lead-in line
  * opens `<project_context>`. Part of the extension's interface; tests assert where it goes, not what
  * it says, so rewording it is a deliberate edit and not a test failure.
+ *
+ * It says what the file is *for*, because that is the part a model gets wrong on its own: an
+ * assistant left with a scratch file keeps a diary of its sessions — dated entries, what it did, how
+ * it debugged — which is history the transcript already has and no description of the system. The
+ * note asks for the other thing: the specification of how things work now, for everything the user's
+ * `AGENTS.md` does not settle. Keep it one paragraph (a blank line would read as a block boundary in
+ * the section) and keep it roughly this size; it is in every session's prompt.
  */
 export const MEMORY_NOTE =
-  "Assistant-maintained memory. This file is owned by you (the assistant) and is injected at the start of every session. " +
-  "Keep it up to date, and keep it short. Use the normal file tools on these paths to change it; edits land in later sessions, not this one.";
+  "Assistant-maintained notes, owned by you, injected at the start of every session; edit these files with the normal file tools, and changes reach later sessions, not this one. " +
+  "Write the specification of the system as it stands now — what it is, how it works, what to run — covering what AGENTS.md and the code leave unsettled: invariants, constraints, interfaces, gotchas, and decisions with the reason behind them. " +
+  "This is not a diary: no dates, no log of what a session did, no retelling of how a problem was tracked down. " +
+  "Omit anything the next session can read off the code, the tests, or AGENTS.md, and rewrite or delete an entry when it stops being true instead of appending a correction; the file is only worth its prompt space while it is accurate and short.";
 
 function readMemory(path: string): string | undefined {
   try {

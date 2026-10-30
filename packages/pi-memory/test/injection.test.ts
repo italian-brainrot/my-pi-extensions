@@ -187,6 +187,9 @@ describe("pi-memory", () => {
     // The assertion above only means something if the note itself cannot be confused with a tag.
     expect(MEMORY_NOTE).not.toContain("<memory");
     expect(MEMORY_NOTE.trim().split("\n\n")).toHaveLength(1);
+    // It is also a cost paid by every session that has a memory file, so it stays about this long;
+    // its wording is free to change, its size is not.
+    expect(Buffer.byteLength(MEMORY_NOTE, "utf8")).toBeLessThan(1200);
   });
 
   it("keeps memory out of project context, so it is not in the AGENTS.md tag", async () => {
