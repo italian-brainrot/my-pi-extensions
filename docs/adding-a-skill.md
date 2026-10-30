@@ -27,13 +27,24 @@ skills/<name>/
 
 ## Shipping and checking it
 
-`npm run manifest` keeps `pi.skills` in the root manifest, so `pi install .` ships skills alongside the
-extensions. Installs from a local path load from the working tree, so editing a skill plus `/reload` is
-the whole update loop.
+The skills in `skills/` are not declared in the root Pi manifest. They are installed as user skills:
 
-Pi discovers skills from the package, the agent directory (`~/.pi/agent/skills/`), and `.pi/skills/`.
-Declare the package path (`"skills": ["./skills"]`) once and skip symlinks into the agent directory —
-two copies of one skill produce a name-collision warning and the first one found wins.
+```bash
+npm run install:skills        # copy skills/* into ~/.agents/skills (PI_SKILLS_DIR to change it)
+npm run skills:check          # fail if that copy has drifted; runs inside npm run check
+```
+
+`~/.agents/skills/<name>` is one of the places Pi discovers skills automatically — package paths, the
+agent directory (`~/.pi/agent/skills/`), `~/.agents/skills/`, and `.pi/skills/` are the rest — so one
+install serves every project, and a repo checkout is not needed for a session to use a skill. The cost
+is a second copy that can go stale, which is what `skills:check` is for: it compares file by file, and
+the install replaces the whole directory rather than merging, and records a marker so it knows which
+copies are its own. A skill edit is live after `npm run install:skills` plus `/reload` or a new session.
+
+One skill must exist in one place. Two directories with the same name make Pi warn about a collision
+and the first one found wins, so do not also declare `pi.skills` in the root manifest or symlink into
+the agent directory; `install:skills` refuses to overwrite a target it did not create unless you pass
+`--force`.
 
 To confirm discovery without a model:
 

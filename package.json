@@ -17,13 +17,15 @@
     ]
   },
   "scripts": {
-    "check": "npm run manifest -- --check && npm run typecheck && npm run lint && npm run test",
+    "check": "npm run manifest -- --check && npm run skills:check && npm run typecheck && npm run lint && npm run test",
     "dev": "node scripts/dev.mjs",
     "fmt": "biome check --write .",
     "install:personal": "pi install .",
+    "install:skills": "node scripts/install-skills.mjs",
     "lint": "biome check .",
     "manifest": "node scripts/sync-manifest.mjs",
     "new": "node scripts/new-extension.mjs",
+    "skills:check": "node scripts/install-skills.mjs --check",
     "smoke": "node scripts/extension-smoke.mjs",
     "test": "vitest --run",
     "test:watch": "vitest",

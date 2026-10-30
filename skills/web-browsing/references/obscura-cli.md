@@ -58,6 +58,9 @@ Verified behaviour, worth knowing before designing around it:
   (events arrive trusted), and the non-standard `LP.getMarkdown` for DOM → Markdown.
 - `Input.dispatchMouseEvent` needs coordinates: get them from `DOM.getBoxModel` on a
   `Runtime.evaluate` object id. `element.click()` via `Runtime.evaluate` is a fine fallback.
+- `serve` never exits on idle, so it is stopped by killing a recorded pid (`scripts/browse.mjs stop`
+  does this). Cleaning up by pattern needs `pkill -f "obscura[ ]serve"` — the plain pattern also matches
+  the shell running it.
 
 ## `obscura mcp`
 

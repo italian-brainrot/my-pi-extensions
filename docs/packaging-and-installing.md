@@ -11,15 +11,20 @@ conventional directory:
 // package.json (root)
 {
   "pi": {
-    "extensions": ["./packages/pi-bg-tasks/src/index.ts", "./packages/pi-subagent/src/index.ts"],
-    "skills": ["./skills"]
+    "extensions": ["./packages/pi-bg-tasks/src/index.ts", "./packages/pi-subagent/src/index.ts"]
   }
 }
 ```
 
 That list of extensions is generated: run `npm run manifest` after adding or renaming a package, and
-`npm run check` fails when it drifts. The script also keeps `pi.skills` pointed at `skills/` when that
-directory exists, so a skill never sits in the tree undeclared.
+`npm run check` fails when it drifts.
+
+Skills are deliberately not in that list. They live in `skills/` and are installed as user skills with
+`npm run install:skills`, which copies them to `~/.agents/skills` so every project sees them; declaring
+the same skills in the manifest as well would give Pi two directories with one skill name, and it warns
+about the collision and keeps whichever it finds first. `npm run skills:check`, also part of
+`npm run check`, fails when the installed copy no longer matches the repository. See
+[adding-a-skill.md](./adding-a-skill.md).
 
 Each package declares its own entry points too, so it can be installed on its own:
 

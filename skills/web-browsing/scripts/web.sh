@@ -93,6 +93,9 @@ case "$cmd" in
       esac
     done
     [[ -n "$query" ]] || die "usage: web.sh search QUERY [-n N]"
+    # lite.duckduckgo.com answers a headless fetch; html.duckduckgo.com/html/ also works, with
+    # a.result__a and no snippet column. Mojeek returned nothing at all. Snippet is the next <tr>, and
+    # the real URL is in the uddg query parameter, not in href.
     url="https://lite.duckduckgo.com/lite/?q=$(urlencode "$query")"
     expr="JSON.stringify([...document.querySelectorAll('a.result-link')].map(a=>({t:a.textContent.trim(),u:new URL(a.href).searchParams.get('uddg')||a.href,s:(a.closest('tr')?.nextElementSibling?.textContent||'').trim().replace(/\s+/g,' ')})).slice(0,$n))"
     results=$("$(obscura_bin)" fetch "$url" -q --timeout 25 --eval "$expr" "${rest[@]}" 2>&1) ||

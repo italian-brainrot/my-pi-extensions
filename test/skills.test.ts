@@ -1,12 +1,12 @@
 /**
- * Skills travel with this repo through the root Pi manifest, so they have to satisfy Pi's own
- * Agent Skills loader and their helper scripts have to stay runnable. None of this needs the
- * network or an Obscura binary: the scripts are only checked for syntax, usage output, and the
- * error path when no binary can be found.
+ * Skills are installed as user skills rather than shipped in the Pi package, so they have to satisfy
+ * Pi's own Agent Skills loader and their helper scripts have to stay runnable. None of this needs the
+ * network or an Obscura binary: the scripts are only checked for syntax, usage output, and the error
+ * path when no binary can be found.
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { constants, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
@@ -27,9 +27,16 @@ function scriptPaths(): string[] {
 }
 
 describe("the skills directory", () => {
-  it("is declared in the root Pi manifest and exists", () => {
-    expect(rootManifest.pi?.skills).toContain("./skills");
+  it("exists and is kept out of the root Pi manifest", () => {
     expect(existsSync(skillsDir)).toBe(true);
+    // Declaring skills in the manifest while they are also installed to ~/.agents/skills gives Pi two
+    // directories with the same skill name: it warns about the collision and the first one wins. One
+    // route only, and it is `npm run install:skills`.
+    expect(rootManifest.pi?.skills ?? []).toEqual([]);
+    // …and that route has to exist, otherwise the installed copy drifts in silence.
+    expect(rootManifest.scripts?.["install:skills"]).toBe("node scripts/install-skills.mjs");
+    expect(rootManifest.scripts?.["skills:check"]).toBe("node scripts/install-skills.mjs --check");
+    expect(rootManifest.scripts?.check).toContain("skills:check");
   });
 
   it("loads through Pi's own skill loader without diagnostics", () => {
@@ -75,6 +82,54 @@ describe.each(scriptPaths().map((path) => ({ path })))("skill script $path", ({ 
     });
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).toMatch(/OBSCURA_BIN/);
+  });
+});
+
+describe("install-skills.mjs keeps the installed copy honest", () => {
+  const script = resolve(repoRoot, "scripts", "install-skills.mjs");
+
+  const run = (target: string, ...args: string[]) =>
+    spawnSync("node", [script, ...args], { encoding: "utf8", env: { ...process.env, PI_SKILLS_DIR: target } });
+
+  it("installs, detects an edit, and stops detecting it after another install", () => {
+    const temp = makeTempDir("pi-skills-install-");
+    try {
+      const installed = join(temp.path, "skills");
+      const first = run(installed);
+      expect(first.status, first.stderr).toBe(0);
+      expect(run(installed, "--check").status).toBe(0);
+
+      // A repository edit that has not been installed yet is drift, and the message names the command
+      // that fixes it — that is the whole point of running this in npm run check.
+      const skill = skillDirs()[0]!;
+      const file = join(installed, skill, "SKILL.md");
+      writeFileSync(file, `${readFileSync(file, "utf8")}\n<!-- installed copy edited -->\n`);
+      const drifted = run(installed, "--check");
+      expect(drifted.status).toBe(1);
+      expect(`${drifted.stdout}${drifted.stderr}`).toContain("install:skills");
+
+      expect(run(installed).status).toBe(0);
+      expect(run(installed, "--check").status).toBe(0);
+    } finally {
+      temp.dispose();
+    }
+  });
+
+  it("leaves a skill it did not install alone", () => {
+    const temp = makeTempDir("pi-skills-foreign-");
+    try {
+      const installed = join(temp.path, "skills");
+      const skill = skillDirs()[0]!;
+      mkdirSync(join(installed, skill), { recursive: true });
+      writeFileSync(join(installed, skill, "SKILL.md"), "# not mine\n");
+
+      const result = run(installed, "--check");
+      expect(result.status).toBe(1);
+      expect(`${result.stdout}${result.stderr}`).toContain("not managed by this script");
+      expect(readFileSync(join(installed, skill, "SKILL.md"), "utf8")).toBe("# not mine\n");
+    } finally {
+      temp.dispose();
+    }
   });
 });
 

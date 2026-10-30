@@ -8,22 +8,24 @@ test harness, shared tooling, and a single install for the whole set.
 
 ## Extensions
 
-| Package                                 | What it does                                                                                                                                                               | Adds                                                                                     |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them.                              | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
-| [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, in a prompt section of its own, reads it once per session, and tells it to keep that file current. | none — it changes the prompt, not the tool list                                          |
-| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                                                          | `subagent`                                                                               |
-| [`pi-takeover`](./packages/pi-takeover) | Ends the running agent and starts a fresh one on a handoff prompt, so an implement/review loop can run unattended with one live session at a time.                         | `takeover`, `/takeover`, `/takeover-cancel`                                              |
+| Package                                 | What it does                                                                                                                                                                                                                          | Adds                                                                                     |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| [`pi-bg-tasks`](./packages/pi-bg-tasks) | Long shell commands move to the background instead of timing out, stay reachable across reloads, and belong to the session that started them.                                                                                         | `bash` (replaces the built-in tool, adds `timeout` and `blocking`), `bg_wait`, `bg_stop` |
+| [`pi-memory`](./packages/pi-memory)     | Loads `MEMORY.md` into the system prompt beside the user's `AGENTS.md`, in a prompt section of its own, reads it once per session, and defines what that file is: the assistant's description of the system, not its log of sessions. | none — it changes the prompt, not the tool list                                          |
+| [`pi-subagent`](./packages/pi-subagent) | Delegate a prompt to a nested Pi on the same model, so the work happens outside the main context.                                                                                                                                     | `subagent`                                                                               |
+| [`pi-takeover`](./packages/pi-takeover) | Ends the running agent and starts a fresh one on a handoff prompt, so an implement/review loop can run unattended with one live session at a time.                                                                                    | `takeover`, `/takeover`, `/takeover-cancel`                                              |
 
 Read each package's README for parameters, environment variables, and behaviour details.
 
 ### Context files in this repository
 
-`AGENTS.md` is the spec, and only the user writes it. `MEMORY.md` is what the assistant writes as it
-works — decisions, gotchas, commands, what broke and why — and `pi-memory` injects it beside
-`AGENTS.md` in a section of its own (`<assistant_memory>`, with one `<memory path="…">` block per
-file), and tells the assistant to keep it current. Every Pi session in this checkout gets both, and
-each session reads `MEMORY.md` once, the way Pi reads `AGENTS.md`.
+`AGENTS.md` is the spec, and only the user writes it. `MEMORY.md` is the assistant's: the same kind
+of spec, for everything `AGENTS.md` does not settle — invariants, gotchas, decisions and the reason
+for them, the commands to run — written about the system as it stands, not about the sessions that
+worked on it. `pi-memory` injects it beside `AGENTS.md` in a section of its own (`<assistant_memory>`,
+with one `<memory path="…">` block per file), and its note tells the assistant to keep it current,
+accurate, short, and free of diary entries. Every Pi session in this checkout gets both, and each
+session reads `MEMORY.md` once, the way Pi reads `AGENTS.md`.
 
 ### Skills
 
@@ -34,9 +36,10 @@ advertises by name and description, then loads only when a task calls for them.
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`web-browsing`](./skills/web-browsing/SKILL.md) | Live web access through the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser: search, read a rendered page as markdown, extract with CSS/JS, screenshots, and multi-step flows (login, pagination) over CDP. Needs the `obscura` binary. |
 
-The root manifest declares `pi.skills: ["./skills"]`, so one `pi install .` ships skills and
-extensions together. `/skill:web-browsing` forces a skill into the conversation; otherwise the model
-reaches for it when the description matches the task.
+The skills are not in the root Pi manifest: `npm run install:skills` copies them to
+`~/.agents/skills/`, where Pi discovers them for every session in every project. `npm run check` then
+fails if that installed copy has drifted from `skills/`. `/skill:web-browsing` forces a skill into the
+conversation; otherwise the model reaches for it when the description matches the task.
 
 ## Use them
 
@@ -88,6 +91,8 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 | `npm run fmt`                              | Apply Biome fixes (format, safe lint fixes, import order).                                    |
 | `npm run manifest`                         | Rewrite the root `pi.extensions` list from the packages. `--check` in CI.                     |
 | `npm run new -- pi-name --description "…"` | Scaffold a new extension package, test, README, and manifest entry.                           |
+| `npm run install:skills`                   | Copy `skills/*` to `~/.agents/skills`, where Pi discovers them for every session.             |
+| `npm run skills:check`                     | Fail if that installed copy has drifted from the repository. Part of `npm run check`.         |
 | `npm run dev`                              | Pi with the repo's extensions loaded from source.                                             |
 | `npm run smoke -- pi-takeover`             | Drive a real Pi with a scripted model, and print what happened.                               |
 | `npm run install:personal`                 | `pi install .` — add this repo to your personal Pi settings.                                  |
@@ -97,7 +102,7 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 ```text
 package.json              workspace root + Pi manifest listing every extension entry
 AGENTS.md                 how to work here, written by the user (Pi injects it)
-MEMORY.md                 how the work actually goes, written by you (pi-memory injects it)
+MEMORY.md                 the system as it stands, beyond what AGENTS.md settles; written by you, injected by pi-memory
 skills/
   web-browsing/
     SKILL.md              what the model reads, and when it reads it
@@ -122,6 +127,7 @@ test/
   load.test.ts            loads every package through Pi's own extension loader
 scripts/
   sync-manifest.mjs       keep the root Pi manifest in sync with packages/
+  install-skills.mjs      copy skills/ to ~/.agents/skills, and check that copy for drift
   new-extension.mjs       scaffold the next extension
   dev.mjs                 run pi against the repo's sources
 docs/                     packaging, testing, and conventions
@@ -131,8 +137,10 @@ docs/                     packaging, testing, and conventions
 
 Pi discovers resources from the root `pi` manifest, so `pi install .` (or
 `pi install git:github.com/italian-brainrot/my-pi-extensions` once public) loads every extension in
-`packages/` and every skill in `skills/`. Each package also carries its own manifest, so it can be
-installed on its own. Sources ship as TypeScript: Pi compiles them with jiti, so there is no build step.
+`packages/`. Skills are not part of that install: `npm run install:skills` puts them in
+`~/.agents/skills`, where Pi finds them for every session. Each package also carries its own manifest,
+so it can be installed on its own. Sources ship as TypeScript: Pi compiles them with jiti, so there is
+no build step.
 
 Host-provided Pi packages are declared as `peerDependencies: "*"` and pinned in the root
 `devDependencies` for typechecking and tests — never as `dependencies`, which would bundle a second
