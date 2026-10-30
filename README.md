@@ -25,6 +25,19 @@ works — decisions, gotchas, commands, what broke and why — and `pi-memory` i
 file), and tells the assistant to keep it current. Every Pi session in this checkout gets both, and
 each session reads `MEMORY.md` once, the way Pi reads `AGENTS.md`.
 
+### Skills
+
+`skills/` holds [Pi skills](./docs/adding-a-skill.md): instructions plus helper scripts that Pi
+advertises by name and description, then loads only when a task calls for them.
+
+| Skill                                            | What a session gets                                                                                                                                                                                                                                        |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`web-browsing`](./skills/web-browsing/SKILL.md) | Live web access through the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser: search, read a rendered page as markdown, extract with CSS/JS, screenshots, and multi-step flows (login, pagination) over CDP. Needs the `obscura` binary. |
+
+The root manifest declares `pi.skills: ["./skills"]`, so one `pi install .` ships skills and
+extensions together. `/skill:web-browsing` forces a skill into the conversation; otherwise the model
+reaches for it when the description matches the task.
+
 ## Use them
 
 Install the whole repository as one Pi package (recommended — it is what this repo is designed for):
@@ -85,6 +98,11 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 package.json              workspace root + Pi manifest listing every extension entry
 AGENTS.md                 how to work here, written by the user (Pi injects it)
 MEMORY.md                 how the work actually goes, written by you (pi-memory injects it)
+skills/
+  web-browsing/
+    SKILL.md              what the model reads, and when it reads it
+    scripts/              helpers the skill tells the model to run
+    references/           deeper reference, read only when pointed at
 packages/
   pi-bg-tasks/
     package.json          Pi manifest (pi.extensions), peer dependencies, npm metadata
@@ -113,8 +131,8 @@ docs/                     packaging, testing, and conventions
 
 Pi discovers resources from the root `pi` manifest, so `pi install .` (or
 `pi install git:github.com/italian-brainrot/my-pi-extensions` once public) loads every extension in
-`packages/`. Each package also carries its own manifest, so it can be installed on its own. Sources
-ship as TypeScript: Pi compiles them with jiti, so there is no build step.
+`packages/` and every skill in `skills/`. Each package also carries its own manifest, so it can be
+installed on its own. Sources ship as TypeScript: Pi compiles them with jiti, so there is no build step.
 
 Host-provided Pi packages are declared as `peerDependencies: "*"` and pinned in the root
 `devDependencies` for typechecking and tests — never as `dependencies`, which would bundle a second
@@ -128,7 +146,8 @@ npm run new -- pi-wordcount --description "Count words in the files a session to
 
 That creates the package, a first test, a README, and the manifest entry. Then read
 [docs/adding-an-extension.md](./docs/adding-an-extension.md) for the conventions and the checklist,
-and [docs/testing.md](./docs/testing.md) for the harness.
+and [docs/testing.md](./docs/testing.md) for the harness. A skill instead of a tool goes in `skills/`
+— see [docs/adding-a-skill.md](./docs/adding-a-skill.md).
 
 ## Status
 

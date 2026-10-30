@@ -64,3 +64,32 @@ Pi facts worth keeping:
 
 Tests: `test/wait-listing.test.ts` reloads the extension per test (`vi.resetModules()`), because the listing
 is exactly the module-level registry, and a shared runtime would leak earlier tests' tasks into it.
+
+## web-browsing skill (2026-10-30)
+
+`skills/web-browsing/` — `scripts/web.sh` (search / read / eval / shot) and `scripts/browse.mjs` (multi-step
+over CDP). The root manifest now declares `pi.skills: ["./skills"]`, which the already-installed repo package
+picks up for every session; `~/.local/bin/obscura` symlinks `~/Apps/obscura/obscura`. Check discovery without
+a model: `pi --mode rpc` then `{"type":"get_commands"}` → `skill:web-browsing`. `test/skills.test.ts` runs Pi's
+own skill loader over `skills/` and checks each script parses, prints usage, and fails without its binary;
+`npm run manifest` keeps `pi.skills` honest.
+
+Obscura 0.2.5, verified rather than assumed:
+
+- `fetch --dump markdown|text|links|html|cookies|assets`; `--dump original` is the raw body and skips the
+  browser (JSON/API/files); `--eval` prints the JSON-encoded result of a JS expression; `-s` PNG; `-o` file;
+  `-q` no banner. Navigation failure exits 1, an HTTP 404 exits 0. `--wait S` is a **fixed** delay, so leave
+  it unset to get the adaptive settle.
+- DuckDuckGo answers a headless fetch: `lite.duckduckgo.com/lite/?q=` with `a.result-link` (snippet is the
+  next `<tr>`, the real URL is the `uddg` query param), `html.duckduckgo.com/html/?q=` with `a.result__a`.
+  Mojeek returned nothing. `docs.obscura.sh` routinely times out.
+- CDP: connect to the **browser** endpoint, then `Target.createTarget` + `Target.attachToTarget {flatten:true}`
+  and send every later call with that `sessionId`; a direct `/devtools/page/<id>` socket answers
+  "No page for session". The page target is destroyed when the connection closes, `Network.setCookies` /
+  `Storage.setCookies` are accepted but do nothing, and `--storage-dir` wrote no files — so DOM and cookies
+  live exactly one connection, which is why `browse.mjs` takes a whole flow per call.
+- `LP.getMarkdown` does DOM → markdown; `Page.captureScreenshot` returns base64 PNG; `Input.dispatchMouseEvent`
+  needs coordinates from `DOM.getBoxModel` on a `Runtime.evaluate` object id, and JS `el.click()` is a fine
+  fallback. `serve` never exits on idle: `browse.mjs stop` kills the pid it recorded.
+- Pi's own module cache is irrelevant here, but note a shell gotcha when cleaning up: `pkill -f "obscura serve"`
+  matches the shell running it. Use `pkill -f "obscura[ ]serve"`.

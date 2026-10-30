@@ -11,13 +11,15 @@ conventional directory:
 // package.json (root)
 {
   "pi": {
-    "extensions": ["./packages/pi-bg-tasks/src/index.ts", "./packages/pi-subagent/src/index.ts"]
+    "extensions": ["./packages/pi-bg-tasks/src/index.ts", "./packages/pi-subagent/src/index.ts"],
+    "skills": ["./skills"]
   }
 }
 ```
 
-That list is generated: run `npm run manifest` after adding or renaming a package, and
-`npm run check` fails when it drifts.
+That list of extensions is generated: run `npm run manifest` after adding or renaming a package, and
+`npm run check` fails when it drifts. The script also keeps `pi.skills` pointed at `skills/` when that
+directory exists, so a skill never sits in the tree undeclared.
 
 Each package declares its own entry points too, so it can be installed on its own:
 
