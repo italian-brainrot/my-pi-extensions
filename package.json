@@ -9,9 +9,6 @@
     "packages/*"
   ],
   "pi": {
-    "skills": [
-      "./skills"
-    ],
     "extensions": [
       "./packages/pi-bg-tasks/src/index.ts",
       "./packages/pi-memory/src/index.ts",
