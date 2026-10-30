@@ -22,8 +22,8 @@ jobs:
         # Pi requires Node >= 22.19; the older entry is the floor, the newer one is what I run.
         node: ["22.x", "24.x"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
