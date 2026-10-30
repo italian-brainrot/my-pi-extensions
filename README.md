@@ -82,20 +82,21 @@ npm run dev -- --only pi-bg-tasks   # only one of them
 /reload                         # inside that pi session, after editing a file
 ```
 
-| Command                                    | What it does                                                                                  |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------- |
-| `npm run check`                            | Manifest sync check, typecheck, lint/format check, tests. Run this before you call work done. |
-| `npm test`                                 | Vitest suite. Extension tests spawn real processes.                                           |
-| `npm run typecheck`                        | `tsc --noEmit` over packages and tests.                                                       |
-| `npm run lint`                             | Biome lint and format check.                                                                  |
-| `npm run fmt`                              | Apply Biome fixes (format, safe lint fixes, import order).                                    |
-| `npm run manifest`                         | Rewrite the root `pi.extensions` list from the packages. `--check` in CI.                     |
-| `npm run new -- pi-name --description "…"` | Scaffold a new extension package, test, README, and manifest entry.                           |
-| `npm run install:skills`                   | Copy `skills/*` to `~/.agents/skills`, where Pi discovers them for every session.             |
-| `npm run skills:check`                     | Fail if that installed copy has drifted from the repository. Part of `npm run check`.         |
-| `npm run dev`                              | Pi with the repo's extensions loaded from source.                                             |
-| `npm run smoke -- pi-takeover`             | Drive a real Pi with a scripted model, and print what happened.                               |
-| `npm run install:personal`                 | `pi install .` — add this repo to your personal Pi settings.                                  |
+| Command                                    | What it does                                                                                                         |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `npm run check`                            | Lockfile sync, manifest sync check, skills check, typecheck, lint/format, tests. Run this before you call work done. |
+| `npm run deps:check`                       | Fail if `package-lock.json` does not describe every workspace; the same drift CI's `npm ci` rejects.                 |
+| `npm test`                                 | Vitest suite. Extension tests spawn real processes.                                                                  |
+| `npm run typecheck`                        | `tsc --noEmit` over packages and tests.                                                                              |
+| `npm run lint`                             | Biome lint and format check.                                                                                         |
+| `npm run fmt`                              | Apply Biome fixes (format, safe lint fixes, import order).                                                           |
+| `npm run manifest`                         | Rewrite the root `pi.extensions` list from the packages. `--check` in CI.                                            |
+| `npm run new -- pi-name --description "…"` | Scaffold a new extension package, test, README, and manifest entry.                                                  |
+| `npm run install:skills`                   | Copy `skills/*` to `~/.agents/skills`, where Pi discovers them for every session.                                    |
+| `npm run skills:check`                     | Fail if that installed copy has drifted from the repository. Part of `npm run check`.                                |
+| `npm run dev`                              | Pi with the repo's extensions loaded from source.                                                                    |
+| `npm run smoke -- pi-takeover`             | Drive a real Pi with a scripted model, and print what happened.                                                      |
+| `npm run install:personal`                 | `pi install .` — add this repo to your personal Pi settings.                                                         |
 
 ## Layout
 

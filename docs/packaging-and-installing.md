@@ -110,6 +110,23 @@ Dependabot opens monthly PRs and groups the Pi-provided ones together. Merge tho
 Pi has been updated to the same version, because the root pin is what typechecks against. See
 `.github/dependabot.yml`.
 
+### The lockfile has to be committed and in sync
+
+CI installs with `npm ci`, which refuses to run when `package-lock.json` does not describe every
+workspace — adding a package without running `npm install` fails the build at the install step, with
+no test output at all. `npm run deps:check` (part of `npm run check`) compares the two files and names
+the same drift in milliseconds, so it is caught before the push. `npm run new` runs the install for you.
+
+Do not write that check as `npm ci --dry-run`: `npm ci` deletes `node_modules` as its first step, and
+`--dry-run` never puts it back. `scripts/check-lock.mjs` only reads files.
+
+Regenerate the lock with an npm as new as the one that wrote it. CI runs npm 10 and 11; an older npm
+rewrites the lockfile and drops fields it does not know about, which buries the real change in churn:
+
+```bash
+npx npm@11 install
+```
+
 ## No build step
 
 Extensions ship as TypeScript. Pi compiles them with jiti, and Vitest transforms them for tests, so

@@ -7,8 +7,9 @@ npm run new -- pi-wordcount --description "Count words in the files a session to
 ```
 
 That creates `packages/pi-wordcount/` with a `package.json` (Pi manifest, peer dependencies, npm
-metadata), `src/index.ts`, `test/extension.test.ts`, and `README.md`, then rewrites the root
-manifest. Add the new package to the table in the root README.
+metadata), `src/index.ts`, `test/extension.test.ts`, and `README.md`, then rewrites the root manifest
+and runs `npm install` so the lock file knows about the workspace. Add the new package to the table in
+the root README.
 
 ## 2. Write the extension
 
@@ -121,7 +122,7 @@ changes the system prompt instead) is listed with `tools: []`.
 ## 5. Verify
 
 ```bash
-npm run check          # manifest --check, typecheck, lint, tests
+npm run check          # lockfile sync, manifest --check, skills check, typecheck, lint, tests
 npm run dev            # load it in a real pi session, then /reload after edits
 npm run smoke          # drive it with a scripted model against a real pi, and print the result
 ```
@@ -130,8 +131,9 @@ npm run smoke          # drive it with a scripted model against a real pi, and p
 in the package. Writing them is worth it for any extension whose behaviour depends on Pi's own
 lifecycle — sessions, prompts, the system prompt — rather than on what the tool returns.
 
-`npm run check` failing is a normal part of the loop: Biome reformats, `npm run fmt` fixes files, and
-the manifest script rewrites the root list when you add a package.
+`npm run check` failing is a normal part of the loop: Biome reformats, `npm run fmt` fixes files, the
+manifest script rewrites the root list when you add a package, and `npm install` fixes the lock file
+when `deps:check` says it is out of sync with the workspaces.
 
 ## 6. Install it for real
 

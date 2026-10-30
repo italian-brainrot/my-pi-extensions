@@ -3,8 +3,8 @@
 /**
  * Scaffold a new extension package: `npm run new -- pi-wordcount --description "Count words"`.
  *
- * Creates the package, its README, a starter entry point, and a first test, then updates the
- * root manifest so Pi and CI both see the new package.
+ * Creates the package, its README, a starter entry point, and a first test, then updates the root
+ * manifest and the lock file so Pi and CI both see the new package.
  */
 
 import { spawnSync } from "node:child_process";
@@ -186,6 +186,14 @@ npm test               # run the whole suite
 
 const sync = spawnSync(process.execPath, [join(repoRoot, "scripts", "sync-manifest.mjs")], { stdio: "inherit" });
 if (sync.status !== 0) process.exit(sync.status ?? 1);
+
+// The lock file has to know about the workspace or `npm ci` — CI, and `npm run deps:check` — fails.
+const install = spawnSync("npm", ["install"], { cwd: repoRoot, stdio: "inherit" });
+if (install.status !== 0) {
+  console.error("\nnpm install failed, so package-lock.json does not know about the new package.");
+  console.error("Fix it before committing: npm install");
+  process.exit(install.status ?? 1);
+}
 
 console.log(`
 Created packages/${name}:

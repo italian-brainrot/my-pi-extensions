@@ -17,7 +17,8 @@
     ]
   },
   "scripts": {
-    "check": "npm run manifest -- --check && npm run skills:check && npm run typecheck && npm run lint && npm run test",
+    "check": "npm run deps:check && npm run manifest -- --check && npm run skills:check && npm run typecheck && npm run lint && npm run test",
+    "deps:check": "node scripts/check-lock.mjs",
     "dev": "node scripts/dev.mjs",
     "fmt": "biome check --write .",
     "install:personal": "pi install .",
@@ -45,6 +46,7 @@
     "vitest": "^4.1.11"
   },
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "npm": ">=10.0.0"
   }
 }
