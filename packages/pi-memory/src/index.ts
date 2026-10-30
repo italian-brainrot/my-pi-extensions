@@ -165,10 +165,9 @@ export const SECTION_NAME = "assistant_memory";
  * the section) and keep it roughly this size; it is in every session's prompt.
  */
 export const MEMORY_NOTE =
-  "Assistant-maintained notes, owned by you, injected at the start of every session; edit these files with the normal file tools, and changes reach later sessions, not this one. " +
-  "Write the specification of the system as it stands now — what it is, how it works, what to run — covering what AGENTS.md and the code leave unsettled: invariants, constraints, interfaces, gotchas, and decisions with the reason behind them. " +
-  "This is not a diary: no dates, no log of what a session did, no retelling of how a problem was tracked down. " +
-  "Omit anything the next session can read off the code, the tests, or AGENTS.md, and rewrite or delete an entry when it stops being true instead of appending a correction; the file is only worth its prompt space while it is accurate and short.";
+  "Assistant-maintained notes, owned by you (the AI), injected into the system message of all agents working on this project. " +
+  "You must keep this file up to date so that future agents have the correct context. " +
+  "This file is not a diary. It should only contain important information that all future sessions must know.";
 
 function readMemory(path: string): string | undefined {
   try {
