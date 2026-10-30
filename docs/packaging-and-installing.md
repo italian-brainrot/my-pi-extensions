@@ -107,6 +107,10 @@ npm install -D @earendil-works/pi-coding-agent@<that version> \
   @earendil-works/pi-tui@<that version>
 ```
 
+`typebox` and `jiti` move with that same command, but to the versions the new Pi declares for them rather
+than to the Pi's own version; the pinned Pi's own `package.json` lists them, and `npm run deps:check`
+prints the whole `npm install -D` line whenever anything disagrees.
+
 `npm run deps:check` also runs `scripts/check-pi-pin.mjs`, which enforces this from both sides: it reads
 the pinned Pi's own `package.json` and fails when any of those pins is a range instead of the host's
 exact version, or when npm has installed a copy the host will not load (the second copy then sits under
