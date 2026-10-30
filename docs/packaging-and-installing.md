@@ -93,22 +93,35 @@ duplicate classes, registries, and initialization work. Pi reports a warning whe
 and `test/repo.test.ts` fails the build before it gets that far.
 
 For local development the same modules are pinned in the root `devDependencies`, which is what gives
-`tsc --noEmit` and Vitest real types. Keep that pin equal to the Pi you run — `pi update` moves it:
+`tsc --noEmit` and Vitest real types. Pi never loads those copies: its extension loader aliases every
+`typebox` and `@earendil-works/*` specifier to a path resolved out of Pi's own tree (`getAliases` in
+`dist/core/extensions/loader.js`). Our pins are therefore only ever the types of the Pi that will load
+the extension, and they are only right when they are the versions that Pi ships. Pin them exactly, the
+way Pi pins them itself, and update them together when `pi update` moves the host:
 
 ```bash
-npm view @earendil-works/pi-coding-agent version
+pi --version
 npm install -D @earendil-works/pi-coding-agent@<that version> \
   @earendil-works/pi-ai@<that version> \
   @earendil-works/pi-agent-core@<that version> \
   @earendil-works/pi-tui@<that version>
 ```
 
+`npm run deps:check` also runs `scripts/check-pi-pin.mjs`, which enforces this from both sides: it reads
+the pinned Pi's own `package.json` and fails when any of those pins is a range instead of the host's
+exact version, or when npm has installed a copy the host will not load (the second copy then sits under
+`node_modules/@earendil-works/pi-coding-agent`, which the failure names). When a Pi is installed on the
+machine — `~/.pi/agent/install/current-version`, or `PI_MANAGED_INSTALL_ROOT` — it also fails when that
+Pi is a different version than the one being typechecked against, which is what a `pi update` without a
+re-pin looks like. CI has no Pi, so it only runs the first half.
+
+A dependency PR that bumps `typebox` or `jiti` on their own is exactly the mistake that check exists to
+catch, and it fails CI rather than needing a human to notice; `.github/dependabot.yml` ignores those two
+for the same reason. A PR bumping the Pi packages themselves is only correct once the Pi on this machine
+matches, which is the half CI cannot see.
+
 Third-party runtime dependencies are allowed, but they have to be real `dependencies` and reachable
 from the installed tree; nothing in this repository needs one today.
-
-Dependabot opens monthly PRs and groups the Pi-provided ones together. Merge those only when the local
-Pi has been updated to the same version, because the root pin is what typechecks against. See
-`.github/dependabot.yml`.
 
 ### The lockfile has to be committed and in sync
 
@@ -133,6 +146,11 @@ Extensions ship as TypeScript. Pi compiles them with jiti, and Vitest transforms
 the only compiler in the loop is `tsc --noEmit` for typechecking. Do not add a bundler unless an
 extension genuinely needs one: it would double the number of ways the shipped code can differ from the
 code under test.
+
+`tsc` here is TypeScript 7, the native compiler: `npm ci` pulls in one platform binary as an optional
+dependency and typechecking takes under a second. It is a compiler, not the `typescript` JavaScript
+library, so nothing in this repository can `import "typescript"` to inspect or rewrite source — if a
+script ever needs the compiler API, that is a separate dependency and a decision, not a detail.
 
 ## Publishing later
 

@@ -70,7 +70,7 @@ const run = (cwd: string) => spawnSync("node", [join(cwd, "scripts", "check-lock
 describe("check-lock.mjs", () => {
   it("is wired into npm run check", () => {
     const manifest = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8"));
-    expect(manifest.scripts["deps:check"]).toBe("node scripts/check-lock.mjs");
+    expect(manifest.scripts["deps:check"]).toContain("node scripts/check-lock.mjs");
     expect(manifest.scripts.check).toContain("deps:check");
     // npm ci --dry-run would wipe node_modules instead; see the header of this file.
     expect(manifest.scripts["deps:check"]).not.toContain("npm ci");

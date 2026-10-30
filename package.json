@@ -18,7 +18,7 @@
   },
   "scripts": {
     "check": "npm run deps:check && npm run manifest -- --check && npm run skills:check && npm run typecheck && npm run lint && npm run test",
-    "deps:check": "node scripts/check-lock.mjs",
+    "deps:check": "node scripts/check-lock.mjs && node scripts/check-pi-pin.mjs",
     "dev": "node scripts/dev.mjs",
     "fmt": "biome check --write .",
     "install:personal": "pi install .",
@@ -40,10 +40,10 @@
     "@earendil-works/pi-coding-agent": "1.4.0",
     "@earendil-works/pi-tui": "1.4.0",
     "@types/node": "^22.19.19",
-    "jiti": "^2.7.0",
-    "typebox": "^1.3.27",
+    "jiti": "2.7.0",
+    "typebox": "1.3.27",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=22.19.0",

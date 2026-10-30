@@ -18,6 +18,12 @@ real session, not assumed.
   only `/reload` re-runs the factories. Module state is per-process, not per-session: anything that must
   survive a reload, or be scoped to one session, goes on disk (`<agent-dir>/<package>/`) or into a
   session custom entry.
+- Pi never loads the copies of `typebox` and `@earendil-works/*` that sit in a package's own
+  `node_modules`: `getAliases` in `pi-coding-agent/dist/core/extensions/loader.js` rewrites those specifiers
+  (and the legacy `@mariozechner/*` ones) to paths resolved out of Pi's tree, and Pi pins them exactly. So
+  the versions in this repo's `node_modules` only ever reach `tsc` and Vitest, and a bump there changes what
+  the types claim, never what an extension runs. jiti is not aliased — it is the compiler Pi loads our
+  source with, and the same exact-pin rule applies because `foreign-runtime.mjs` imitates that loader.
 - A `ctx` is bound to the session that built it. `runtime.invalidate()` marks it stale during session
   replacement and `reload()`, and its getters then throw the `assertActive` error — including inside a
   template literal in a debug line that would never have printed. Read what you need from the old ctx

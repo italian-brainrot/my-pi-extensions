@@ -4,25 +4,37 @@ updates:
     directory: "/"
     schedule:
       interval: monthly
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
 
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: monthly
-    open-pull-requests-limit: 3
+    # Three slots was too few: the queue is ordered by impact, so the majors that opened first used up
+    # every slot and a one-line security patch for a dev dependency never got a PR at all.
+    open-pull-requests-limit: 10
     labels:
       - dependencies
     commit-message:
       prefix: chore(deps)
-    # Pi-provided packages must stay pinned to the Pi version actually installed on this
-    # machine (see docs/packaging-and-installing.md). Merge those PRs only when the local
-    # pi has been updated to the same version.
+    ignore:
+      # Pi provides these to extensions and pins them to exact versions, so our copy only ever feeds
+      # tsc and Vitest. They move with the Pi on this machine, not with npm; `npm run deps:check`
+      # (scripts/check-pi-pin.mjs) fails whenever they drift. See docs/packaging-and-installing.md.
+      - dependency-name: "typebox"
+      - dependency-name: "jiti"
+      # The Node types track the engines floor (Node >= 22.19): a newer major typechecks against APIs
+      # the oldest runtime Pi supports does not have. Move this when engines does.
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
     groups:
+      # A Pi release is one decision, and the Pi packages always move together. typebox is deliberately
+      # not here: when a new Pi ships a different typebox, this group's PR fails deps:check with the
+      # exact `npm install -D typebox@<that version>` to push onto the PR branch.
       pi-host-packages:
         patterns:
           - "@earendil-works/*"
-          - "typebox"
         update-types:
           - "minor"
           - "patch"
