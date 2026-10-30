@@ -191,6 +191,7 @@ describe("a takeover in a running pi", () => {
     const reviewer = calls.find((entry) => entry.lastUser === REVIEW);
     const merger = calls.find((entry) => entry.lastUser === MERGE);
     expect(reviewer?.systemTakeoverSection[0]).toContain("previous session file is");
+    expect(merger?.systemTakeoverSection[0]).toContain("previous session file is");
 
     const sessions = sessionFiles();
     expect(sessions).toHaveLength(3);

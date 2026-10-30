@@ -31,8 +31,8 @@
  *
  * What the incoming session knows. Each takeover writes a custom entry into the new session — visible
  * in the transcript, invisible to the model — and the section this extension adds to that session's
- * system prompt is rendered from it, so lineage survives a reload and a resume. It states the position
- * in the chain, the remaining budget, and the path of the previous session file.
+ * system prompt is rendered from it, so lineage survives a reload and a resume. It says that the
+ * session arrived through a takeover and names the previous session's file.
  *
  * The model survives as well, and only because it is carried. A replacement is Pi's `/new`, which
  * resolves the model from settings, so a model the outgoing agent had switched to — session-scoped, the
@@ -313,10 +313,7 @@ function discardHandoff(reason: string): void {
  * what keeps it out of the transcript diff and out of the provider cache's way.
  */
 function renderSection(info: TakeoverEntry): string {
-  const limit = info.maxChain > 0 ? ` of ${info.maxChain}` : "";
-  const lines = [
-    `You are spawned by an earlier agent via a takeover.`
-  ];
+  const lines = [`You are spawned by an earlier agent via a takeover.`];
 
   if (info.fromSession) {
     lines.push(`The previous session file is ${info.fromSession} — read it if the handoff left something out.`);

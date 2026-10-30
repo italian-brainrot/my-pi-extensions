@@ -40,3 +40,27 @@ Tests: `npx vitest --run packages/pi-takeover` (the `test` script already passes
 `node_modules/.bin/pi --mode rpc` with `test/fixtures/fake-model.ts`, which answers from rules matched
 against the transcript it is shown and logs what every call was given. `npm run smoke -- pi-takeover`
 prints the same flow for reading rather than asserting.
+
+## pi-bg-tasks (2026-10-30)
+
+`bash` gains `timeout` and auto-backgrounds at it; `bg_wait` waits for any task and then answers with a
+table of every background task of the session: status, run time, lines/chars, exit code, log path.
+
+Pi facts worth keeping:
+
+- Pi makes **one AbortSignal per agent run** (`runWithLifecycle`'s controller) and hands it to every tool
+  call in that run. An `abort` listener outlives the call that added it, which is how a command that had
+  been deliberately released to the background got killed by an unrelated Escape later in the same run.
+  Every listener this extension installs is removed in the `finally` of the call that installed it.
+- `details` and `structuredContent` never reach the model, only `content` does. So the task table is capped
+  for the model (30 newest) while `details.tasks` carries all of them.
+- Output size is read from the log, never tracked in memory: newline bytes (exact, because 0x0A cannot
+  appear inside a UTF-8 sequence) plus `StringDecoder` for characters, cached per job on size+mtimeMs, and
+  marked `>=` past the 16 MB scan cap. Line counting matches `truncateTail`'s: a final line with no newline
+  counts as a line.
+- A job is a _background task_ (`job.backgrounded`) once it was spawned with `timeout: 0`, released at the
+  timeout, or adopted. Foreground commands live in the same registry so they can still be killed, but their
+  logs are deleted when they finish, so listing them would be noise.
+
+Tests: `test/wait-listing.test.ts` reloads the extension per test (`vi.resetModules()`), because the listing
+is exactly the module-level registry, and a shared runtime would leak earlier tests' tasks into it.
