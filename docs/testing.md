@@ -132,8 +132,9 @@ per-component costs, and that context size is the largest single response rather
   for any provider and id, which is enough to look a recorded model up but nothing else. If an
   extension reaches for something missing, the harness throws with instructions: either add a stub to
   the harness or cover that part in a real `pi` session with `npm run dev`.
-- **Kill timers keep the process alive.** `pi-bg-tasks` deliberately does not unref its SIGTERM grace
-  timer, so a worker can sit for a few seconds after stopping a job. Vitest's teardown allows it.
+- **Kill timers are cancelled, but a kill still takes a moment.** `pi-bg-tasks` cancels the timer of
+  every wait that returns early and unrefs the SIGTERM→SIGKILL escalation timer, so a finished tool
+  call never holds the process open. A worker can still sit until a killed command actually exits.
 - **Behaviour that lives per runtime needs a second process.** A cross-session bug — one pi process
   reaching into another's state — cannot be reproduced inside one runtime, because each load has its
   own module registry. Spawn a fixture that loads the same entry in its own process:

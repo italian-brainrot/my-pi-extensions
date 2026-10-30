@@ -8,15 +8,28 @@ instead of failing them**, plus two tools for working with those background jobs
 | Tool                               | What it does                                                                                                                                                                                                                                   |
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bash` (replaces the built-in one) | Runs a command. Adds `timeout` (seconds, default 60) and `blocking`. When the timeout expires the command keeps running in the background and the tool returns its task ID and log path. `timeout: 0` starts it in the background immediately. |
-| `bg_wait`                          | Wait for **any** running background command to finish (like `wait -n`). Default timeout 3600s.                                                                                                                                                 |
+| `bg_wait`                          | Wait for **any** running background task to finish (like `wait -n`), then list every background task of the session with its status, run time, output size, exit code, and log path. Default timeout 3600s.                                    |
 | `bg_stop`                          | Stop a background task by ID: SIGTERM, then SIGKILL after a 5s grace period.                                                                                                                                                                   |
 
 ```text
 > build the project                       bash { command: "npm run build", timeout: 5 }
   Command timed out after 5s and moved to background with ID: bg-1a2b3c4d (pid 4242).
   Output is being written to: ~/.pi/agent/bg-tasks/bg-1a2b3c4d.log
+
+  (no output yet)
+
+  Read the log file to inspect output, bg_wait to wait for it to finish, bg_stop to kill it.
+> start the dev server as well           bash { command: "npm run dev", timeout: 0 }
+  Command running in background with ID: bg-7f3k2m1q (pid 4300).
 > ... keep working on something else ...
 > bg_wait {}                              1 task(s) finished: bg-1a2b3c4d: completed (exit 0)
+
+  Background tasks in this session (2 tracked, 1 running):
+
+  bg-7f3k2m1q  running (pid 4300)    1m12s   42 lines   3096 chars   ~/.pi/agent/bg-tasks/bg-7f3k2m1q.log
+    $ npm run dev
+  bg-1a2b3c4d  completed (exit 0)    34.2s  318 lines  21402 chars   ~/.pi/agent/bg-tasks/bg-1a2b3c4d.log
+    $ npm run build
 > Read ~/.pi/agent/bg-tasks/bg-1a2b3c4d.log
 ```
 
@@ -61,7 +74,8 @@ A command that finishes inside the timeout behaves like the built-in tool: outpu
 Pi's own limits (last 2000 lines or 50 KB) and the temporary log is deleted, because the model
 already has everything. Output that had to be truncated keeps its log, and the result points at it.
 
-A command that was moved to the background returns the task ID, the pid, and the log path. The
+A command that was moved to the background returns the task ID, the pid, the log path, and the last
+4 KB of output printed so far — or `(no output yet)` when the command has printed nothing. The
 model is told to keep working rather than wait.
 
 Finished results also carry `structuredContent` (`output`, `truncated`, `exit_code`,
@@ -69,11 +83,44 @@ Finished results also carry `structuredContent` (`output`, `truncated`, `exit_co
 codemode scripts can read them. Commands that were moved to the background have no result yet, so
 they return only the task text.
 
+### What `bg_wait` reports
+
+`bg_wait` waits, then answers with one line about the wait — what finished, or that it timed out —
+followed by a table of **every background task this session knows about**, running ones first:
+
+```text
+bg-1a2b3c4d  completed (exit 0)  34.2s  318 lines  21402 chars  ~/.pi/agent/bg-tasks/bg-1a2b3c4d.log
+  $ npm run build
+bg-7f3k2m1q  running (pid 4300)  1m12s  42 lines   3096 chars   ~/.pi/agent/bg-tasks/bg-7f3k2m1q.log
+  $ npm run dev
+```
+
+- **status** — `running (pid …)`, `completed (exit 0)`, `failed (exit 3)`, `killed (signal SIGTERM)`,
+  and `(…, adopted)` for a job taken over from a previous runtime.
+- **run time** — from spawn to exit for a finished task, so it does not keep growing; from spawn to
+  now while it runs.
+- **output size** — lines and characters counted from the log, which is exact while the log is under
+  16 MB; beyond that the counts are prefixed with `>=` and the byte count stays exact.
+- **exit code** — for finished tasks; a running task has none.
+- **log path** — the file to `Read`, or `(no log: …)` if retention removed it.
+
+Commands that finished in the foreground are deliberately not in this table: their output already
+reached the model and their log is gone. The listing shows the 30 newest tasks (running ones are
+always included); `details.tasks` and `structuredContent.tasks` carry all of them, with
+`id`, `status`, `pid`, `exit_code`, `signal`, `command`, `runtime_seconds`, `log_path`,
+`log_exists`, `bytes`, `chars`, and `lines`.
+
+A wait also notices tasks that were backgrounded _while it was running_, so nothing started by a
+concurrent `bash` call goes unnoticed.
+
 ### Reading and stopping jobs
 
 - Read the log file with the `Read` tool; it is a plain file that keeps growing while the job runs.
-- `bg_wait` returns as soon as one job finishes, and lists what is still running.
+- `bg_wait` returns as soon as one job finishes, and lists every task either way — including when it
+  times out or the wait itself is aborted.
 - `bg_stop` on an already-finished job reports its final status rather than pretending to stop it.
+- A task that was deliberately backgrounded is not killed when the run is aborted later. Aborting a
+  run stops the command that call was waiting on, and nothing else.
 
 ### Background jobs survive a reload
 
@@ -143,5 +190,6 @@ npm test             # the whole monorepo suite
 npx vitest --run packages/pi-bg-tasks
 ```
 
-The tests spawn real processes, so they cover timeout release, killing, re-adoption after a reload,
-log retention, and the environment handed to commands. See [docs/testing.md](../../docs/testing.md).
+The tests spawn real processes, so they cover timeout release, killing, the task listing and its
+counts, output surviving the handover to the background, re-adoption after a reload, log retention,
+and the environment handed to commands. See [docs/testing.md](../../docs/testing.md).

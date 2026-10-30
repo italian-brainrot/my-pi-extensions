@@ -7,7 +7,8 @@
  * command in the background immediately.
  *
  * Two extra tools:
- *   - bg_wait — wait for ANY running background task to finish (default 1 hour)
+ *   - bg_wait — wait for ANY running background task to finish (default 1 hour), then list every
+ *     background task of this session: status, run time, output size, exit code, and log path
  *   - bg_stop — stop a background task by ID (SIGTERM, then SIGKILL)
  *
  * Behaviour worth knowing:
@@ -18,9 +19,9 @@
  *     PI_BG_TASKS_KEEP_RUNNING=0 to also kill them on /new, /resume, /fork and
  *     /reload (the previous behaviour).
  *   - Logs live in `<agentDir>/bg-tasks` and are pruned by age and count.
- *   - Finished commands return `structuredContent` (as the built-in bash tool
- *     does) for programmatic callers such as codemode scripts; a command that was
- *     moved to the background returns only its task text, since it has no result.
+ *   - Results carry `structuredContent` (as the built-in bash tool does) for programmatic callers
+ *     such as codemode scripts: a finished command reports its output, a command moved to the
+ *     background only its task text, and bg_wait every background task of the session.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -33,12 +34,14 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  type Stats,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, constants as osConstants } from "node:os";
 import { delimiter, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { TextContent } from "@earendil-works/pi-ai";
 import {
   type AgentToolResult,
@@ -88,6 +91,17 @@ const LARGE_LOG_WARN_BYTES = 50 * 1024 * 1024;
 const OUTPUT_POLL_MS = 300;
 const ADOPTED_POLL_MS = 1000;
 
+/**
+ * Limits for counting a job's output. A whole-file scan is capped so a runaway log cannot stall a
+ * tool call; past the cap the byte count stays exact and lines/chars are reported as lower bounds.
+ */
+const COUNT_CHUNK_BYTES = 1024 * 1024;
+const COUNT_SCAN_CAP_BYTES = 16 * 1024 * 1024;
+/** Commands are shown on one line in the task listing. */
+const LISTING_COMMAND_CHARS = 100;
+/** Cap on the model-facing listing; `details.tasks` still carries all of them. */
+const LISTING_MAX_TASKS = 30;
+
 /** PI_* variables the built-in tool owns; they must never leak from a parent session. */
 const SESSION_ENV_KEYS = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"] as const;
 
@@ -106,13 +120,24 @@ interface BgJob {
   status: BgStatus;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+  /** Set when the job stopped running, so run time stops growing. */
+  finishedAt?: number;
   /** Present for jobs this process did not spawn (restored after reload). */
   adopted: boolean;
+  /**
+   * True once the job is a *background task*: spawned with `timeout: 0`, released to the background
+   * at the timeout, or adopted from another runtime. Foreground commands that finished inside their
+   * timeout are tracked (so they can still be killed) but are not listed or waited on as background
+   * tasks, and their logs are already gone.
+   */
+  backgrounded: boolean;
   /** Set once a kill was requested, so an adopted job reports "killed". */
   killRequested?: boolean;
   proc?: ChildProcess;
   donePromise?: Promise<void>;
   resolveDone?: () => void;
+  /** Cached output counts, valid while the log's size and mtime are unchanged. */
+  counts?: { size: number; mtimeMs: number; value: OutputCounts };
 }
 
 /** Shared result shape so every tool branch stays type-checked. */
@@ -127,7 +152,10 @@ interface BgToolDetails {
   fullOutputPath?: string;
   truncation?: TruncationResult;
   running?: string[];
+  finished?: string[];
   timeout?: number;
+  /** Per-task information, as reported by bg_wait. */
+  tasks?: TaskInfo[];
 }
 
 interface BashParams {
@@ -189,6 +217,7 @@ function getDone(job: BgJob): Promise<void> {
 
 function markDone(job: BgJob, exitCode: number | null, signal: NodeJS.Signals | null): void {
   if (job.status !== "running") return;
+  job.finishedAt = Date.now();
   job.exitCode = exitCode;
   job.signal = signal;
   // An adopted job has no exit handle, so a kill we requested shows up as
@@ -298,6 +327,7 @@ function writeMeta(job: BgJob): void {
         // Who wrote this. The agent dir is shared by every pi process, and a job belongs to the
         // session that started it: see isOwnedByAnotherSession().
         ownerPid: process.pid,
+        backgrounded: job.backgrounded,
       }),
       "utf8",
     );
@@ -315,6 +345,7 @@ interface JobMeta {
   startedAt?: unknown;
   logPath?: unknown;
   ownerPid?: unknown;
+  backgrounded?: unknown;
 }
 
 /** Parse a sidecar; undefined when it cannot be read or is not valid JSON. */
@@ -359,6 +390,9 @@ function isManagedByOtherProcess(pid: number): boolean {
   return pid !== process.pid && isAlive(pid);
 }
 
+/** Listeners told about every job that becomes a background task, so a wait can pick it up. */
+const backgroundListeners = new Set<(job: BgJob) => void>();
+
 /**
  * Start a command with stdout and stderr attached to a log file.
  *
@@ -366,8 +400,13 @@ function isManagedByOtherProcess(pid: number): boolean {
  * command in a shell redirection: a wrapper such as `(cmd) > log 2>&1` breaks
  * heredocs, trailing line continuations, commands that end in a comment, and
  * commands that start with `(`.
+ *
+ * A background job must never keep the agent process alive, so its handle is unref'd when it is
+ * spawned as a background task. A foreground job stays ref'd: that is what keeps the event loop
+ * alive while the command is being awaited. It is unref'd when the command is moved to the
+ * background.
  */
-function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | undefined, ref: boolean): BgJob {
+function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | undefined, backgrounded: boolean): BgJob {
   ensureLogDir();
   const id = newId();
   const logPath = logPathFor(id);
@@ -382,6 +421,10 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
       stdio: ["ignore", fd, fd],
       env: buildEnv(ctx),
     });
+  } catch (error) {
+    // Nothing can read an empty log left behind by a command that never started.
+    unlinkQuietly(logPath);
+    throw error;
   } finally {
     // The child duplicated the descriptors at spawn; the parent copy is not needed.
     closeSync(fd);
@@ -399,6 +442,7 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
     exitCode: null,
     signal: null,
     adopted: false,
+    backgrounded,
     proc,
   };
   getDone(job);
@@ -413,17 +457,29 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
     markDone(job, 127, null);
   });
 
-  // A background job must never keep the agent process alive, so its handle is
-  // unref'd right away. A foreground job stays ref'd: that is what keeps the
-  // event loop alive while the command is being awaited. It is unref'd when the
-  // command is moved to the background.
-  if (!ref) proc.unref();
+  if (backgrounded) {
+    proc.unref();
+    announceBackground(job);
+  }
 
   return job;
 }
 
+/**
+ * A foreground job that ran out of its timeout becomes a background task: its output stays in the
+ * log, its handle stops holding the event loop, and its sidecar now says what the job really is, so
+ * a reload re-adopts it. The caller's abort listener is removed by the caller that owned it: an
+ * abort later in the same run must not kill a task that was deliberately left running.
+ */
 function releaseToBackground(job: BgJob): void {
+  job.backgrounded = true;
   job.proc?.unref();
+  writeMeta(job);
+  announceBackground(job);
+}
+
+function announceBackground(job: BgJob): void {
+  for (const listener of backgroundListeners) listener(job);
 }
 
 function appendToLog(path: string, text: string): void {
@@ -466,11 +522,11 @@ function killJob(job: BgJob): void {
 
   signal("SIGTERM");
 
-  // Deliberately not unref'd and never cleared: a kill in flight is awaited by a tool call or by
-  // shutdown, and the grace window must not be cut short by the event loop exiting.
+  // Unref'd on purpose: whoever asked for this kill awaits it with a timer of their own that holds
+  // the event loop, so the escalation must not be the last thing keeping the process alive.
   setTimeout(() => {
     if (job.status === "running") signal("SIGKILL");
-  }, SIGTERM_GRACE_MS);
+  }, SIGTERM_GRACE_MS).unref?.();
 }
 
 // ── Re-adopting jobs after reload or session replacement ─────────────────────
@@ -640,6 +696,8 @@ function adoptJobs(): void {
       exitCode: null,
       signal: null,
       adopted: true,
+      // Nothing is awaiting an adopted job, so by definition it is a background task.
+      backgrounded: true,
     };
     jobs.set(id, job);
     getDone(job);
@@ -778,8 +836,15 @@ function appendStatus(text: string, status: string): string {
   return text ? `${text}\n\n${status}` : status;
 }
 
-function wallSeconds(startedAt: number): number {
-  return Math.round((Date.now() - startedAt) / 100) / 10;
+function wallSeconds(job: BgJob): number {
+  const end = job.finishedAt ?? Date.now();
+  return Math.round((end - job.startedAt) / 100) / 10;
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${String(Math.round(seconds % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(seconds / 3600)}h${String(Math.floor((seconds % 3600) / 60)).padStart(2, "0")}m`;
 }
 
 function oversizedNote(job: BgJob): string {
@@ -787,6 +852,187 @@ function oversizedNote(job: BgJob): string {
   return size > LARGE_LOG_WARN_BYTES
     ? `\nWarning: ${job.logPath} is already ${formatSize(size)}. Consider limiting the command's output.`
     : "";
+}
+
+// ── Counting and listing background tasks ─────────────────────────────────────
+
+interface OutputCounts {
+  bytes: number;
+  chars: number;
+  lines: number;
+  /** True when the scan stopped at the cap, so chars and lines are lower bounds. */
+  partial: boolean;
+}
+
+/**
+ * Count a log in bounded chunks: the file may be megabytes long and is still being written while the
+ * task runs. Newlines are counted on the raw bytes, which is exact for UTF-8 (0x0A never appears
+ * inside a multi-byte sequence); characters are counted on the decoded text, so a split codepoint at
+ * a chunk boundary is not miscounted.
+ */
+function scanOutputCounts(path: string, size: number): OutputCounts {
+  if (size === 0) return { bytes: 0, chars: 0, lines: 0, partial: false };
+
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(COUNT_CHUNK_BYTES);
+    const decoder = new StringDecoder("utf8");
+    let scanned = 0;
+    let lines = 0;
+    let chars = 0;
+    let endsWithNewline = false;
+
+    while (scanned < size && scanned < COUNT_SCAN_CAP_BYTES) {
+      const want = Math.min(buffer.length, size - scanned, COUNT_SCAN_CAP_BYTES - scanned);
+      const bytesRead = readSync(fd, buffer, 0, want, scanned);
+      if (bytesRead === 0) break;
+      chars += decoder.write(buffer.subarray(0, bytesRead)).length;
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 0x0a) lines++;
+      }
+      endsWithNewline = buffer[bytesRead - 1] === 0x0a;
+      scanned += bytesRead;
+    }
+    chars += decoder.end().length;
+    // Pi counts a final line that has no trailing newline; a capped scan counts its last fragment too.
+    if (!endsWithNewline) lines++;
+
+    return { bytes: size, chars, lines, partial: scanned < size };
+  } catch {
+    return { bytes: size, chars: 0, lines: 0, partial: false };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Counts of a job's log, re-scanned only when the file changed. */
+function outputCounts(job: BgJob): OutputCounts {
+  let stat: Stats;
+  try {
+    stat = statSync(job.logPath);
+  } catch {
+    return { bytes: 0, chars: 0, lines: 0, partial: false };
+  }
+
+  const cached = job.counts;
+  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.value;
+
+  const value = scanOutputCounts(job.logPath, stat.size);
+  job.counts = { size: stat.size, mtimeMs: stat.mtimeMs, value };
+  return value;
+}
+
+/** One background task, as bg_wait reports it. */
+interface TaskInfo {
+  id: string;
+  status: BgStatus;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  pid: number;
+  command: string;
+  runtimeSeconds: number;
+  logPath: string;
+  logExists: boolean;
+  bytes: number;
+  chars: number;
+  lines: number;
+  countsPartial: boolean;
+  adopted: boolean;
+}
+
+function taskInfo(job: BgJob): TaskInfo {
+  const counts = outputCounts(job);
+  return {
+    id: job.id,
+    status: job.status,
+    exitCode: job.exitCode,
+    signal: job.signal,
+    pid: job.pid,
+    command: job.command,
+    runtimeSeconds: wallSeconds(job),
+    logPath: job.logPath,
+    logExists: existsSync(job.logPath),
+    bytes: counts.bytes,
+    chars: counts.chars,
+    lines: counts.lines,
+    countsPartial: counts.partial,
+    adopted: job.adopted,
+  };
+}
+
+/** Every background task this runtime knows about for the session, running ones first. */
+function backgroundTasks(): TaskInfo[] {
+  return [...jobs.values()]
+    .filter((job) => job.backgrounded)
+    .sort((a, b) => {
+      const aRunning = a.status === "running";
+      const bRunning = b.status === "running";
+      if (aRunning !== bRunning) return aRunning ? -1 : 1;
+      return a.startedAt - b.startedAt;
+    })
+    .map(taskInfo);
+}
+
+function statusColumn(info: TaskInfo): string {
+  if (info.status === "running") return `running (pid ${info.pid}${info.adopted ? ", adopted" : ""})`;
+  const code = info.exitCode !== null ? `exit ${info.exitCode}` : info.signal ? `signal ${info.signal}` : "code unknown";
+  return `${info.status} (${code})`;
+}
+
+function truncateOneLine(text: string, limit: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > limit ? `${flat.slice(0, limit - 1)}…` : flat;
+}
+
+/** One pair of lines per task: the facts, then the command that produced them. */
+function taskListing(infos: TaskInfo[]): string[] {
+  const rows = infos.map((info) => {
+    const bound = info.countsPartial ? ">=" : "";
+    return {
+      command: truncateOneLine(info.command, LISTING_COMMAND_CHARS),
+      cells: [
+        info.id,
+        statusColumn(info),
+        formatDuration(info.runtimeSeconds),
+        `${bound}${info.lines} lines`,
+        `${bound}${info.chars} chars`,
+        info.logExists ? info.logPath : `(no log: ${info.logPath})`,
+      ],
+    };
+  });
+
+  // Pad every column except the last, where the path reads better unbroken.
+  const widths = rows[0]!.cells.map((_, column) => Math.max(...rows.map((row) => row.cells[column]!.length)));
+  const lines: string[] = [];
+  for (const row of rows) {
+    lines.push(
+      row.cells
+        .map((cell, column) => (column < row.cells.length - 1 ? cell.padEnd(widths[column]!) : cell))
+        .join("  ")
+        .trimEnd(),
+    );
+    if (row.command) lines.push(`  $ ${row.command}`);
+  }
+  return lines;
+}
+
+/** The section bg_wait appends to whatever it was waiting for. */
+function taskSection(infos: TaskInfo[]): string[] {
+  if (infos.length === 0) return [];
+
+  const running = infos.filter((info) => info.status === "running").length;
+  const shown = infos.slice(0, LISTING_MAX_TASKS);
+  const omitted = infos.length - shown.length;
+
+  return [
+    "",
+    `Background tasks in this session (${infos.length} tracked, ${running} running):`,
+    "",
+    ...taskListing(shown),
+    // Running tasks sort first, so anything dropped here is an old finished one.
+    ...(omitted > 0 ? ["", `(${omitted} older finished tasks not listed; their logs are in ${LOG_DIR})`] : []),
+  ];
 }
 
 // ── Foreground execution with auto-backgrounding ─────────────────────────────
@@ -807,8 +1053,19 @@ function startOutputPolling(job: BgJob, onUpdate: AgentToolUpdateCallback<BgTool
   return () => clearInterval(timer);
 }
 
+/**
+ * The result for a command that is still running and is now a background task. Whatever the command
+ * printed so far is already in the log; say what is not there rather than leaving the model to guess.
+ */
 function backgroundResult(job: BgJob, reason: string | undefined): BgResult {
-  const preview = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
+  // The preview is trimmed for display, but whether it was cut is judged on what was read, not on
+  // what is shown.
+  const read = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
+  const readBytes = Buffer.byteLength(read, "utf8");
+  const preview = read.trimEnd();
+  const size = logSize(job.logPath);
+  const previewLabel = size > readBytes ? `Preview (last ${formatSize(readBytes)} of ${formatSize(size)}):` : "Preview:";
+
   return {
     content: [
       {
@@ -818,7 +1075,8 @@ function backgroundResult(job: BgJob, reason: string | undefined): BgResult {
             ? `Command ${reason} with ID: ${job.id} (pid ${job.pid}).`
             : `Command running in background with ID: ${job.id} (pid ${job.pid}).`,
           `Output is being written to: ${job.logPath}`,
-          ...(preview ? ["", "Preview:", preview] : []),
+          "",
+          ...(preview ? [previewLabel, preview] : ["(no output yet)"]),
           "",
           "Read the log file to inspect output, bg_wait to wait for it to finish, bg_stop to kill it.",
           oversizedNote(job),
@@ -869,7 +1127,7 @@ function finishedResult(job: BgJob, aborted: boolean): BgResult {
       truncated: full.truncated,
       ...(full.truncated && fullOutputPath ? { full_output_path: fullOutputPath } : {}),
       exit_code: exitCode,
-      wall_time_seconds: wallSeconds(job.startedAt),
+      wall_time_seconds: wallSeconds(job),
     },
     ...(failure ? { isError: true } : {}),
   };
@@ -883,34 +1141,28 @@ async function runWithTimeout(
   onUpdate: AgentToolUpdateCallback<BgToolDetails> | undefined,
   ctx: ExtensionToolContext | undefined,
 ): Promise<BgResult> {
-  const job = spawnJob(command, cwd, ctx, true);
+  const job = spawnJob(command, cwd, ctx, false);
   const stopPolling = startOutputPolling(job, onUpdate);
 
-  if (signal) {
-    if (signal.aborted) killJob(job);
-    else signal.addEventListener("abort", () => killJob(job), { once: true });
-  }
-
-  let timedOut = false;
-  const timeoutPromise = new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      timedOut = true;
-      resolve();
-    }, Math.max(0, timeoutSec) * 1000);
-    timer.unref?.();
-  });
-  const abortPromise = new Promise<void>((resolve) => {
-    if (!signal) return;
-    if (signal.aborted) resolve();
-    else signal.addEventListener("abort", () => resolve(), { once: true });
-  });
+  // Pi gives one signal to every tool call in a run, so every listener installed here is removed
+  // again in the finally: a command that was deliberately released to the background must survive an
+  // abort that arrives later in the same run, and long runs must not pile listeners onto one signal.
+  const stopKillOnAbort = onAbort(signal, () => killJob(job));
+  const timer = sleep(Math.max(0, timeoutSec) * 1000);
+  const aborting = abortWatch(signal);
 
   try {
-    await Promise.race([getDone(job), timeoutPromise, abortPromise]);
+    const settled = await Promise.race([
+      getDone(job).then(() => "done" as const),
+      timer.promise.then(() => "timeout" as const),
+      aborting.promise,
+    ]);
 
     // An abort starts a kill; give the grace window room to land before deciding.
-    if (job.status === "running" && !timedOut) {
-      await Promise.race([getDone(job), delay(SIGTERM_GRACE_MS + 1000)]);
+    if (job.status === "running" && settled !== "timeout") {
+      const grace = sleep(SIGTERM_GRACE_MS + 1000);
+      await Promise.race([getDone(job), grace.promise]);
+      grace.cancel();
     }
 
     if (job.status === "running") {
@@ -924,24 +1176,67 @@ async function runWithTimeout(
     return finishedResult(job, signal?.aborted === true);
   } finally {
     stopPolling();
+    timer.cancel();
+    aborting.off();
+    stopKillOnAbort();
   }
 }
 
 /**
- * Bounded wait helper. Its timer is ref'd on purpose: a tool call that is being
- * awaited must keep the event loop alive, otherwise a print/run-mode process can
- * exit while the tool is still waiting.
+ * Bounded wait helper. Its timer is ref'd on purpose: a tool call that is being awaited must keep
+ * the event loop alive, otherwise a print/run-mode process can exit while the tool is still waiting.
+ * A caller that stops waiting early has to `cancel()`, or a finished tool call keeps holding the
+ * process open for the rest of its timeout.
  */
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+interface Sleeper {
+  promise: Promise<void>;
+  cancel(): void;
+}
+
+function sleep(ms: number): Sleeper {
+  let timer: NodeJS.Timeout | undefined;
+  const promise = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
   });
+  return {
+    promise,
+    cancel() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  };
+}
+
+/**
+ * Attach an abort handler and return its remover.
+ *
+ * Handlers that are never removed are both a leak and a correctness hazard here: the signal belongs
+ * to the whole run, so an abort handler left behind by a call that backgrounded its command would
+ * kill that command when the user aborts something else later in the same run.
+ */
+function onAbort(signal: AbortSignal | undefined, handler: () => void): () => void {
+  if (!signal) return () => {};
+  if (signal.aborted) {
+    handler();
+    return () => {};
+  }
+  signal.addEventListener("abort", handler, { once: true });
+  return () => signal.removeEventListener("abort", handler);
+}
+
+/** Resolve to "aborted" when the signal aborts; `off` removes the listener again. */
+function abortWatch(signal: AbortSignal | undefined): { promise: Promise<"aborted">; off: () => void } {
+  let off = () => {};
+  const promise = new Promise<"aborted">((resolve) => {
+    off = onAbort(signal, () => resolve("aborted"));
+  });
+  return { promise, off };
 }
 
 // ── Background spawn ─────────────────────────────────────────────────────────
 
 function spawnBackground(command: string, cwd: string, ctx: ExtensionToolContext | undefined): BgResult {
-  const job = spawnJob(command, cwd, ctx, false);
+  const job = spawnJob(command, cwd, ctx, true);
   return backgroundResult(job, undefined);
 }
 
@@ -974,7 +1269,7 @@ const BASH_PROMPT_GUIDELINES = [
   "Use timeout: 0 when a command is expected to run for a long time (dev servers, watchers, long builds).",
   "After starting a background command, do NOT wait on it — continue with other work.",
   "Read a task's output with the Read tool on the log file path returned in the result.",
-  "Stop a task with bg_stop; wait for any task to finish with bg_wait.",
+  "bg_stop kills a task; bg_wait waits for any task to finish and lists every background task with its status, run time, output size, and log path.",
   "You can inspect PI_* environment variables for current model and session details.",
 ];
 
@@ -1069,7 +1364,9 @@ function registerBgStop(pi: ExtensionAPI): void {
       }
 
       killJob(job);
-      await Promise.race([getDone(job), delay(SIGTERM_GRACE_MS + 1000)]);
+      const grace = sleep(SIGTERM_GRACE_MS + 1000);
+      await Promise.race([getDone(job), grace.promise]);
+      grace.cancel();
 
       return {
         content: [
@@ -1086,14 +1383,60 @@ function registerBgStop(pi: ExtensionAPI): void {
 
 // ── bg_wait tool ─────────────────────────────────────────────────────────────
 
-type WaitOutcome = { kind: "job" } | { kind: "timeout" } | { kind: "aborted" };
+type WaitOutcome = "job" | "timeout" | "aborted" | "none";
+
+/** Task fields in the shape a programmatic caller expects, matching the bash tool's snake_case. */
+function structuredTask(info: TaskInfo) {
+  return {
+    id: info.id,
+    status: info.status,
+    pid: info.pid,
+    exit_code: info.exitCode,
+    signal: info.signal,
+    command: info.command,
+    runtime_seconds: info.runtimeSeconds,
+    log_path: info.logPath,
+    log_exists: info.logExists,
+    bytes: info.bytes,
+    chars: info.chars,
+    lines: info.lines,
+    counts_partial: info.countsPartial,
+    adopted: info.adopted,
+  };
+}
+
+/** Every bg_wait answer: one line about the wait, then the whole task table. */
+function waitResult(summary: string, outcome: WaitOutcome, finished: string[], timeoutSec?: number, isError = false): BgResult {
+  const infos = backgroundTasks();
+  const running = infos.filter((info) => info.status === "running").map((info) => info.id);
+  const timedOut = outcome === "timeout";
+
+  return {
+    content: [{ type: "text", text: [summary, ...taskSection(infos)].join("\n") } as TextContent],
+    details: {
+      running,
+      finished,
+      tasks: infos,
+      ...(timedOut ? { timeout: timeoutSec } : {}),
+    },
+    structuredContent: {
+      outcome,
+      finished,
+      running,
+      ...(timedOut ? { timeout: timeoutSec } : {}),
+      tasks: infos.map(structuredTask),
+    },
+    ...(isError ? { isError: true } : {}),
+  };
+}
 
 function registerBgWait(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "bg_wait",
     label: "Background Task Wait",
     description:
-      "Wait for ANY currently running background command to finish (similar to bash `wait -n`). Returns as soon as at least one task finishes. Has a timeout (default 1 hour).",
+      "Wait for ANY running background task to finish (like bash `wait -n`), then list every background task of this " +
+      "session with its status, run time, output lines and characters, exit code, and log path. Has a timeout (default 1 hour).",
     parameters: Type.Object({
       timeout: Type.Optional(Type.Number({ description: `Timeout in seconds (default: ${DEFAULT_BG_WAIT_TIMEOUT_SEC})` })),
     }),
@@ -1102,67 +1445,57 @@ function registerBgWait(pi: ExtensionAPI): void {
       const { timeout } = params as { timeout?: number };
       const timeoutSec = timeout === undefined ? DEFAULT_BG_WAIT_TIMEOUT_SEC : resolveTimeout(timeout);
 
-      const runningJobs = [...jobs.values()].filter((job) => job.status === "running");
-      if (runningJobs.length === 0) {
-        return { content: [{ type: "text", text: "No background tasks are running." }], details: { running: [] } };
-      }
-
-      const jobOutcomes: Promise<WaitOutcome>[] = runningJobs.map(async (job) => {
-        await getDone(job);
-        return { kind: "job" } as const;
-      });
-
-      const timeoutOutcome: Promise<WaitOutcome> = delay(timeoutSec * 1000).then(() => ({ kind: "timeout" }) as const);
-      const abortOutcome: Promise<WaitOutcome> = new Promise((resolve) => {
-        if (!signal) return;
-        if (signal.aborted) resolve({ kind: "aborted" });
-        else signal.addEventListener("abort", () => resolve({ kind: "aborted" }), { once: true });
-      });
-
-      const outcome = await Promise.race([...jobOutcomes, timeoutOutcome, abortOutcome]);
-
-      if (outcome.kind === "timeout") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Timeout reached (${timeoutSec} sec). No tasks finished yet. Still running: ${runningJobs.map((job) => job.id).join(", ")}.`,
-            },
-          ],
-          details: { timeout: timeoutSec, running: runningJobs.map((job) => job.id) },
+      // Watched tasks are tracked as they become background tasks, so a command backgrounded while
+      // this call is already running is waited on too, and nothing that ends during the wait goes
+      // unreported.
+      const watched = new Map<string, BgJob>();
+      let announce = (_job: BgJob) => {};
+      const anyFinished = new Promise<"job">((resolve) => {
+        announce = (job) => {
+          watched.set(job.id, job);
+          void getDone(job).then(() => resolve("job"));
         };
-      }
-
-      if (outcome.kind === "aborted") {
-        // Background jobs keep running; only the wait was cancelled.
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Wait aborted. Tasks are still running: ${runningJobs.map((job) => job.id).join(", ")}.`,
-            },
-          ],
-          details: { running: runningJobs.map((job) => job.id) },
-          isError: true,
-        };
-      }
-
-      const finished = runningJobs.filter((job) => job.status !== "running");
-      const stillRunning = runningJobs.filter((job) => job.status === "running");
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `${finished.length} task(s) finished:`,
-              ...finished.map((job) => describeJob(job)),
-              ...(stillRunning.length > 0 ? ["", "Still running:", ...stillRunning.map((job) => describeJob(job))] : []),
-            ].join("\n"),
-          },
-        ],
-        details: { running: stillRunning.map((job) => job.id) },
+      });
+      const listen = (job: BgJob) => {
+        if (job.status === "running") announce(job);
       };
+      for (const job of jobs.values()) {
+        if (job.backgrounded) listen(job);
+      }
+
+      if (watched.size === 0) {
+        return waitResult("No background tasks are running.", "none", []);
+      }
+      backgroundListeners.add(listen);
+
+      const timer = sleep(timeoutSec * 1000);
+      const aborting = abortWatch(signal);
+
+      let outcome: WaitOutcome;
+      try {
+        outcome = await Promise.race([anyFinished, timer.promise.then(() => "timeout" as const), aborting.promise]);
+      } finally {
+        backgroundListeners.delete(listen);
+        timer.cancel();
+        aborting.off();
+      }
+
+      const finishedJobs = [...watched.values()].filter((job) => job.status !== "running");
+      const finished = finishedJobs.map((job) => job.id);
+      const finishedNote =
+        finishedJobs.length > 0
+          ? `${finishedJobs.length} task(s) finished: ${finishedJobs.map((job) => describeJob(job)).join(", ")}`
+          : "No task finished.";
+
+      if (outcome === "timeout") {
+        return waitResult(`Timeout reached (${timeoutSec} sec). ${finishedNote}`, outcome, finished, timeoutSec);
+      }
+      if (outcome === "aborted") {
+        // Background jobs keep running; only the wait was cancelled.
+        return waitResult(`Wait aborted; background tasks keep running. ${finishedNote}`, outcome, finished, undefined, true);
+      }
+
+      return waitResult(finishedNote, outcome, finished);
     },
   });
 }
@@ -1183,11 +1516,17 @@ function withBlockingLock<T>(run: () => Promise<T>): Promise<T> {
 
 // ── Session lifecycle ────────────────────────────────────────────────────────
 
-function killAllJobs(): Promise<void> {
+async function killAllJobs(): Promise<void> {
   const running = [...jobs.values()].filter((job) => job.status === "running");
-  if (running.length === 0) return Promise.resolve();
+  if (running.length === 0) return;
   for (const job of running) killJob(job);
-  return Promise.race([Promise.all(running.map(getDone)), delay(SIGTERM_GRACE_MS + 1000)]).then(() => undefined);
+
+  const grace = sleep(SIGTERM_GRACE_MS + 1000);
+  try {
+    await Promise.race([Promise.all(running.map((job) => getDone(job))), grace.promise]);
+  } finally {
+    grace.cancel();
+  }
 }
 
 function keepOnSessionReplacement(): boolean {

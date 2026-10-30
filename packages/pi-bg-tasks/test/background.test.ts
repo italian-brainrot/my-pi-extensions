@@ -97,6 +97,24 @@ describe("background commands", () => {
     await ext.callTool("bg_stop", { task_id: job.id, reason: "test cleanup" });
   });
 
+  it("loses nothing across the handover from foreground to background", async () => {
+    // The command is still writing when the timeout releases it, so the log has to carry every line:
+    // 200 of them, some written before the handover, some after.
+    const result = await ext.callTool("bash", { command: "for i in $(seq 1 200); do echo line-$i; sleep 0.01; done", timeout: 1 });
+    expect(result.details.status).toBe("running");
+
+    const wait = await ext.callTool("bg_wait", { timeout: 20 });
+    const task = wait.structuredContent.tasks.find((entry: any) => entry.id === result.details.id);
+    const content = readFileSync(result.details.logPath, "utf8");
+
+    expect(content).toBe(`${Array.from({ length: 200 }, (_, index) => `line-${index + 1}`).join("\n")}\n`);
+    expect(task.status).toBe("completed");
+    expect(task.exit_code).toBe(0);
+    expect(task.lines).toBe(200);
+    expect(task.chars).toBe(content.length);
+    expect(task.bytes).toBe(Buffer.byteLength(content, "utf8"));
+  });
+
   it("rejects an unknown task id", async () => {
     await expect(ext.callTool("bg_stop", { task_id: "bg-deadbeef" })).rejects.toThrow(/Unknown task/);
   });
