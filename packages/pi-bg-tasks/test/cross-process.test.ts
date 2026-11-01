@@ -9,7 +9,7 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type LoadedExtension, loadExtension, packageDir } from "../../../test/helpers/extension.ts";
@@ -18,8 +18,26 @@ import { isAlive, waitFor } from "../../../test/helpers/wait.ts";
 const foreignRuntime = new URL("./fixtures/foreign-runtime.mjs", import.meta.url).pathname;
 const extensionEntry = join(packageDir("pi-bg-tasks"), "src", "index.ts");
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** A duration no other test in this suite uses, so a scan can single this worker out. */
+const VANISHED_MARKER = "177";
 
 let ext: LoadedExtension;
+
+/** Live processes whose whole command line is `sleep <seconds>`; a finished task has no pid to keep. */
+function pidsNamedFor(seconds: string): number[] {
+  const wanted = new RegExp(`^sleep ${seconds}$`);
+  const found: number[] = [];
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const command = readFileSync(`/proc/${entry}/cmdline`, "utf8").replace(/\0+$/, "").replaceAll("\0", " ");
+      if (wanted.test(command.trim())) found.push(Number(entry));
+    } catch {
+      // Exited between the listing and the read.
+    }
+  }
+  return found;
+}
 
 function text(result: any): string {
   return result.content.map((part: any) => part.text).join("");
@@ -50,9 +68,16 @@ function sidecarPath(id: string): string {
  * so it reaps its own children the way a real pi session does. A synchronous spawn would block the
  * loop and leave a zombie that looks like a live process to every liveness check in the test.
  */
-async function runForeignRuntime(): Promise<{ sidecarsBefore: string[]; sidecarsAfter: string[]; stderr: string }> {
+async function runForeignRuntime(spawnCommand?: string): Promise<{
+  sidecarsBefore: string[];
+  sidecarsAfter: string[];
+  spawned?: { id: string; pid: number };
+  stderr: string;
+}> {
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, [foreignRuntime, extensionEntry], {
+    const argv = [foreignRuntime, extensionEntry];
+    if (spawnCommand !== undefined) argv.push("--spawn", spawnCommand);
+    const child = spawn(process.execPath, argv, {
       env: { ...process.env, PI_CODING_AGENT_DIR: ext.agentDir },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -251,5 +276,54 @@ describe("other pi sessions sharing the agent dir", () => {
     expect(existsSync(sidecarPath(job.id))).toBe(true);
 
     await stopQuietly(job.id);
+  });
+
+  it("does not delete a sidecar it cannot parse, which is another session's record of a live command", async () => {
+    // A sidecar is rewritten in place — `open(path, "w")` truncates it, then the bytes arrive — so a
+    // runtime that lists the log dir at that moment sees a partial file. A runtime killed during the
+    // write leaves the same thing behind. The reader cannot tell whose the record was, and today it
+    // simply removes it: the live command of another session is left with no record at all, which is the
+    // F3/F9 hole (not adoptable, not protected from retention, not stoppable by the next runtime).
+    const job = await startBackground("sleep 120");
+    const contents = readFileSync(sidecarPath(job.id), "utf8");
+    writeFileSync(sidecarPath(job.id), contents.slice(0, Math.floor(contents.length / 2)));
+
+    const seen = await runForeignRuntime();
+
+    expect(seen.sidecarsBefore, `the truncated record should have been visible; stderr: ${seen.stderr}`).toContain(`${job.id}.json`);
+    expect(seen.sidecarsAfter, "a runtime that cannot parse a record must leave it where it is").toContain(`${job.id}.json`);
+    expect(existsSync(job.logPath), "and it must not take the log of a live command with it").toBe(true);
+    expect(isAlive(job.pid), "the command it stands for is still running, and still the owner's").toBe(true);
+
+    await stopQuietly(job.id);
+    await waitFor(() => !isAlive(job.pid), "the owning session to stop its own command");
+  });
+
+  it("takes over the process group a runtime that went away left behind", async () => {
+    // A runtime that disappears without a shutdown — a crash, a kill, a nested pi that exits nonzero —
+    // stops nothing and claims nothing. What it leaves is a task that finished while its process group
+    // kept running, and the record of that group is the only handle on it. This session re-reads the
+    // sidecars at its own session_start, and from then on the orphan is its responsibility: listed as
+    // the finished task it was, and stopped by its shutdown.
+    const foreign = await runForeignRuntime(`sleep ${VANISHED_MARKER} & echo started`);
+    const spawned = foreign.spawned;
+    if (!spawned) throw new Error(`the fixture did not report a task; stderr: ${foreign.stderr}`);
+    expect(foreign.sidecarsAfter, "the record outlives the runtime that wrote it").toContain(`${spawned.id}.json`);
+
+    // The other runtime is gone (its exit has been awaited, so its pid is reaped), its own leader is
+    // gone with it, and the worker it left behind is nobody's until someone takes the record over.
+    await waitFor(() => pidsNamedFor(VANISHED_MARKER).length > 0, "the worker the vanished runtime left behind");
+
+    await ext.emit({ type: "session_start", reason: "reload" });
+
+    const wait = await ext.callTool("bg_wait", { timeout: 1 });
+    const inherited = (wait.structuredContent.tasks as any[]).find((task) => task.id === spawned.id);
+    expect(inherited, "the next session adopts the record, not a running task").toBeTruthy();
+    expect(inherited.status).not.toBe("running");
+    expect(inherited.adopted).toBe(true);
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    await waitFor(() => pidsNamedFor(VANISHED_MARKER).length === 0, "this session's shutdown to stop the inherited group", 12_000);
+    expect(existsSync(sidecarPath(spawned.id)), "and the record goes with the group").toBe(false);
   });
 });

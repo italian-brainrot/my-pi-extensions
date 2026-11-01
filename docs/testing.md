@@ -130,6 +130,11 @@ per-component costs, and that context size is the largest single response rather
   pass an explicit `agentDir` (from `makeTempDir()`) to every load and reset modules before each one.
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in
   `dispose()`. Do not rely on env changes made after a load to affect module-level constants.
+- **Every load needs its `dispose()`, even after a teardown event.** A test that emits
+  `session_shutdown` in its own body and then forgets the load leaks the temp working directory the
+  harness made for it — a whole-suite run ends with directories in the temp dir, and they are only found
+  by counting them after a green run. Emitting the shutdown twice is a no-op, so an `afterEach` can
+  always emit and dispose; do not clear the variable to skip it.
 - **The tool context is not Pi's.** The harness builds a context object, so features that need a real
   session (UI dialogs, `executeTool`) are unavailable; `modelRegistry` is a stub whose `find` answers
   for any provider and id, which is enough to look a recorded model up but nothing else. If an

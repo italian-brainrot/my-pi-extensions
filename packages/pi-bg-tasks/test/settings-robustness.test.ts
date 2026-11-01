@@ -57,6 +57,29 @@ describe("settings files that are not well-formed", () => {
     expect(text(result), "and must not hide the scope that is readable").toContain(AGENT_PREFIX_LINE);
   });
 
+  it("still runs the command when the project file holds the JSON value null", async () => {
+    // `JSON.parse` answers `null` without throwing, and a scope that parses to null mentions no keys —
+    // Pi's loader treats that as an empty scope and reports the problem. `Object.hasOwn(null, key)`
+    // throws, and it throws out of the tool, so every command of the session fails with a TypeError.
+    settings(agentDir.path, JSON.stringify({ shellCommandPrefix: `echo ${AGENT_PREFIX_LINE}` }));
+    settings(join(project.path, ".pi"), "null");
+
+    const result = await ext!.callTool("bash", { command: "echo the-command" });
+
+    expect(text(result), "a null scope answers nothing for either key").toContain("the-command");
+    expect(text(result)).toContain(AGENT_PREFIX_LINE);
+  });
+
+  it("still runs the command when the agent file holds the JSON value null", async () => {
+    settings(join(project.path, ".pi"), JSON.stringify({ shellCommandPrefix: `echo ${AGENT_PREFIX_LINE}` }));
+    settings(agentDir.path, "null");
+
+    const result = await ext!.callTool("bash", { command: "echo the-command" });
+
+    expect(text(result)).toContain("the-command");
+    expect(text(result), "and the project scope still applies").toContain(AGENT_PREFIX_LINE);
+  });
+
   it("falls through a value that is neither a string nor null", async () => {
     settings(agentDir.path, JSON.stringify({ shellPath: "sh" }));
     settings(join(project.path, ".pi"), JSON.stringify({ shellPath: 42 }));

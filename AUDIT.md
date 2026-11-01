@@ -584,3 +584,228 @@ Harness notes:
   a finished task at entry has one, a running task with an immune member has two that overlap.
 - A test that asserts on files under `agentDir` needs its own `agentDir` per test in this file — the log
   dir is shared across the handover test by design and nothing else.
+
+---
+
+## Pass 3 — tester
+
+Baseline: `f0e7dd9`, 243/243 green, and a clean run leaves no `/tmp/pi-ext-*` and no strays (checked
+again: still true with this pass's files added). After the pass: **248 green, 8 red in 4 files**, all
+written by this pass; 106 in the package (98 green, 8 red). `tsc` and biome are clean, `npm run check`
+fails only on the 8. Reproduce with `npx vitest --run packages/pi-bg-tasks`.
+
+Findings, most valuable first. Each is covered by a red test that fails for exactly the stated reason.
+
+### F12 — a bare `shellPath` is looked up on the runtime's PATH, not on the PATH commands get
+
+`buildEnv` puts `<agent-dir>/bin` in front of the `PATH` handed to every command, exactly as Pi's
+`getShellEnv` does, and hands that environment to `spawn` — libuv resolves a bare program name against
+the **child's** `PATH`, which is what makes `shellPath: "bash"` work at all. The check that decided to
+support bare names scans a different `PATH`: `shellPathExists` reads `process.env.PATH`, the runtime's
+own, which never has the agent dir's `bin` in it. So a shell the user installed in pi's bin dir — the
+documented place for user executables, and the one directory every command of the session can see — is
+refused, and refused for _every_ command of the session (`Custom shell path not found: …`), while the
+child would have run it.
+
+Evidence: `shellPath: "audit-session-shell"`, the program at `<agentDir>/bin/audit-session-shell`. The
+tool answers `Custom shell path not found`; the same file, reached through the environment `buildEnv`
+builds, executes as a shell (checked directly with `spawn(name, args, { env })`).
+
+Red: `test/shell-path-lookup.test.ts`, first test.
+
+Direction: resolve the candidate against the PATH the child gets (`binDir` first, same order as
+`buildEnv`), and keep the once-per-runtime cache. Going the other way — dropping bare names and using
+Pi's `F_OK` on the literal value — is also coherent, but then the README's "looked up on `PATH`"
+sentence and the `settings-scopes` / `shell-precedence` pins that configure `sh` and `bash` by name have
+to go with it.
+
+### F13 — a settings file containing the JSON value `null` makes every command throw
+
+`JSON.parse("null")` succeeds and answers `null`, and `Object.hasOwn(settings, key)` is outside the
+`try`, so `configuredSetting` throws `TypeError: Cannot convert undefined or null to object` out of the
+`bash` tool's `execute`. One file — a project's `settings.json` written by a script with an unset
+variable, say — breaks every command in the session, with a message that points at neither file. Pi
+answers an empty scope plus a reported load error for the same content (`tryLoadFromStorage` catches the
+throw from `migrateSettings`) and carries on.
+
+Red: `test/settings-robustness.test.ts`, two tests (project scope null, agent scope null). Nothing else
+about a scalar scope misbehaves: `[]`, `"x"`, `42`, `true` all answer nothing for the key and fall
+through.
+
+Direction: a parsed scope that is not a non-null object answers nothing for every key. Two lines, and it
+keeps the "a malformed scope does not lose the scope that is readable" rule the file already pins.
+
+### F14 — the registry cap throws away the obligation the kept record exists to carry
+
+Pass 2 keeps a finished background task's sidecar while its process group lives, and adopts such a record
+in a replacement runtime, because the sidecar is the only record of the group id somebody still has to
+stop. The thing that carries that obligation is the job in the registry: `killAllJobs` filters
+`status === "running" || hasLeftoverGroup(job)`, and `bg_stop` looks the ID up in `jobs`. `enforceRegistryCap`
+then drops the oldest finished job whenever the registry passes `MAX_REGISTRY_SIZE` (200) — and a session
+passes 200 by running commands, since every command, foreground ones included, is a registry entry. The
+record stays on disk (protected from retention by the live-group rule, which is the point of it), and the
+runtime that started the task forgets it: it disappears from `bg_wait`, `bg_stop` answers
+`Unknown task: bg-…`, and a quit shutdown signals nothing. Measured with one daemonising task followed by
+201 sequential foreground `true` commands: the sidecar is there, `bg_wait` lists nothing, the worker is
+alive after the shutdown.
+
+That is the F9 hole, reopened by a cap, and the "always stop on real shutdown" sentence is what does not
+hold. It does not need anything exotic: 200 commands is an ordinary session.
+
+Red: `test/record-cap.test.ts`, two tests. They are two requirements, not one: the shutdown must leave no
+process behind, and the ID must keep working while the record stands. If the second is judged out of
+scope, say why — `bg_stop`'s error text currently offers "tasks older than the retention window are no
+longer tracked" as the explanation, and this task is not that.
+
+Direction: `enforceRegistryCap` should evict what carries nothing before it evicts what carries something
+(a finished job with `hasLeftoverGroup` is not a candidate while anything else can go). If that risks an
+unbounded registry (a session that daemonises thousands of times), say what the bound is instead of
+letting the cap quietly drop obligations.
+
+### F15 — a configured shell that exists but cannot be executed still arrives as exit 127
+
+`shellPathExists` is Pi's `access(path, F_OK)`, which a directory and a 0644 file both pass. The setting
+then reaches `spawn`, which answers EACCES; the log gets `[bg-tasks] failed to start command with
+<path>: spawn <path> EACCES` and the result is `Command exited with code 127` with
+`structuredContent.exit_code: 127` — the failure mode F11 exists to prevent, one check over. Pi has the
+same hole, and this extension's README promises otherwise: a value "is checked before anything is
+spawned … instead of running something that cannot start".
+
+Red: `test/shell-path-lookup.test.ts`, two tests (a directory, a non-executable file). They assert that
+the result does not report a command exit code and does say something about the configured shell, without
+pinning wording.
+
+Direction: "can be executed" means a regular file with `X_OK`, not `F_OK`. Keep it once per runtime, and
+keep it a result rather than a throw, for the reason already recorded under F6.
+
+### F16 — a runtime deletes a sidecar it cannot parse, including another live session's record
+
+`adoptJobs` parses a sidecar and, on failure, unlinks it and moves on — before any ownership question,
+which it cannot ask without the parse. But sidecars are rewritten in place (`openPrivate(path, "w")`
+truncates, then the bytes arrive), so a runtime that lists the log dir during another runtime's
+`writeMeta` sees a partial file and removes it; a runtime killed during a write leaves the same shape
+permanently. `writeMeta` runs at every spawn, at every release to the background, at every `markDone`
+that keeps a record, and at every adoption, and `adoptJobs` runs at the start of every nested `pi` — which
+is the situation the README's headline bug is about.
+
+What the victim loses is the record itself, and every rule that reads it: a live command's sidecar gone
+means not adoptable after a reload, not protected by the foreign/live-group/running protections, so its
+log is prunable and its process is nobody's to stop.
+
+Red: `test/cross-process.test.ts`, one test: this session's live background command, its sidecar cut to
+half its bytes (standing in for a read during the write), and the foreign runtime's `sidecarsAfter` no
+longer contains it.
+
+Direction: two independent halves. Leave an unparseable sidecar where it is — retention's age and count
+rules collect garbage without anyone destructively guessing at it. And make the write atomic (write
+`<id>.json.tmp` in the same directory, `renameSync` over the target) so no reader can see a half file in
+the first place; if a temp name is introduced, check the retention walk and the log-count rule against it,
+and decide who collects a `.tmp` left by a crash.
+
+### New pins, all green
+
+- `test/stop-under-pressure.test.ts` (2). The reach half of the F8 fix: a member a SIGTERM can never
+  deliver to, because it is `SIGSTOP`ped, is still ended by the escalation and `bg_stop` says it stopped
+  the group. And eight tasks of that shape are swept by one shutdown, which returns in ~5.1 s — the two
+  windows really do overlap; eight such groups cost the same as one (pinned under 8 s, against a
+  `teardownTimeout` of 10 s).
+- `test/inherited-record.test.ts` (2). The `backgrounded` field of a kept record, which pass 2 introduced
+  and nothing covered: a backgrounded task's record is listed by `bg_wait` after a handover as the
+  finished task it was (`completed (exit 0)`, `adopted`), never as a running one; a foreground-origin
+  record is not listed — and its group is stopped all the same.
+- `test/cross-process.test.ts` (1) and `test/fixtures/foreign-runtime.mjs` (`--spawn <command>`). The
+  cross-process half of F9, which the in-process reload tests cannot reach: a runtime that goes away
+  **without** a shutdown (the fixture exits after its task finishes, handlers never run) leaves a finished
+  task's record, and the next session adopts it, lists it as finished and adopted, stops its group at its
+  own shutdown, and drops the record with the group.
+
+### Attacked, no finding
+
+Recorded so pass 4 does not spend time here.
+
+- **`killAllJobs`'s two-window cap is unreachable, and nothing about it is wrong.** `stopJobAndWait` can
+  in principle wait 6 s for a leader and then 6 s for a group, and the shutdown cap is
+  `2 * (SIGTERM_GRACE_MS + 1000)` = 12 s, past `teardownTimeout: 10_000`. To pay the second window a
+  member has to survive the escalation's `SIGKILL` at t=5 s, and the escalation signals `-pid`, which
+  includes the leader. A stopped member does not survive it (pinned green); a `D`-state member cannot be
+  produced from an unprivileged container; a member owned by another user would need one. Measured: eight
+  immune groups, one shutdown, 5109 ms, all eight gone. So 12 s is a bound no reachable shape pays, and
+  the shape that could pay it is a shape no stop can win.
+- **A leftover group we may not signal.** `processGroupExists` answers EPERM as "exists", so
+  `hasLeftoverGroup` is true and `stopLeftoverGroup`'s first `kill(-pid, SIGTERM)` throws, which returns
+  `false` without unlinking: the record then sits under the live-group protection forever. Unreachable in
+  the sandbox, bounded by the number of groups this user may not signal, and the direction is the safe
+  one (it does not claim a stop it could not make). The same early return also skips the unlink when the
+  group vanishes between the check and the signal — one stale record until the next `session_start` or
+  retention pass. Not worth a test either way.
+- **An abort landing between the timeout timer and the `finally` is not a turn that exists.** Twelve runs
+  of `sleep N` with `timeout: 1` and the abort jittered ±1 and ±8 ms around the expiry ended in exactly
+  one of two coherent states every time: `Command aborted` and the command gone, or `timed out … moved to
+  background` and the command alive (the documented survivor of a later abort). None reported a
+  backgrounding and killed the task. The reason is ordering, not luck: once the race settles on
+  `"timeout"`, the continuation of `runWithTimeout` runs as microtasks before any later macrotask can
+  dispatch `abort`, and there is no `await` between the race and `releaseToBackground`. Left untested;
+  it is a fuzz on timing margins.
+- **The numbers a sidecar carries are trusted, and only the report is hurt.** A record hand-edited to
+  `startedAt: 9e15`, `finishedAt: 0`, `exitCode: 1e999`, `signal: "SIGMOOSE"` is adopted and reported as
+  `killed (exit Infinity)` with `-9000000000000.0s`; the group was still stopped at shutdown, and the
+  only arithmetic keyed off those fields is `wallSeconds`. A `signal` that is not a signal name is enough
+  to make the status `killed`, since `finishedStatus` only tests truthiness. A record can also point
+  `log_path` at any file this user can read and `bg_wait` will report its size and line count — a 0700
+  directory written by that same user, so not a trust boundary. If anyone wants the reporting tidy:
+  validate on adoption (finite, integral, `finishedAt >= startedAt`, `signal` in `osConstants.signals`).
+  A _truncated_ sidecar parses to nothing and is dropped — see F16 for what dropping costs.
+- **The ownership chain across more than two runtimes.** Worth knowing when reading the reload tests:
+  every in-process runtime in the suite shares `process.pid`, so `ownerPid` always reads as "ours" and
+  those tests pin handover, not foreignness. The foreignness and adoption rules that do differ are now
+  pinned across a real process boundary (the new `--spawn` fixture test). A third runtime can only see a
+  record whose recorded owner is already dead, which is the adopt case; a live owner is left alone
+  (`sidecarsAfter` keeps it, pinned).
+- **`configuredSetting` beyond `null`.** Missing, unreadable, `EISDIR`, invalid JSON, and a top-level
+  `[]`, `"x"`, `42` or `true` all answer nothing or fall through, as pinned. With `PATH` unset a bare
+  name is correctly reported as missing, because the child would not find it either.
+- **Retention against kept records, `setsid`, double stops, zombie leaders.** Unchanged from the pass-2
+  record; the mid-session pass still leaves a dead-pid sidecar alone, and the new foreground-record pin
+  confirms the id-based protection covers a record nothing lists.
+
+### For pass 4 — what to attack
+
+- **F16's atomic write**, if it is taken: `.json.tmp` names must not be read as sidecars by `adoptJobs`
+  (they do not end in `.json`) nor counted as logs, must not be `tightenPrivate`d into something's way,
+  and a crash leaves temp files that nothing currently collects.
+- **F14's bound.** If obligation-carrying jobs are no longer evictable, what happens in a session that
+  daemonises thousands of times, and does `enforceRegistryCap` then have any candidates left at all? If
+  instead the registry keeps dropping them, the shutdown and `bg_stop` have to find the obligation
+  elsewhere — which means a sidecar scan in the stop path, with the ownership rules that implies.
+- **F12's cache against `buildEnv`.** `buildEnv` builds the PATH per call from `process.env`, while the
+  shell (and its existence answer) is resolved once per runtime. A `PATH` change inside a runtime now
+  changes what a bare `shellPath` means for the child but not for the check. Also Windows: the same
+  lookup wants `where`/`PATHEXT` thinking, and the file's second describe (`X_OK`, `isFile`) is POSIX-shaped.
+- **`stopLeftoverGroup`'s early `return false` on a failed first signal** — it conflates "could not
+  signal", "group is gone" and "nothing to do". Nothing observable depends on it today.
+- Carried forward, still open and still cosmetic-or-documented: `tightenPrivate` on files another live
+  runtime owns, the recycled-`ownerPid` rule, Pi's `/bin/bash` → `bash` → `sh` fallback, retention driven
+  by completions.
+
+### Harness notes
+
+- Marker sleeps used by this pass: 163, 165 (`record-cap`), 167, 169 (`stop-under-pressure`), 171, 173
+  (`inherited-record`), 177 (`cross-process`).
+- **Do not set the loaded extension to `undefined` after an in-test `session_shutdown`.** It makes
+  `afterEach` skip `dispose()`, and the load's temporary _working_ directory is left behind: eight
+  `/tmp/pi-ext-*` directories, all from two files. Emitting the shutdown again in `afterEach` is a no-op,
+  so dispose unconditionally instead.
+- `test/fixtures/foreign-runtime.mjs --spawn <command>`: starts the command as a background task of its
+  own, waits for it with `bg_wait` so the task's own record is written the way a finished task writes it,
+  prints `spawned: {id, pid}`, and exits **without** running the shutdown handlers — a runtime going away
+  without stopping what it started.
+- The registry pressure in `record-cap.test.ts` needs **sequential foreground** fillers: they have all
+  finished before the cap is asserted, they leave no log or sidecar behind (so retention is out of the
+  picture and the only record in the log dir is the one under test), and the leftover record is the oldest
+  finished job, i.e. the first eviction candidate. 201 of them cost ~400 ms; the red version of the first
+  test runs ~13 s because it waits out the "is it gone?" check.
+- A `SIGSTOP`ped process is still scannable through `/proc/<pid>/cmdline` and is still killed by the
+  escalation. `kill -STOP $!` from inside the spawned shell races the `exec` and can stop bash instead of
+  the worker — stop the member from the test process, after finding it by its marker.
+- `settings.json` holding `null` is the only JSON value that breaks the scope walk; `[]`, `"x"`, `42` and
+  `true` are inert. If a test wants a _parse_ failure, an empty file or `{"key": ` is the way.
