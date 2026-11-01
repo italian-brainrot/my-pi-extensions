@@ -49,6 +49,11 @@ real session, not assumed.
   `finishSessionReplacement` runs `rebindSession` and `withSession`, so the model is already right when
   the handoff prompt is sent. Get the `Model` with `ctx.modelRegistry.find(provider, id)`. Guard on the
   reason: on a resume the session's own later choice must win.
+- Pi's settings are exactly two files, deep-merged project-over-agent: `<cwd>/.pi/settings.json` over
+  `<agent-dir>/settings.json`. `deepMergeObjects` takes the project value unless the key is _absent_ there,
+  so `""` and `null` override, and the loader does not validate ("a malformed value replaces instead of
+  throwing"). An extension re-implementing a host tool must read the two scopes key by key and treat
+  "unset" as "the key is missing", never as "the value is empty".
 
 ## MEMORY.md itself
 

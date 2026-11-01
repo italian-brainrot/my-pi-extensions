@@ -248,3 +248,193 @@ Harness notes for this pass:
   imported and write into _that_ load's agent dir — which the earlier test already deleted, so
   `spawnJob`'s `ensureLogDir()` recreates it. Same reason a `backdate()` in one of those tests moves a file
   in another test's directory. Fix by giving those loads `vi.resetModules()` and their own `agentDir`.
+
+---
+
+## Pass 2 — tester
+
+Baseline: `0c7e72e`, 224/224 green. After the pass: **229 green, 7 red in 4 files**, all written by this
+pass. `tsc` and biome are clean; `npm run check` fails only on the 7 red tests. Reproduce with
+`npx vitest --run packages/pi-bg-tasks`.
+
+Red: `test/stop-group-escalation.test.ts` (3), `test/reload-leftover.test.ts` (1),
+`test/settings-shell-edges.test.ts` (3). New green pins: `test/prefix-command-forms.test.ts` (5).
+
+### F8 — nothing escalates a group whose leader died: a running task's stop leaks its workers
+
+The pass-1 leftover stop is only wired into the branch for a job that is **already finished** when
+`bg_stop` looks at it, and `killAllJobs` computes `leftovers` once, before anything is killed. For a task
+that is running when it is stopped, every decision is made from the **leader's** state:
+
+- `killJob`'s grace timer is gated on `job.status === "running"`, and the status is the leader's;
+- `bg_stop`'s running branch awaits `getDone(job)` — the leader being reaped is what ends it;
+- `killAllJobs` puts the job in `running` (never in `leftovers`, which is filtered at entry), and its
+  `Promise.all` resolves on the same `getDone`;
+- `runWithTimeout`'s abort path goes straight to `finishedResult`.
+
+So: a task whose shell dies on SIGTERM while another member of its group ignores SIGTERM. The shell is
+reaped, the job goes to `killed`, every wait resolves, the escalation is skipped because the status is no
+longer `"running"` — and the worker is left running in the group the shell led, forever. `bg_stop` answers
+`Task bg-x stopped (killed).`
+
+Evidence, same command shape as pass 1's `stop-reach` pin plus a `trap - TERM` so the leader is not also
+immune (`trap '' TERM; sleep N & echo started; trap - TERM; wait` — the disposition is inherited across
+fork+exec, `trap - TERM` puts the shell back to default termination, `wait` keeps it running until
+signalled). After `kill -TERM <pgid>` from a plain shell: `kill -0 <pgid>` → ESRCH, `kill -0 -<pgid>` →
+success, the `sleep N` alive 12 s later. That is exactly the state `hasLeftoverGroup()` is built to
+recognise, and it is reached a hundred milliseconds into a stop that then refuses to act on it.
+
+Red, one per entry point: `bg_stop` on a running task; `session_shutdown reason:"quit"`; an aborted run.
+All three leave the worker alive.
+
+Direction: make the stop about the group rather than the leader, keeping the `!processAt(pid)` guard.
+
+- `killJob`'s escalation: escalate when the leader is gone but the group is not —
+  `job.status === "running" || (processGroupExists(pid) && !processAt(pid))`;
+- `bg_stop`: after the race in the running branch, if `hasLeftoverGroup(job)` then
+  `await stopLeftoverGroup(job)` and say so, as the finished branch already does;
+- `killAllJobs`: re-scan for leftovers after the running jobs' leaders have been reaped instead of
+  filtering once at entry, and give the shutdown room for the second window (the group stop can now start
+  after the leader stop);
+- `runWithTimeout`: stop the group before `finishedResult` — which also deletes a non-truncated log.
+
+Must not regress: `process-groups.test.ts` test 1, `stop-reach.test.ts` test 3 (a `setsid`-ed process:
+`hasLeftoverGroup` is false there, so it stays out of reach), and "running" must stay the leader's state —
+`sleep 1 & echo started` still finishes.
+
+### F9 — a leftover group is forgotten when the runtime that started it goes away
+
+`markDone` unlinks the sidecar as soon as a job stops. That is the only record of which group id to signal,
+so the pass-1 fix reaches a leftover group **only in the runtime that started the task**. A session
+replacement (`/reload`, `/new`, `/fork`) deliberately keeps everything running, and the runtime taking over
+discovers what to manage by reading sidecars: there is none, so the worker is nobody's. `bg_wait` lists
+nothing, `bg_stop` has no ID, and the new runtime's quit shutdown signals nothing.
+
+Reproduction: `bash { command: "sleep 153 & echo started", timeout: 5 }` → completed, worker alive;
+`session_shutdown reason:"reload"`; new runtime in the same agent dir (`vi.resetModules()` + shared
+`agentDir`) → `session_start` adopts nothing → `session_shutdown reason:"quit"` → the worker is still
+alive, in the group its dead shell led, and nothing can point at it.
+
+That contradicts two unqualified sentences: "Jobs always stop on real shutdown (`quit`), together with
+whatever they left running in their process group" (README, settings table) and the tool description's
+"A process the task left running in that group is stopped too" — neither says "…by the runtime that
+started it", and the section right above them promises that state survives a reload.
+
+Red: `test/reload-leftover.test.ts`.
+
+Direction, either of these is acceptable — say which in AUDIT.md, since the second means deleting this
+test:
+
+1. Close it: in `markDone`, keep the sidecar of a backgrounded job when `hasLeftoverGroup(job)` is true
+   (the leader is reaped by the time the exit event fires, so the check is exact), and in `adoptJobs`
+   treat a sidecar whose `pid` is dead as a finished-but-owned entry rather than unlinking it when
+   `processGroupExists(pid) && !processAt(pid)` — `killAllJobs`'s leftovers filter then covers it.
+   Ownership rules stay as they are: a sidecar owned by a live runtime is foreign and its group is not
+   ours to signal. Such an entry should not appear as "running", and a normal task whose group went empty
+   still loses its sidecar at once, so the common case creates no extra files.
+2. Scope the claim: say in the README and in `bg_stop`'s description that the group a task leaves behind
+   is stopped by the runtime that started it, and that a replacement session inherits only live leaders.
+
+### F10 — a project-scope setting that is present but empty does not override the agent scope
+
+`configuredSetting()` returns the first scope whose value is a non-empty string. Pi's merge drops a key only
+when it is `undefined`: `deepMergeObjects` iterates the project file's own keys and `continue`s just for an
+`undefined` value, so a JSON `null` or `""` that is present in the project file _is_ the merged value
+(`settings-manager.js:19-31`). Nothing normalises it on the way out — `getShellCommandPrefix()` returns
+`this.settings.shellCommandPrefix` verbatim (`:788`), and `getShellConfig()` treats a falsy `shellPath` as
+unset. So `"shellCommandPrefix": ""` or `"shellPath": null` in a project is Pi's way of switching an
+agent-level setting off, and this extension silently keeps the agent's value instead. The README's claim
+that the two keys are resolved "the way Pi merges its settings" is what does not hold.
+
+Red, both keys: project `{"shellCommandPrefix": ""}` over an agent prefix that still runs; project
+`{"shellPath": null}` over an agent `shellPath` that does not exist, where Pi's default shell would run the
+command and this reports a failed command.
+
+Direction: resolve per key as "the innermost scope that _mentions_ the key", and treat any string (including
+empty) or `null` as a value; only a missing key, or one that is not a string and not `null`, falls through.
+The existing `settings-scopes.test.ts` and `shell-settings.test.ts` pins must stay green.
+
+### F11 — a configured shell that does not exist is reported as a command that failed
+
+`getShellConfig` in Pi refuses a configured path it cannot find, by name: `Custom shell path not found:
+<path>` (`utils/shell.js`). Here `shellPath: "/definitely/not/a/shell"` reaches `spawn`, the `error` handler
+writes `[bg-tasks] failed to start command with /definitely/not/a/shell: spawn … ENOENT` into the log, and
+the result is `Command exited with code 127` with `isError` — a broken setting indistinguishable from a
+command that failed, which is the F6 mistake one setting over. Fix direction: check the resolved shell before
+spawning (once per runtime, next to `missingWorkingDirectory`) and return an error result with Pi's wording;
+do not throw, for the reason already recorded under F6.
+
+Red: `test/settings-shell-edges.test.ts`, third test.
+
+Not a finding, worth knowing: the rest of Pi's shell resolution still differs and the README says so. Pi
+falls back `/bin/bash` → `bash` on PATH → `sh`; this extension spawns literal `bash`. Pi's legacy-WSL
+`commandTransport: "stdin"` is irrelevant here because output is attached by descriptor. A user on a machine
+with no `bash` on PATH gets a failure from this extension and a working `sh` from Pi — documented, so left
+alone; if anyone wants it closed, reuse `getShellConfig` rather than re-deriving it.
+
+### Attacked, no finding
+
+Recorded so pass 3 does not spend time here.
+
+- **`stopLeftoverGroup`'s point-in-time guard is sound.** A group id `P` with nothing living at `P` can
+  only be the task's own leftovers: a _new_ group with id `P` is created by a process that is itself at pid
+  `P` (`processAt` → true → refuse), so mistaking one needs the pid to be recycled by a fresh group leader
+  **and** that leader to die leaving members, all inside the microseconds between the check and the signal —
+  a full pid wrap per stop attempt. The SIGKILL re-checks `!processAt(pid)` immediately before signalling,
+  `bg_stop` twice on the same task is idempotent, and a stopped (`SIGSTOP`) or unreadable (EPERM) member
+  keeps the group "existing" and gets SIGKILL, which is right.
+- **The zombie refusal is unreachable, and refusing is the safe direction.** This runtime reaps its own
+  children before `markDone`; an adopted leader's parent is gone, so init reaps it. A `kill(pid, 0)`-yes
+  zombie therefore never hides a leftover group.
+- **Retention.** A pass creates nothing and never `ensureLogDir`s. Foreign and this-runtime-running ids are
+  collected before anything is deleted, so a sidecar and its log are always protected (or removed) as a pair
+  — a foreign log cannot outlive its protecting sidecar by one pass. The count rule counts only files it may
+  touch, which is what makes "cap + running" exact. The "a session whose tasks never finish never prunes"
+  case is empty: a log dir only grows through completions, and every completion runs the throttle check, so
+  the only files that can pile up without one are logs of running jobs, which no pass may touch. Deleting a
+  log an earlier tool result pointed at is the documented cap, not a defect, and `bg_wait` already prints
+  `(no log: …)` for it.
+- **`tightenPrivate` on files another live runtime owns** — it only ever clears group/other bits, which is
+  the documented intent, and the alternative (a shared dir where one runtime's files stay 0664 because
+  another runtime happened not to run a pass) is worse. Left as is.
+- **Modes.** `openPrivate` passes the mode to `open` _and_ `fchmod`s, so the process umask cannot widen it and
+  a pre-existing file cannot keep a loose mode; `ensureLogDir` mkdirs 0700 and tightens an existing dir.
+  `LOG_DIR` existing as a non-directory surfaces as an fs error naming the log path, which is diagnostic.
+  A symlink planted at a log name is not reachable: the directory is 0700 and the ids are 62^8.
+- **`missingWorkingDirectory`** uses the same cwd expression as Pi (`ctx.cwd || process.cwd()`, mirroring
+  `resolveSpawnContext`), Pi's wording for the missing case, and adds the not-a-directory case Pi's
+  `fsAccess(cwd, F_OK)` lets through into a spawn `ENOTDIR`.
+- **`withCommandPrefix`** is applied in `spawnJob` only, which is the only place a command reaches a shell;
+  the raw command is what `writeMeta`, `bg_wait`'s listing and `structuredContent.tasks[].command` carry
+  (now pinned green, along with heredoc / trailing-comment / trailing-backslash / leading-paren forms
+  surviving the join).
+- **Windows**: `process.kill(-pid, 0)` is inert there, and so is the whole leftover path — `detached` is
+  false and `signalJobTree` uses `taskkill /T /F`. Consistent, and nothing claims otherwise.
+- **Not tested, too narrow to be worth it**: an abort landing in the one event-loop turn between the
+  timeout timer firing and `runWithTimeout` reaching its `finally` releases the job to the background and
+  then lets that abort kill it, while reporting it as moved to the background. `bg_wait` still shows it.
+
+### For pass 3 — what to attack
+
+- Whatever shape F8's fix takes: the shutdown path is the risky one (two grace windows, and `stop-reach`'s
+  `>= 4000` assertion already budgets for one). Do not widen that assertion to make a red test pass — check
+  which window the wait actually belongs to.
+- F9 option 1 keeps sidecars around; check it does not resurrect a finished task as adoptable-forever, and
+  that retention still collects such a record once its group is gone.
+- F10's fix walks the two scope files; the trap is that `settings.json` may be missing, unreadable or
+  invalid in either scope, and the cached-per-runtime rule ("the shell is chosen once per runtime") has to
+  stay true for both keys.
+- Still open from pass 1, cosmetic: several loads in `test/lifecycle.test.ts` reuse an earlier load's module
+  and agent dir, which is where the ~6 surviving `/tmp/pi-ext-*` directories come from. Give them
+  `vi.resetModules()` and their own `agentDir` and that note can be deleted from this file.
+
+Harness notes:
+
+- The marker sleeps used by this pass are 147, 149, 151, 153. Passes must keep them unique across files —
+  the `/proc` scans are process-global and Vitest runs test files in parallel forks.
+- `trap '' TERM; … ; trap - TERM; wait` is the shape that reaches F8; without the `trap - TERM` the leader
+  is immune too and pass 1's pin already covers it.
+- `stop-group-escalation.test.ts` emits a quit shutdown in its second test and then keeps using the same
+  runtime; that is deliberate (Pi would emit `session_start` again), and the third test does not depend on
+  adoption.
+- A full suite leaves exactly 6 `/tmp/pi-ext-*` directories; the four files this pass added leave none.
