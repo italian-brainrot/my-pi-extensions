@@ -22,8 +22,10 @@ skills/<name>/
   bounded preview and a path, so the model can `read` or `grep` the file instead.
 - Scripts are executable and shebang'd; name Node scripts `.mjs` so the extension is unambiguous.
 - `test/skills.test.ts` loads `skills/` through Pi's own skill loader (a malformed skill fails the
-  build) and checks that every script is executable, parses, prints usage with no arguments, and fails
-  loudly when its external binary is missing. Extend it when a skill gains a script.
+  build) and checks that every script is executable, parses, and prints a usage block naming itself.
+  A script that needs an external binary gets an extra check that it fails loudly when that binary is
+  missing (`web-browsing` has two). A script with logic of its own gets real tests — `loop.sh` in
+  `audit-loop` has five against a throwaway git repo. Extend the file when a skill gains a script.
 
 ## Shipping and checking it
 

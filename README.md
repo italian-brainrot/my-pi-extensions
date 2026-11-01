@@ -32,9 +32,10 @@ session reads `MEMORY.md` once, the way Pi reads `AGENTS.md`.
 `skills/` holds [Pi skills](./docs/adding-a-skill.md): instructions plus helper scripts that Pi
 advertises by name and description, then loads only when a task calls for them.
 
-| Skill                                            | What a session gets                                                                                                                                                                                                                                        |
-| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`web-browsing`](./skills/web-browsing/SKILL.md) | Live web access through the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser: search, read a rendered page as markdown, extract with CSS/JS, screenshots, and multi-step flows (login, pagination) over CDP. Needs the `obscura` binary. |
+| Skill                                            | What a session gets                                                                                                                                                                                                                                                     |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`web-browsing`](./skills/web-browsing/SKILL.md) | Live web access through the [Obscura](https://github.com/h4ckf0r0day/obscura) headless browser: search, read a rendered page as markdown, extract with CSS/JS, screenshots, and multi-step flows (login, pagination) over CDP. Needs the `obscura` binary.              |
+| [`audit-loop`](./skills/audit-loop/SKILL.md)     | The tester↔fixer audit loop: one fresh session per pass, a tester filing findings with deliberately-red tests, a fixer turning them green at the mechanism, an audit log as the only memory. The workflow layer on top of `pi-takeover`; say "audit loop" to start one. |
 
 The skills are not in the root Pi manifest: `npm run install:skills` copies them to
 `~/.agents/skills/`, where Pi discovers them for every session in every project. `npm run check` then
@@ -109,6 +110,8 @@ skills/
     SKILL.md              what the model reads, and when it reads it
     scripts/              helpers the skill tells the model to run
     references/           deeper reference, read only when pointed at
+  audit-loop/
+    ...                   the same shape: SKILL.md, scripts/loop.sh, two references
 packages/
   pi-bg-tasks/
     package.json          Pi manifest (pi.extensions), peer dependencies, npm metadata
