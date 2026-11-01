@@ -107,6 +107,9 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   // A caller-supplied agent dir outlives the load: it belongs to the test, not to this helper.
   const ownsAgentDir = options.agentDir === undefined;
   const cwd = options.cwd ? resolve(options.cwd) : mkdtempSync(join(tmpdir(), "pi-ext-cwd-"));
+  // Same for a working directory this helper made. It used to be left behind: every load created one
+  // and nothing removed it, so a test run ended with hundreds of directories in the temp dir.
+  const ownsCwd = options.cwd === undefined;
 
   const savedEnv: Record<string, string | undefined> = {};
   const envKeys = ["PI_CODING_AGENT_DIR", ...Object.keys(options.env ?? {})];
@@ -200,6 +203,7 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   } catch (error) {
     disposeState = false;
     if (ownsAgentDir) rmSync(agentDir, { recursive: true, force: true });
+    if (ownsCwd) rmSync(cwd, { recursive: true, force: true });
     throw error;
   }
 
@@ -251,6 +255,7 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
         else process.env[key] = value;
       }
       if (ownsAgentDir) rmSync(agentDir, { recursive: true, force: true });
+      if (ownsCwd) rmSync(cwd, { recursive: true, force: true });
     },
   };
 

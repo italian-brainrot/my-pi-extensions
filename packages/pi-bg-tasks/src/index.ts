@@ -15,10 +15,15 @@
  *   - Background jobs are process-scoped, not session-scoped. Their pid and log
  *     path are recorded next to the log, so a reloaded session re-adopts jobs
  *     that are still alive and bg_stop / bg_wait keep working.
- *   - Jobs are killed on real shutdown (reason "quit"). Set
- *     PI_BG_TASKS_KEEP_RUNNING=0 to also kill them on /new, /resume, /fork and
- *     /reload (the previous behaviour).
- *   - Logs live in `<agentDir>/bg-tasks` and are pruned by age and count.
+ *   - Jobs are killed on real shutdown (reason "quit"), and so is anything a finished job left
+ *     running in its own process group. Set PI_BG_TASKS_KEEP_RUNNING=0 to also kill them on /new,
+ *     /resume, /fork and /reload (the previous behaviour).
+ *   - A stop signals the job's whole process group: the shell plus everything it started, including
+ *     a worker the shell forked and left behind before it exited.
+ *   - Logs live in `<agentDir>/bg-tasks` — the directory is 0700 and every file in it 0600, because
+ *     a log is command output and a sidecar is a whole command line. They are pruned by age and by
+ *     count, both while a session runs and when one starts.
+ *   - Both shell settings the built-in tool honours apply here: `shellPath` and `shellCommandPrefix`.
  *   - Results carry `structuredContent` (as the built-in bash tool does) for programmatic callers
  *     such as codemode scripts: a finished command reports its output, a command moved to the
  *     background only its task text, and bg_wait every background task of the session.
@@ -27,8 +32,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomInt } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   existsSync,
+  fchmodSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -64,6 +71,14 @@ import { Type } from "typebox";
 const LOG_DIR = join(getAgentDir(), "bg-tasks");
 const META_SUFFIX = ".json";
 
+/**
+ * A log is command output the model was not shown in full, and a sidecar carries the whole command
+ * line, so neither is for anyone else to read or write. Pi writes the same class of data 0600 for
+ * the same reason: "Output can carry private data, so only the user may read them."
+ */
+const LOG_DIR_MODE = 0o700;
+const PRIVATE_MODE = 0o600;
+
 const DEFAULT_TIMEOUT_SEC = 60;
 /** Same upper bound the built-in bash tool uses (max setTimeout delay). */
 const MAX_TIMEOUT_SEC = Math.floor(2_147_483_647 / 1000);
@@ -77,6 +92,10 @@ const MAX_REGISTRY_SIZE = 200;
 const RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 /** Newest logs kept regardless of age (metadata sidecars go with them). */
 const MAX_RETAINED_LOGS = 100;
+/** How long a session may go without a full retention pass, however few files it starts. */
+const RETENTION_THROTTLE_MS = 60_000;
+/** How often a leftover process group is checked for having gone away. */
+const GROUP_POLL_MS = 150;
 
 /** Model-facing limits come from pi's own truncation helpers. */
 const PARTIAL_PREVIEW_BYTES = 4096;
@@ -183,8 +202,57 @@ function newId(): string {
   return id;
 }
 
+/**
+ * The log dir, private to whoever owns the agent dir.
+ *
+ * The mode given to `mkdirSync` is ignored for a directory that already exists, so an install that
+ * created this one before the mode existed has to be tightened: the directory is what gates
+ * everything inside it.
+ */
 function ensureLogDir(): void {
-  mkdirSync(LOG_DIR, { recursive: true });
+  try {
+    mkdirSync(LOG_DIR, { recursive: true, mode: LOG_DIR_MODE });
+  } catch {
+    // A directory that cannot be created is reported by whatever writes into it next.
+  }
+  tightenPrivate(LOG_DIR);
+}
+
+/**
+ * Clear the group and other permission bits of an existing file or directory. Only ever takes
+ * permissions away, so a mode the user set deliberately narrow stays narrow.
+ */
+function tightenPrivate(path: string): void {
+  let current: number;
+  try {
+    current = statSync(path).mode & 0o7777;
+  } catch {
+    return;
+  }
+  const wanted = current & ~0o077;
+  if (wanted === current) return;
+  try {
+    chmodSync(path, wanted);
+  } catch {
+    // Not ours to tighten, or it went away between the stat and the chmod.
+  }
+}
+
+/**
+ * Open a file that only this user can read or write.
+ *
+ * The mode is both passed to `open` and set with `fchmod`: the mode argument is masked by the process
+ * umask and ignored when the file already exists, and a leftover from an install that predates these
+ * modes must not stay group-writable just because a command reused its name.
+ */
+function openPrivate(path: string, flags: "w" | "a"): number {
+  const fd = openSync(path, flags, PRIVATE_MODE);
+  try {
+    fchmodSync(fd, PRIVATE_MODE);
+  } catch {
+    // The file went away or refuses to be chmod'd; the mode argument covered the normal case.
+  }
+  return fd;
 }
 
 function unlinkQuietly(path: string): void {
@@ -228,6 +296,10 @@ function markDone(job: BgJob, exitCode: number | null, signal: NodeJS.Signals | 
   unlinkQuietly(job.metaPath);
   job.resolveDone?.();
   enforceRegistryCap();
+  // Retention runs when a command ends, not only when a session starts: the log dir only grows when
+  // a command finishes, and a session that runs for days never reloads. This is also the moment when
+  // the command's own log is no longer protected as running, so the count cap can be met exactly.
+  enforceRetention();
 }
 
 function enforceRegistryCap(): void {
@@ -259,26 +331,53 @@ function logSize(path: string): number {
 
 // ── Environment and shell resolution ─────────────────────────────────────────
 
-let cachedShell: string | undefined;
+let cachedShellSettings: ShellSettings | undefined;
 
-function readConfiguredShell(): string | undefined {
+/** What the built-in tool takes from settings, resolved once per runtime. */
+interface ShellSettings {
+  shell: string;
+  /** Pi's `shellCommandPrefix`, empty when unset. */
+  commandPrefix: string;
+}
+
+/** One settings key, project scope of the pi process cwd first, the way pi merges its scopes. */
+function configuredSetting(key: string): string | undefined {
   for (const file of [join(process.cwd(), CONFIG_DIR_NAME, "settings.json"), join(getAgentDir(), "settings.json")]) {
     try {
-      const settings = JSON.parse(readFileSync(file, "utf8")) as { shellPath?: unknown };
-      const configured = typeof settings.shellPath === "string" ? settings.shellPath.trim() : "";
-      if (configured) {
-        return configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured;
-      }
+      const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+      const value = settings[key];
+      if (typeof value === "string" && value.trim().length > 0) return value;
     } catch {
-      // Missing or unreadable settings are fine; fall through to the default.
+      // Missing or unreadable settings are fine; the other file may answer.
     }
   }
   return undefined;
 }
 
+function shellSettings(): ShellSettings {
+  cachedShellSettings ??= { shell: configuredShell(), commandPrefix: configuredSetting("shellCommandPrefix") ?? "" };
+  return cachedShellSettings;
+}
+
+/** `shellPath` with a leading `~` expanded, the way pi normalizes it; `bash` when unset. */
+function configuredShell(): string {
+  const configured = (configuredSetting("shellPath") ?? "").trim();
+  if (!configured) return "bash";
+  return configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured;
+}
+
 function resolveShell(): string {
-  cachedShell ??= readConfiguredShell() ?? "bash";
-  return cachedShell;
+  return shellSettings().shell;
+}
+
+/**
+ * The command line handed to the shell, with `shellCommandPrefix` in front of it exactly as the
+ * built-in tool does. Without it a command that relies on aliases, shell functions or an environment
+ * the prefix sets up works with Pi's own tool and fails with this one.
+ */
+function withCommandPrefix(command: string): string {
+  const { commandPrefix } = shellSettings();
+  return commandPrefix ? `${commandPrefix}\n${command}` : command;
 }
 
 /**
@@ -315,22 +414,27 @@ function buildEnv(ctx: ExtensionToolContext | undefined): NodeJS.ProcessEnv {
 
 function writeMeta(job: BgJob): void {
   try {
-    writeFileSync(
-      job.metaPath,
-      JSON.stringify({
-        id: job.id,
-        pid: job.pid,
-        cwd: job.cwd,
-        command: job.command,
-        logPath: job.logPath,
-        startedAt: job.startedAt,
-        // Who wrote this. The agent dir is shared by every pi process, and a job belongs to the
-        // session that started it: see isOwnedByAnotherSession().
-        ownerPid: process.pid,
-        backgrounded: job.backgrounded,
-      }),
-      "utf8",
-    );
+    const fd = openPrivate(job.metaPath, "w");
+    try {
+      writeFileSync(
+        fd,
+        JSON.stringify({
+          id: job.id,
+          pid: job.pid,
+          cwd: job.cwd,
+          command: job.command,
+          logPath: job.logPath,
+          startedAt: job.startedAt,
+          // Who wrote this. The agent dir is shared by every pi process, and a job belongs to the
+          // session that started it: see isOwnedByAnotherSession().
+          ownerPid: process.pid,
+          backgrounded: job.backgrounded,
+        }),
+        "utf8",
+      );
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     // Metadata is only needed to re-adopt after a reload; losing it is not fatal.
   }
@@ -368,12 +472,17 @@ function readMeta(metaPath: string): JobMeta | undefined {
  * session was still waiting on.
  *
  * `ownerPid` names the owning runtime and is rewritten whenever a runtime adopts a job, so
- * ownership survives a reload and stays correct after a takeover. Two cases have no usable marker:
- * a pid recycled by an unrelated live process, and a sidecar written before `ownerPid` existed.
- * Both are answered from the process table — a command whose parent process is still alive belongs
- * to that runtime, one reparented to init lost its owner, and one whose parent is this process is
- * ours to pick up after a reload. Where the process table cannot be read, an unmarked job is left
- * alone rather than guessed at.
+ * ownership survives a reload and stays correct after a takeover. A marked sidecar is answered from
+ * that field alone: if the pid has since been given to an unrelated process, the marker stays right
+ * for the wrong process and the sidecar is foreign for good — never adopted, never pruned. That is
+ * the cheap direction to fall in (a stale marker costs a couple of files, a wrong answer would stop
+ * a command another session is waiting on), and reaching it means the pid counter wrapped past every
+ * live pid while the sidecar sat there.
+ *
+ * A sidecar written before `ownerPid` existed carries no marker, and there the process table answers
+ * the question: a command whose parent process is still alive belongs to that runtime, one reparented
+ * to init lost its owner, and one whose parent is this process is ours to pick up after a reload.
+ * Where the process table cannot be read, an unmarked job is left alone rather than guessed at.
  */
 function isOwnedByAnotherSession(meta: JobMeta | undefined): boolean {
   const ownerPid = typeof meta?.ownerPid === "number" ? meta.ownerPid : undefined;
@@ -405,6 +514,10 @@ const backgroundListeners = new Set<(job: BgJob) => void>();
  * spawned as a background task. A foreground job stays ref'd: that is what keeps the event loop
  * alive while the command is being awaited. It is unref'd when the command is moved to the
  * background.
+ *
+ * What reaches the shell is `shellCommandPrefix` plus the command, as in the built-in tool, and the log
+ * is created private in a private directory: a log is whatever the command printed, and a sidecar is
+ * its whole command line.
  */
 function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | undefined, backgrounded: boolean): BgJob {
   ensureLogDir();
@@ -412,10 +525,10 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
   const logPath = logPathFor(id);
   const metaPath = metaPathFor(id);
 
-  const fd = openSync(logPath, "w");
+  const fd = openPrivate(logPath, "w");
   let proc: ChildProcess;
   try {
-    proc = spawn(resolveShell(), ["-c", command], {
+    proc = spawn(resolveShell(), ["-c", withCommandPrefix(command)], {
       cwd,
       detached: process.platform !== "win32",
       stdio: ["ignore", fd, fd],
@@ -484,7 +597,7 @@ function announceBackground(job: BgJob): void {
 
 function appendToLog(path: string, text: string): void {
   try {
-    const fd = openSync(path, "a");
+    const fd = openPrivate(path, "a");
     try {
       writeFileSync(fd, text, "utf8");
     } finally {
@@ -500,33 +613,108 @@ function killJob(job: BgJob): void {
   job.killRequested = true;
   if (pid <= 0) return;
 
-  const signal = (sig: NodeJS.Signals): void => {
-    if (process.platform === "win32") {
-      try {
-        spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-      } catch {
-        // Ignore a missing taskkill.
-      }
-      return;
-    }
-    // The child is a process group leader, so signal the whole tree first.
-    for (const target of [-pid, pid]) {
-      try {
-        process.kill(target, sig);
-        return;
-      } catch {
-        // Group may be gone while the leader lives on, or vice versa.
-      }
-    }
-  };
-
-  signal("SIGTERM");
+  signalJobTree(pid, "SIGTERM");
 
   // Unref'd on purpose: whoever asked for this kill awaits it with a timer of their own that holds
   // the event loop, so the escalation must not be the last thing keeping the process alive.
   setTimeout(() => {
-    if (job.status === "running") signal("SIGKILL");
+    if (job.status === "running") signalJobTree(pid, "SIGKILL");
   }, SIGTERM_GRACE_MS).unref?.();
+}
+
+/** Signal a running job's whole process group, falling back to its leader. */
+function signalJobTree(pid: number, sig: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    try {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {
+      // Ignore a missing taskkill.
+    }
+    return;
+  }
+  // The child is a process group leader, so signal the whole tree first.
+  for (const target of [-pid, pid]) {
+    try {
+      process.kill(target, sig);
+      return;
+    } catch {
+      // Group may be gone while the leader lives on, or vice versa.
+    }
+  }
+}
+
+/**
+ * Stop what a finished task left running in its own process group.
+ *
+ * A spawned shell leads a process group, so everything it starts — including a worker it forks and
+ * leaves behind (`npm run dev &`, a forking dev server, `foo &`) — stays in that group after the
+ * shell exits and the task is reported as completed. Nothing else holds a handle on those processes:
+ * the only way to reach them is the group id, which is the shell's pid, and a task that "finished"
+ * is otherwise free to outlive the stop request, the session and the runtime.
+ *
+ * A finished pid can be given to an unrelated process, and `kill(-pid)` would then hit whatever group
+ * that process leads, so the group is only signalled while nothing is living at the pid at all. If
+ * the task's shell were alive the task would not be finished; with nothing at the pid, that id either
+ * still belongs to the task's own leftovers or is free, and signalling a free id is a no-op.
+ */
+async function stopLeftoverGroup(job: BgJob): Promise<boolean> {
+  const { pid } = job;
+  if (!hasLeftoverGroup(job)) return false;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    return false;
+  }
+
+  const deadline = Date.now() + SIGTERM_GRACE_MS;
+  while (processGroupExists(pid) && Date.now() < deadline) await unrefDelay(GROUP_POLL_MS);
+  if (processGroupExists(pid) && !processAt(pid)) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // The group went away between the check and the signal.
+    }
+  }
+  return true;
+}
+
+/** Whether a finished job left processes behind in the group its shell led. */
+function hasLeftoverGroup(job: BgJob): boolean {
+  return job.status !== "running" && job.pid > 0 && !processAt(job.pid) && processGroupExists(job.pid);
+}
+
+/**
+ * Whether some process is living at `pid`, an unreaped zombie included. Different from `isAlive()`,
+ * which asks whether a *command* is still running.
+ */
+function processAt(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: a process we may not signal, but a process. Anything else cannot be answered, and an
+    // unanswered question here is answered as "free", which is the direction that stops us signalling.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Whether a process group with id `pid` exists and may be signalled. */
+function processGroupExists(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** A timer that never holds the event loop: stopping must not be why a process stays alive. */
+function unrefDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.();
+  });
 }
 
 // ── Re-adopting jobs after reload or session replacement ─────────────────────
@@ -563,21 +751,51 @@ function isZombie(pid: number): boolean {
 }
 
 function isAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+  return processAt(pid) && !isZombie(pid);
+}
+
+/** When the last full retention pass ran; 0 until one has. */
+let lastPruneAt = 0;
+
+/**
+ * Retention while a session runs.
+ *
+ * A session that runs for days without reloading never reaches `adoptJobs()`, so retention that only
+ * ran there would never run at all, and every truncated command leaves a full log behind. The cheap
+ * part runs whenever a command ends — one directory listing; a full pass runs when that listing is
+ * already at the retained-count cap, or when the session has gone a while without one. The dir only
+ * grows when a command finishes, so that is the only moment a pass has anything to do.
+ *
+ * This is the same pass `adoptJobs()` runs, with the same protections: a job this runtime tracks as
+ * running is never swept, and neither is anything another live runtime owns. Without them a
+ * long-running task would lose its files to a later command, exactly as it would have at reload.
+ */
+function enforceRetention(): void {
+  const since = Date.now() - lastPruneAt;
+  if (lastPruneAt !== 0 && since < RETENTION_THROTTLE_MS) {
+    let names: string[];
+    try {
+      names = readdirSync(LOG_DIR);
+    } catch {
+      return;
+    }
+    let logs = 0;
+    for (const name of names) {
+      if (name.startsWith("bg-") && name.endsWith(".log")) logs++;
+    }
+    if (logs < MAX_RETAINED_LOGS) return;
   }
-  return !isZombie(pid);
+  pruneRetention();
 }
 
 function pruneRetention(): void {
-  ensureLogDir();
+  lastPruneAt = Date.now();
   let names: string[];
   try {
     names = readdirSync(LOG_DIR);
   } catch {
+    // No log dir, nothing to prune. Creating it here would put a directory back after whoever removed
+    // it: a job that ends during teardown runs a pass, and the agent dir it writes into is gone.
     return;
   }
 
@@ -596,9 +814,9 @@ function pruneRetention(): void {
 
   for (const name of names) {
     const path = join(LOG_DIR, name);
-    let mtimeMs: number;
+    let stat: Stats;
     try {
-      mtimeMs = statSync(path).mtimeMs;
+      stat = statSync(path);
     } catch {
       continue;
     }
@@ -606,16 +824,21 @@ function pruneRetention(): void {
     const id = name.endsWith(".log") ? name.slice(0, -4) : name.endsWith(META_SUFFIX) ? name.slice(0, -META_SUFFIX.length) : undefined;
     if (!id?.startsWith("bg-")) continue;
 
+    // Files written before logs and sidecars were private are tightened here, so an install that
+    // predates the modes stops leaking as soon as anything runs a command. Tightening is not
+    // reaching into anyone's data: it only ever takes permissions away.
+    tightenPrivate(path);
+
     // Never touch files that belong to a job this runtime is still tracking, or to one another
     // session is still running.
     const tracked = jobs.get(id);
     if (tracked?.status === "running" || foreignIds.has(id)) continue;
 
-    if (now - mtimeMs > RETENTION_MS) {
+    if (now - stat.mtimeMs > RETENTION_MS) {
       unlinkQuietly(path);
       continue;
     }
-    if (name.endsWith(".log")) logs.push({ name, id, mtimeMs });
+    if (name.endsWith(".log")) logs.push({ name, id, mtimeMs: stat.mtimeMs });
   }
 
   for (const entry of logs.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(MAX_RETAINED_LOGS)) {
@@ -648,8 +871,18 @@ function startAdoptedPoller(): void {
   adoptedTimer.unref?.();
 }
 
+/**
+ * Take over the jobs left behind by a previous runtime, then prune.
+ *
+ * The order is the point. At session_start this runtime's registry is still empty, so a prune that
+ * ran first would see a long-quiet command's files as belonging to nothing and sweep its sidecar;
+ * adoption then finds nothing to adopt, and the command this session has just become responsible for
+ * is invisible to bg_wait, unstoppable by bg_stop, still writing to a log that is gone, and not
+ * signalled at shutdown. Adopting first registers the job as running and rewrites its sidecar, which
+ * is exactly what the prune's own protections cover.
+ */
 function adoptJobs(): void {
-  pruneRetention();
+  ensureLogDir();
 
   let names: string[];
   try {
@@ -707,6 +940,8 @@ function adoptJobs(): void {
 
   enforceRegistryCap();
   if ([...jobs.values()].some((job) => job.adopted && job.status === "running")) startAdoptedPoller();
+
+  pruneRetention();
 }
 
 // ── Reading output ───────────────────────────────────────────────────────────
@@ -1273,6 +1508,21 @@ const BASH_PROMPT_GUIDELINES = [
   "You can inspect PI_* environment variables for current model and session details.",
 ];
 
+/**
+ * What is wrong with the working directory, if anything. Pi checks this before spawning for the same
+ * reason: a missing directory makes `spawn` fail with ENOENT, and the model reads that as the shell
+ * being missing. Working directories do get deleted — by the command before this one.
+ */
+function missingWorkingDirectory(cwd: string): string | undefined {
+  let isDirectory: boolean;
+  try {
+    isDirectory = statSync(cwd).isDirectory();
+  } catch {
+    return `Working directory does not exist: ${cwd}\nCannot execute bash commands.`;
+  }
+  return isDirectory ? undefined : `Working directory is not a directory: ${cwd}\nCannot execute bash commands.`;
+}
+
 function registerBashOverride(pi: ExtensionAPI): void {
   const original = createBashToolDefinition(process.cwd());
 
@@ -1300,6 +1550,15 @@ function registerBashOverride(pi: ExtensionAPI): void {
           isError: true,
         };
       }
+
+      // Pi's own tool checks the working directory before it spawns, and says so. Spawning into a
+      // directory that is gone fails with ENOENT, which reads as "the shell failed to start", and the
+      // model goes looking for a missing bash instead of a deleted directory.
+      const missing = missingWorkingDirectory(cwd);
+      if (missing) {
+        return { content: [{ type: "text", text: missing }], details: {}, isError: true };
+      }
+
       if (resolvedTimeout === 0) return spawnBackground(command, cwd, ctx);
       return runWithTimeout(command, cwd, resolvedTimeout, signal, onUpdate, ctx);
     };
@@ -1347,6 +1606,10 @@ function registerBgStop(pi: ExtensionAPI): void {
       }
 
       if (job.status !== "running") {
+        // The task is finished, but a shell that forked a worker and exited leaves that worker in the
+        // task's own process group, and stopping what the task started is what was asked for.
+        const stoppedGroup = await stopLeftoverGroup(job);
+
         // A finished command's log is deleted unless its output was truncated, so only
         // point at the file when it is still there.
         const logExists = existsSync(job.logPath);
@@ -1356,6 +1619,7 @@ function registerBgStop(pi: ExtensionAPI): void {
               type: "text",
               text:
                 `Task ${job.id} is already ${describeJob(job, false)}.${reason ? ` Stop reason: ${reason}` : ""}` +
+                (stoppedGroup ? `\nProcesses it left in its process group (pgid ${job.pid}) were stopped too.` : "") +
                 (logExists ? `\nLog: ${job.logPath}` : ""),
             },
           ],
@@ -1517,13 +1781,21 @@ function withBlockingLock<T>(run: () => Promise<T>): Promise<T> {
 // ── Session lifecycle ────────────────────────────────────────────────────────
 
 async function killAllJobs(): Promise<void> {
-  const running = [...jobs.values()].filter((job) => job.status === "running");
-  if (running.length === 0) return;
+  const all = [...jobs.values()];
+  const running = all.filter((job) => job.status === "running");
+  // A task that finished while leaving processes in its own process group is not running, but this
+  // runtime started those processes, and no other session is going to stop them.
+  const leftovers = all.filter(hasLeftoverGroup);
+  if (running.length === 0 && leftovers.length === 0) return;
+
   for (const job of running) killJob(job);
 
   const grace = sleep(SIGTERM_GRACE_MS + 1000);
   try {
-    await Promise.race([Promise.all(running.map((job) => getDone(job))), grace.promise]);
+    await Promise.race([
+      Promise.all([...running.map((job) => getDone(job)), ...leftovers.map((job) => stopLeftoverGroup(job))]),
+      grace.promise,
+    ]);
   } finally {
     grace.cancel();
   }

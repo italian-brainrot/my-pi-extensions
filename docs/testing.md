@@ -125,7 +125,7 @@ per-component costs, and that context size is the largest single response rather
   (job registries, log directories, `PI_SUBAGENT_MAX_DEPTH`) needs `vi.resetModules()` before a
   second `loadExtension()` in the same file, otherwise the second load reuses the first load's
   module state and environment. The confusing symptom is paths: a directory the extension derived
-  from `getAgentDir()` at import time belongs to the *earlier* load, so files land somewhere the
+  from `getAgentDir()` at import time belongs to the _earlier_ load, so files land somewhere the
   test is not looking and every assertion on them is ENOENT. When a test asserts on such a path,
   pass an explicit `agentDir` (from `makeTempDir()`) to every load and reset modules before each one.
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in

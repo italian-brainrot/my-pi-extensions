@@ -45,7 +45,7 @@ full output) with mode 0600 and says why in `utils/output-files.js`: "Output can
 only the user may read them."
 
 What is in there: the whole command line in the sidecar (`curl -H 'Authorization: Bearer …'` lands
-verbatim), and command output in the log. Group-*writable* is worse than readable — another user on the
+verbatim), and command output in the log. Group-_writable_ is worse than readable — another user on the
 machine can append text to a running task's log, which this session then reports to the model as its own
 command output.
 
@@ -77,7 +77,7 @@ running, never touch another live runtime's files (`test/cross-process.test.ts` 
 ### F4 — a task that daemonises is never stopped by anything
 
 Commands are spawned `detached`, so the shell leads a process group and `bg_stop` signals `-pid` — which
-does reach every process of a *running* task (pinned green in `test/process-groups.test.ts`). But a task
+does reach every process of a _running_ task (pinned green in `test/process-groups.test.ts`). But a task
 that forks a worker and lets its wrapper shell exit (`npm run dev &`, `foo &`, a forking dev server)
 "completes" immediately while the worker keeps running **in that same group**. From then on nothing
 signals the group: `bg_stop` answers "already completed", and `session_shutdown reason:"quit"` only
@@ -89,7 +89,7 @@ Red: `test/process-groups.test.ts` — after `bg_stop`, and separately after a q
 started by the task may survive. (Third test in that file is the already-green pin for the running-task
 case; keep it green.)
 
-Direction: extend the *stop* path only. Signal `-pid` even when the leader has exited (ESRCH means the
+Direction: extend the _stop_ path only. Signal `-pid` even when the leader has exited (ESRCH means the
 group is gone, so it is cheap and safe). Do **not** redefine "running" as "the group still has members" —
 that would make `sleep 1 & echo started` never finish and would break `bg_wait` and the foreground
 results.
@@ -150,3 +150,101 @@ Harness traps hit during this pass, so the fixer does not write them again:
   finish and read the log through `bg_wait`'s `tasks[].log_path`.
 - `finishedResult` details carry no `pid`, so a test cannot recover a finished task's process group from
   the result — find the process by its command line instead (see `test/process-groups.test.ts`).
+
+---
+
+## Pass 1 — fixer
+
+All 11 red tests green; F1–F6 fixed in `packages/pi-bg-tasks/src/index.ts`, F7 comment-only. `npm run check`
+passes end to end (deps, manifest, skills, tsc, biome, **224 tests**). No test written by the tester was
+changed; three files with 7 tests were added to pin decisions the red tests did not cover.
+
+- **F1** — `readConfiguredShell()` became `configuredSetting(key)` over the same two files, resolved **per
+  key**, so a project setting one of `shellPath` / `shellCommandPrefix` still gets the other from the agent
+  scope (Pi deep-merges scopes key by key: `settings-manager.js` `deepMergeSettings(global, project)`).
+  `withCommandPrefix()` is applied inside `spawnJob` — the only place a command is handed to a shell — so the
+  foreground and `timeout: 0` paths both get it, while sidecars, listings and `$` lines keep the raw command.
+  Cached once per runtime beside the shell, so "the shell is chosen once per runtime" now covers the prefix.
+- **F2** — `ensureLogDir()` mkdirs `0700` and then clears group/other bits on the directory that already
+  exists (`mkdir`'s mode is ignored for an existing one); `openPrivate()` opens logs, sidecars and appended
+  notes with mode `0600` _and_ `fchmod`s them (a mode argument is umask-masked, and ignored for a file that
+  already exists); `pruneRetention()` `tightenPrivate`s every file it walks, so files an older install left
+  behind are fixed without deleting them.
+- **F3** — `adoptJobs()` reads the dir, adopts, claims (rewrites the sidecar) and registers the job as
+  running, and only then calls `pruneRetention()`.
+- **F5** — new `enforceRetention()`, called from `markDone`: one directory listing decides, a full pass runs
+  when the last one is older than `RETENTION_THROTTLE_MS` (60s) or the dir already holds `MAX_RETAINED_LOGS`
+  logs. It is the _same_ `pruneRetention()` with the _same_ protections as F3, not a second implementation.
+  Completion is the right trigger: the dir only grows when a command ends, and that is also the moment the
+  job's own log stops being protected as running, so the cap reaches exactly 100 rather than 100 + running.
+- **F4** — `killJob`'s inline signal helper became `signalJobTree()`. New `hasLeftoverGroup()` /
+  `stopLeftoverGroup()` signal `-pid` for a job whose leader has exited — SIGTERM, poll `kill(-pid, 0)` for
+  `SIGTERM_GRACE_MS`, then SIGKILL — awaited from `bg_stop` on a finished job and from `killAllJobs()`. The
+  reuse guard is `!processAt(pid)`: the group is only signalled while nothing at all lives at that pid,
+  because a finished pid is reusable and whatever took it would be leading the group being signalled. With
+  the pid free, the id either still belongs to the task's own leftovers or is free, and signalling a free id
+  is ESRCH. "Running" is untouched, so `sleep 1 & echo started` still finishes.
+- **F6** — `missingWorkingDirectory(cwd)` runs in the bash `execute` before spawning, with Pi's wording. It
+  returns an error result rather than throwing, so it arrives as the tool's answer (Pi's throw is caught by
+  its own caller; a harness calling `execute` would see a rejection).
+- **F7** — comment only, as allowed. A marked sidecar whose owner pid has been recycled stays foreign for
+  good: never adopted, never pruned.
+
+New pins, all green: `test/retention-in-session.test.ts` (a mid-session pass leaves a running task's log and
+sidecar, and the dir holds at most cap + running; a pass tightens `0664` files and ages stale ones out),
+`test/settings-scopes.test.ts` (per-key scope merge in both directions), `test/stop-reach.test.ts` (a
+SIGTERM-ignoring leftover is escalated to SIGKILL by `bg_stop` and by a quit shutdown, which waits for it; a
+`setsid`-ed process is out of reach, pinned as the boundary rather than as a bug).
+
+Also fixed in passing: `isAlive()` now shares `processAt()` instead of duplicating the EPERM branch;
+`loadExtension()` now removes the working-directory temp dir it created (it never removed any, so a full
+test run left ~90 directories in `/tmp`); biome wanted `_emphasis_` over `*emphasis*` in `docs/testing.md`
+and `AUDIT.md`, which had `npm run check` failing before this pass touched anything.
+
+### For pass 2 — what to attack
+
+In rough order of how much I distrust it:
+
+1. `stopLeftoverGroup`'s guard is a point-in-time `kill(pid, 0)`. Sound against a pid that is _already_
+   reused, but there is a window between the check and the signal. It also refuses when an unreaped zombie
+   sits at that pid, so a leftover group behind an adopted job whose leader is a zombie is never stopped.
+   `kill(-pid, 0)` (group existence) is Linux/macOS thinking: on Windows the leftover path is inert.
+2. A task that daemonises and then outlives a reload is untrackable: the sidecar records the wrapper shell's
+   pid, which is gone, so `adoptJobs()` drops it as dead and the worker becomes nobody's. F4 reaches only
+   leftovers whose job is still in this runtime's registry. The registry cap (`MAX_REGISTRY_SIZE`) evicts
+   finished jobs the same way.
+3. Retention is driven by completions, so a session whose tasks never finish never prunes. Defend or replace
+   that: the cap is only enforceable over finished jobs' logs, and the README now states it that way.
+4. `tightenPrivate()` changes the mode of files this process did not create, including a live other-runtime's.
+   Same user, only ever narrowing — argue about whether that is a right.
+5. Retention mid-session can delete a truncated foreground log an earlier tool result pointed at, once it
+   falls outside the newest 100. `details.logPath` and the "Full output:" note then name a missing file.
+6. Pre-existing divergence, deliberately left alone and a fair finding: shell _resolution_ is not Pi's. Pi's
+   `getShellConfig` throws `Custom shell path not found: …` for a configured path that does not exist, falls
+   back `/bin/bash` → bash on PATH → `sh`, and uses `commandTransport: "stdin"` for the legacy WSL bash path.
+   This extension spawns the configured path or literal `bash` and reports `failed to start command with
+   bash: spawn bash ENOENT`.
+7. The F7 limitation, if someone wants it fixed rather than described: telling a recycled `ownerPid` from the
+   real owner means the pid's start time (`/proc/<pid>/stat` field 22 after the last `)`, plus `btime` from
+   `/proc/stat`) against the sidecar's `startedAt`. CLOCK_MONOTONIC excludes suspend, so on a laptop that
+   estimate is off by however long the machine slept — a heuristic that misfires exactly where pids are most
+   likely to have been recycled.
+
+Harness notes for this pass:
+
+- A mid-session full pass needs a _trigger_: put `MAX_RETAINED_LOGS` `bg-*.log` names in the dir, or wait out
+  60s. mtimes written in a loop can land in the same timestamp, so backdate the filler files if a test
+  asserts which names survive the count sweep.
+- `trap '' TERM; sleep N & echo started` gives a worker that ignores SIGTERM (the disposition is inherited by
+  the forked child) — the only way to reach the escalation branch for a finished task. It makes `bg_stop`
+  take about 5s, so give a `waitFor` past it.
+- The marker-sleep trick from `test/process-groups.test.ts` (find the process by its `/proc` cmdline) is what
+  makes leftover-group assertions possible; a finished job's result carries neither pid nor group id.
+- `pruneRetention()` deliberately does **not** call `ensureLogDir()`: a job that ends during teardown runs
+  a retention pass, and creating the log dir there puts back a directory the test just deleted.
+- A full suite still leaves ~6 `/tmp/pi-ext-*` directories. They are not from this pass: several loads in
+  `test/lifecycle.test.ts` (the ones for live jobs, quit shutdown, `KEEP_RUNNING=0`, and the tracked-log
+  pin) neither reset modules nor pass an `agentDir`, so they reuse the module instance an earlier test
+  imported and write into _that_ load's agent dir — which the earlier test already deleted, so
+  `spawnJob`'s `ensureLogDir()` recreates it. Same reason a `backdate()` in one of those tests moves a file
+  in another test's directory. Fix by giving those loads `vi.resetModules()` and their own `agentDir`.

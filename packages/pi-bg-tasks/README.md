@@ -9,7 +9,7 @@ instead of failing them**, plus two tools for working with those background jobs
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bash` (replaces the built-in one) | Runs a command. Adds `timeout` (seconds, default 60) and `blocking`. When the timeout expires the command keeps running in the background and the tool returns its task ID and log path. `timeout: 0` starts it in the background immediately. |
 | `bg_wait`                          | Wait for **any** running background task to finish (like `wait -n`), then list every background task of the session with its status, run time, output size, exit code, and log path. Default timeout 3600s.                                    |
-| `bg_stop`                          | Stop a background task by ID: SIGTERM, then SIGKILL after a 5s grace period.                                                                                                                                                                   |
+| `bg_stop`                          | Stop a background task by ID: SIGTERM to its whole process group, then SIGKILL after a 5s grace period. A process the task left running in that group is stopped too.                                                                          |
 
 ```text
 > build the project                       bash { command: "npm run build", timeout: 5 }
@@ -118,7 +118,13 @@ concurrent `bash` call goes unnoticed.
 - Read the log file with the `Read` tool; it is a plain file that keeps growing while the job runs.
 - `bg_wait` returns as soon as one job finishes, and lists every task either way — including when it
   times out or the wait itself is aborted.
-- `bg_stop` on an already-finished job reports its final status rather than pretending to stop it.
+- `bg_stop` on an already-finished job reports its final status rather than pretending to stop it, and
+  stops anything that job left running in its process group.
+- **What a stop reaches is the task's process group**: the shell plus every process it started. A
+  command that forks a worker and lets the shell exit (`npm run dev &`, `foo &`, a forking dev server)
+  finishes immediately, and the worker is still in the task's group — `bg_stop` and a real shutdown
+  reach it there. A process that deliberately starts its own session (`setsid`, `systemd-run`) leaves
+  the group and is not stopped.
 - A task that was deliberately backgrounded is not killed when the run is aborted later. Aborting a
   run stops the command that call was waiting on, and nothing else.
 
@@ -128,12 +134,20 @@ Job state (pid, log path, and owning process) is written next to the log, so `/r
 `/resume`, and `/fork` re-adopt jobs that are still alive and `bg_stop` and `bg_wait` keep working
 afterwards.
 
-| Setting                    | Default              | Effect                                                                                                 |
-| -------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------ |
-| `PI_BG_TASKS_KEEP_RUNNING` | unset (keep running) | Set to `0` to also stop jobs when the session is replaced. Jobs always stop on real shutdown (`quit`). |
+| Setting                    | Default              | Effect                                                                                                                                                                  |
+| -------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_BG_TASKS_KEEP_RUNNING` | unset (keep running) | Set to `0` to also stop jobs when the session is replaced. Jobs always stop on real shutdown (`quit`), together with whatever they left running in their process group. |
 
-Logs live in `<agent-dir>/bg-tasks` and are pruned when older than 3 days, or beyond the newest
-100 of them. A job that this runtime is still tracking is never pruned.
+Logs live in `<agent-dir>/bg-tasks`: the directory is mode `0700` and every file in it `0600`, because
+a log is command output the model was not shown in full and a sidecar carries the whole command line.
+A directory or file that an older install left group- or world-writable is tightened the next time a
+retention pass runs.
+
+A log is pruned once it is older than 3 days, or once it falls outside the newest 100 logs; its
+sidecar goes with it. A pass runs when a command ends and when a session starts — a session that runs
+for days without reloading does not wait for a reload to keep the directory inside the cap. The log and
+sidecar of a job this runtime is still running are never touched, and neither are the files another
+live session owns, so the directory can sit over the cap by as many files as there are jobs running.
 
 ### Commands belong to the session that started them
 
@@ -182,6 +196,11 @@ Resolution is `settings.shellPath`, project settings of the **Pi process** worki
 then the agent directory, otherwise `bash`. The choice is made once per runtime, so a settings
 change needs `/reload`. On Windows, stopping a task uses `taskkill /T /F`.
 
+`settings.shellCommandPrefix` is prepended to every command exactly as the built-in tool prepends it,
+so aliases, shell functions and an environment set up by the prefix work here too. The two keys are
+resolved per scope, the way Pi merges its settings: a project that sets only one of them still gets
+the other from the agent settings.
+
 ## Development
 
 ```bash
@@ -190,6 +209,7 @@ npm test             # the whole monorepo suite
 npx vitest --run packages/pi-bg-tasks
 ```
 
-The tests spawn real processes, so they cover timeout release, killing, the task listing and its
-counts, output surviving the handover to the background, re-adoption after a reload, log retention,
+The tests spawn real processes, so they cover timeout release, killing (including the process group a
+finished task leaves behind), the task listing and its counts, output surviving the handover to the
+background, re-adoption after a reload, log retention while a session runs, the modes on the log files,
 and the environment handed to commands. See [docs/testing.md](../../docs/testing.md).
