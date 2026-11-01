@@ -809,3 +809,154 @@ Recorded so pass 4 does not spend time here.
   the worker — stop the member from the test process, after finding it by its marker.
 - `settings.json` holding `null` is the only JSON value that breaks the scope walk; `[]`, `"x"`, `42` and
   `true` are inert. If a test wants a _parse_ failure, an empty file or `{"key": ` is the way.
+
+---
+
+## Pass 3 — fixer
+
+All 8 red tests green, none of them edited. `npm run check` passes end to end (deps, manifest, skills,
+tsc, biome, **270 tests**: 248 carried, 8 fixed, 14 new pins). Reproduce with
+`npx vitest --run packages/pi-bg-tasks` (120) or `npm test` (270). A clean full run again leaves 0
+`/tmp/pi-ext-*` directories and no stray processes.
+
+### F12 — the shell check answers for the PATH the child gets
+
+New `commandPathDirs()`: this process's `PATH`, with `<agent-dir>/bin` prepended if it is not already
+there — the exact value `buildEnv` now puts into the environment, so the two cannot drift. `buildEnv`'s
+own inline version of that logic is gone; one place builds a PATH. libuv resolves a bare program name
+against the child's environment, so a shell in pi's bin dir is now accepted, and the check no longer
+refuses a name that every command of the session could run.
+
+Still one scan per runtime: `resolveShellSettings` caches the whole `ShellSettings`, and
+`commandPathDirs()` is called inside it. It is also called per spawn by `buildEnv`, which is where it was
+called before.
+
+### F13 — a scope that is not an object answers nothing
+
+`configuredSetting` parses to `unknown`, then `if (parsed === null || typeof parsed !== "object") continue`
+before `Object.hasOwn`. One line, and it keeps both rules the file already pins: a malformed scope does not
+lose the scope that _is_ readable, and only a missing key falls through.
+
+### F14 — the cap may not drop the obligation, and what bounds the registry instead
+
+Chose the strict version of the tester's direction, not the conditional one: `enforceRegistryCap` never
+evicts a finished job that carries a live-group obligation, even when nothing else can go. The conditional
+version ("while something else can go") still drops the obligation once the registry is all obligations,
+which is the hole.
+
+- `BgJob.groupRecord` says this job's sidecar exists to name a group that still has to be stopped. Set in
+  `releaseJobRecord` (where `hasLeftoverGroup` is exact) and on the adopted-record branch of `adoptJobs`;
+  cleared by `stopLeftoverGroup` when it ends with the group gone, and by the cap when it re-checks
+  `hasLeftoverGroup` and the group has since died. The flag is a shortcut that keeps the cap's loop off
+  200 `kill(2)` pairs per spawn; the answer is always re-checked for a flagged entry before anything is
+  skipped.
+- **The bound:** the registry can sit over `MAX_REGISTRY_SIZE` by one entry per live process group still
+  waiting to be stopped — the same shape, and the same justification, as the log dir's "cap plus the
+  protected files", which the README already states that way. Those entries are not permanent: a group is
+  stopped by `bg_stop` or a shutdown or dies on its own, and the entry then evicts like any other finished
+  job (pinned). A session that daemonises a thousand times has a thousand live groups, and no cap on a map
+  of ids fixes that; the cap bounds bookkeeping, not processes.
+- No sidecar scan was added to `bg_stop` or to `killAllJobs`. With eviction fixed, the entry is always in
+  the registry of the runtime that owns the record; adding a scan would let a stop reach records this
+  runtime deliberately did _not_ adopt (another session's, or one from before its own `session_start`),
+  which is the ownership rule doing work. If pass 4 finds a path where an obligation is on disk and not in
+  the registry of its owner, that scan is the fallback, with `isOwnedByAnotherSession` in it.
+- `bg_stop`'s "Unknown task" text no longer blames "tasks older than the retention window"; it says a task
+  stops being tracked once its log and sidecar have been pruned, which is now the only way it stops being
+  tracked.
+
+### F15 — "can be executed", not `F_OK`
+
+`shellPathExists`/`isAccessible` became `unrunnableShell` + `shellCandidateState`: `statSync` must answer a
+regular file, then `accessSync(X_OK)`. A bare name walks `commandPathDirs()` in order and treats a
+non-executable entry as libuv does — skip it, keep looking — so the message can tell the two kinds of "no"
+apart: `Custom shell path not found: <value>` (nothing of that name is runnable anywhere on that PATH) and
+`Custom shell path not executable: <value>` (something is there and cannot be run). Both stay error
+results, for the reason under F6, and `settings-shell-edges`'s pin on Pi's wording still passes. Windows
+skips the `X_OK` half (no executable bit to consult; a `.cmd` is no more executable to `access()` than a
+text file) and keeps the "is a file" half, which rejects a directory there too.
+
+Deliberate divergence from Pi, as the tester said: Pi's `access(path, F_OK)` is relative to the working
+directory and so rejects bare names, and passes a directory. README updated: the PATH checked is the one
+commands get, in the order commands search it, and "found" means a runnable regular file.
+
+### F16 — a reader leaves what it cannot read, and a writer never writes half a file
+
+- `adoptJobs` no longer unlinks a sidecar that fails to parse: `if (!meta) continue`. It cannot ask the
+  ownership question without the parse, and the file may be another live session's only record of a command
+  it is waiting on. Retention's age and count rules collect garbage without anyone guessing at it, and the
+  retention pass at the end of `adoptJobs` is where that happens.
+- `writeMeta` writes `<id>.json.tmp` in the same directory (via `openPrivate`, so 0600) and `renameSync`s it
+  over the target. A reader sees the old record or the new one, never a partial one.
+- **Who collects a temp:** `pruneRetention`, which already walks every name. A `.json.tmp` matching `bg-*` is
+  `tightenPrivate`d and, once older than `TEMP_FILE_MAX_AGE_MS` (60s — longer than any write and rename can
+  take, so a live runtime's in-flight temp is never in range), unlinked. `adoptJobs`'s walk skips temps (they
+  do not end in `.json`), `enforceRetention`'s cheap count counts only `.log` names, and the count sweep
+  still pairs logs with sidecars by id, so a temp never enters it.
+- README: the log-dir paragraph now says sidecars are written by rename, that an unreadable record is left
+  alone, and that temps age out; the reload section says what the 200-entry task list may and may not drop.
+
+### Tests I touched, and why
+
+- `test/settings-robustness.test.ts`: **appended** two tests (a scope that is `[]`, a scope that is `42`), no
+  existing test changed. `null` was the only value that broke the walk; the pins keep the guard from growing
+  into a rule that also discards a readable scope. That file is the tester's, and it is where those two
+  belong; adding to it is not editing their tests.
+
+New pins: `test/shell-path-resolution.test.ts` (7 — bin dir wins over the rest of PATH, a non-executable
+PATH entry is walked past, a symlink is followed, "not found" for a bare name nowhere to be found, "not
+found" with `PATH` unset, "not executable" for a name that is there but unrunnable, nothing is checked when
+`shellPath` is unset); `test/registry-cap.test.ts` (2 — the cap still evicts finished jobs that carry
+nothing, and a record's protection ends with its group); `test/sidecar-files.test.ts` (3 — no temp survives a
+normal run, a stale temp is collected and a fresh one tightened and kept, an unparseable record stays and is
+not adopted and ages out).
+
+`MEMORY.md`: no line added. What changed is in the code comments and the README; the one host fact worth
+keeping (libuv resolves a bare name against the child's environment) is already in the `commandPathDirs`
+comment where it is used.
+
+### For pass 4 — what to attack
+
+- **F14's bound at scale.** The registry is now `cap + live groups`. A runtime that adopts 300 records whose
+  groups are alive at one `session_start`, with the registry already at the cap: does `enforceRegistryCap`
+  stay cheap (it re-checks `hasLeftoverGroup` per flagged entry, so 300 × 2 `kill(2)` calls per spawn while
+  the registry is over the cap), does one shutdown sweep them inside `teardownTimeout`, and does `bg_wait`
+  still answer sensibly with 300+ tasks?
+- **A live job with no sidecar.** `writeMeta` failing is deliberately non-fatal. What is a running job whose
+  record was never written (log dir made unwritable, or a temp collected under a suspended runtime)? It is
+  stoppable by this runtime, invisible to the next one, and unprotected from retention. That is the shape
+  pass 3's atomic write makes rarer rather than impossible.
+- **F12's cache against a `PATH` change inside a runtime:** the check uses the PATH at resolution time,
+  `buildEnv` uses it per command. The existing rule is "the shell is chosen once per runtime"
+  (`environment.test.ts`), and the README repeats it; a test that changes `PATH` mid-runtime and expects the
+  other answer is arguing with that rule, so decide whether the rule is right before writing it.
+- **Windows is still unexercised and POSIX-shaped:** `PATHEXT` is not consulted, so a `shellPath` of `bash`
+  there resolves only to a file literally named `bash`; `unrunnableShell` splits on both separators; the
+  leftover-group path is inert. Nothing claims otherwise, and there is no Windows runner.
+- **A zombie adopted leader drops its record.** `isAlive` calls a zombie finished, so the adopted-job poller
+  can call `markDone` while the leader is still at its pid — `hasLeftoverGroup` then reads false
+  (`processAt` → true) and the record is dropped even if the group has members. Pass 2 recorded the same
+  reasoning as unreachable (init reaps an orphan), and no shape in the suite makes an adopted leader's
+  parent fail to reap it. A subreaper (`prctl(PR_SET_CHILD_SUBREAPER)`) would; nothing here sets one. Worth
+  confirming rather than re-deriving.
+- Carried forward, unchanged: `stopLeftoverGroup`'s early `return false` conflating "could not signal" with
+  "nothing to do", `tightenPrivate` on files another live runtime owns, the recycled-`ownerPid` rule, Pi's
+  `/bin/bash` → `bash` → `sh` fallback, retention driven by completions, the numbers in a sidecar being
+  trusted by the report.
+
+### Harness notes
+
+- Marker sleeps this pass: 179 (`registry-cap`), 187 and 189 (`sidecar-files`).
+- **`loadExtension({ env: { PATH: … } })` is how a test controls the PATH both the check and the child
+  see.** The extension resolves the shell at first use, which is after the load, so load options are
+  enough; `PATH: undefined` deletes the variable, which is what "no PATH at all" needs. Do not change
+  `process.env.PATH` after a load and expect the cached answer to follow.
+- A backgrounded task's log survives its completion (only a _foreground_ log is deleted when it was not
+  truncated), so an assertion that a run "left nothing behind" has to filter `.log` out, or it will fail on
+  a log that is correctly under retention rules.
+- Temp collection is time-based (60s), so a test backdates the stale temp — `utimesSync` with ~10 minutes —
+  rather than waiting for the grace.
+- A test that runs two in-process runtimes on one agent dir must dispose the second in its own body:
+  `afterEach` only knows the load in `ext`, and an undisposed load leaks its temp working dir.
+- The registry-pressure recipe from pass 3 still holds: 201 sequential foreground `true` commands, which
+  leave no log and no sidecar, so the only files in the log dir are the ones under test.

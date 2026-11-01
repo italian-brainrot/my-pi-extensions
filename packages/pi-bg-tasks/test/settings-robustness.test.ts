@@ -89,4 +89,27 @@ describe("settings files that are not well-formed", () => {
     expect(text(result)).toContain("the-command");
     expect(text(result), "a number is not a shell, so the agent scope answers for the key").toContain("BASH=none");
   });
+
+  it("treats a scope that parses to an array as empty", async () => {
+    // `null` is the one value that used to throw, because `Object.hasOwn(null, key)` does. The other
+    // scalars were always inert — an array is an object, a number boxes, and none of them mentions a key —
+    // and pinning them keeps the guard from growing into something that also loses a readable scope.
+    settings(agentDir.path, JSON.stringify({ shellCommandPrefix: `echo ${AGENT_PREFIX_LINE}` }));
+    settings(join(project.path, ".pi"), "[]");
+
+    const result = await ext!.callTool("bash", { command: "echo the-command" });
+
+    expect(text(result)).toContain("the-command");
+    expect(text(result)).toContain(AGENT_PREFIX_LINE);
+  });
+
+  it("treats a scope that parses to a number as empty, from either side", async () => {
+    settings(agentDir.path, "42");
+    settings(join(project.path, ".pi"), JSON.stringify({ shellCommandPrefix: `echo ${AGENT_PREFIX_LINE}` }));
+
+    const result = await ext!.callTool("bash", { command: "echo the-command" });
+
+    expect(text(result)).toContain("the-command");
+    expect(text(result), "the readable scope still answers").toContain(AGENT_PREFIX_LINE);
+  });
 });

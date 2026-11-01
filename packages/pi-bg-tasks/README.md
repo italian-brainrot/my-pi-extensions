@@ -141,6 +141,12 @@ long as that group exists: the group id is the dead shell's pid, and the sidecar
 it. That is what lets the runtime taking the session over stop what the previous one started. Such a
 record is taken over as a finished task, never as a running one, and is dropped once the group is gone.
 
+The in-memory task list follows the same rule. It keeps at most 200 tasks, dropping the oldest finished
+one when a session passes that — but never a running task, and never a task whose process group is still
+waiting to be stopped, because that entry is what `bg_stop` and a shutdown reach the group through. So the
+list can sit over 200 by as many entries as there are running tasks and groups left to stop, and each such
+entry becomes an ordinary finished task, droppable like any other, the moment its group is gone.
+
 | Setting                    | Default              | Effect                                                                                                                                                                  |
 | -------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PI_BG_TASKS_KEEP_RUNNING` | unset (keep running) | Set to `0` to also stop jobs when the session is replaced. Jobs always stop on real shutdown (`quit`), together with whatever they left running in their process group. |
@@ -156,6 +162,12 @@ for days without reloading does not wait for a reload to keep the directory insi
 sidecar of a job this runtime is still running are never touched, neither are the files another live
 session owns, and neither is the record of a process group that is still waiting to be stopped, so the
 directory can sit over the cap by as many files as there are jobs running or groups left to stop.
+
+A sidecar is written to a temp name in the same directory and renamed into place, so a session reading
+the directory — which every pi sharing the agent dir does at its own start — never sees a half-written
+record. A record that cannot be parsed is left where it is, because it may be a live session's only
+record of a command it is waiting on, and the reader has nothing to go on otherwise; both it and a temp
+left by a process that died mid-write then age out under the rules above.
 
 ### Commands belong to the session that started them
 
@@ -204,10 +216,15 @@ Resolution is `settings.shellPath`, project settings of the **Pi process** worki
 then the agent directory, otherwise `bash`. The choice is made once per runtime, so a settings
 change needs `/reload`. On Windows, stopping a task uses `taskkill /T /F`.
 
-A configured value is checked before anything is spawned. A value with no path separator is looked up on
-`PATH`; if it cannot be found at all, every command answers `Custom shell path not found: <value>`
-instead of running something that cannot start. Pi throws the same message; here it is a tool result,
-so the model sees the setting is broken rather than a command that exited 127.
+A configured value is checked before anything is spawned, and the question it answers is the one the
+child asks: can a command of this session run this? A value with no path separator is looked up on the
+`PATH` commands get — `<agent-dir>/bin` first, then the rest, in that order, skipping entries that hold
+something unrunnable, exactly as the child resolves it. "Found" means a regular file that can be
+executed. Nothing of that name answers `Custom shell path not found: <value>`; something there that
+cannot be run answers `Custom shell path not executable: <value>`. Either way every command of the
+session answers that, followed by `Cannot execute bash commands.`, instead of running something that
+cannot start. Pi throws its `not found` message; here both are tool results, so the model sees the setting
+is broken rather than a command that exited 127.
 
 `settings.shellCommandPrefix` is prepended to every command exactly as the built-in tool prepends it,
 so aliases, shell functions and an environment set up by the prefix work here too. The two keys are
@@ -215,11 +232,14 @@ resolved per scope, the way Pi merges its settings: a project that sets only one
 other from the agent settings, and a key that is _present_ in the project file wins whatever it holds —
 `"shellCommandPrefix": ""` turns an agent-level prefix off, and `"shellPath": null` falls back to the
 default shell. A value that is neither a string nor null is not usable and falls through to the other
-scope.
+scope, and a file that is not a JSON object at all answers nothing for every key: one malformed scope
+does not fail the session, and does not hide the scope that is readable.
 
-Pi resolves the default itself: `/bin/bash`, then `bash` on `PATH`, then `sh`, and it rejects a
-configured `shellPath` that is a bare name. This extension spawns `bash`. A machine with no `bash` gets
-a failure here and a working `sh` from Pi.
+Pi resolves the default itself: `/bin/bash`, then `bash` on `PATH`, then `sh`. This extension spawns
+`bash`. A machine with no `bash` gets a failure here and a working `sh` from Pi. Pi's check for a
+configured value is `access(path, F_OK)`, which a directory and a non-executable file both pass, and which
+is relative to the working directory, so Pi rejects a bare name outright; this extension checks what the
+child will actually do with the value.
 
 ## Development
 

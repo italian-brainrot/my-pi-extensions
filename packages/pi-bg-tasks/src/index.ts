@@ -45,6 +45,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   type Stats,
   statSync,
   unlinkSync,
@@ -74,6 +75,10 @@ import { Type } from "typebox";
 
 const LOG_DIR = join(getAgentDir(), "bg-tasks");
 const META_SUFFIX = ".json";
+/** What a sidecar write renames from, so no reader can see a half-written record. See `writeMeta()`. */
+const TEMP_SUFFIX = ".tmp";
+/** A temp file older than this belongs to a runtime that died mid-write; a live one is renamed away. */
+const TEMP_FILE_MAX_AGE_MS = 60_000;
 
 /**
  * A log is command output the model was not shown in full, and a sidecar carries the whole command
@@ -160,6 +165,12 @@ interface BgJob {
   backgrounded: boolean;
   /** Set once a kill was requested, so an adopted job reports "killed". */
   killRequested?: boolean;
+  /**
+   * True while this job's sidecar exists to name a process group that still has to be stopped — a task
+   * that finished while leaving processes in the group its shell led. It is what keeps the job out of the
+   * registry cap: the in-memory job is what carries that obligation. See `releaseJobRecord()`.
+   */
+  groupRecord?: boolean;
   proc?: ChildProcess;
   donePromise?: Promise<void>;
   resolveDone?: () => void;
@@ -317,13 +328,26 @@ function markDone(job: BgJob, exitCode: number | null, signal: NodeJS.Signals | 
 
 function enforceRegistryCap(): void {
   if (jobs.size <= MAX_REGISTRY_SIZE) return;
-  // Insertion order: drop the oldest finished job. Running jobs are never evicted
-  // silently, because that would strand a live process with no way to stop it.
+  // Insertion order: drop the oldest finished job. Running jobs are never evicted silently, because that
+  // would strand a live process with no way to stop it. Neither is a finished job whose sidecar was kept
+  // because its process group is still there to stop: the cap exists to bound this runtime's bookkeeping,
+  // and dropping that entry is what the record was kept to prevent — the task would leave `bg_wait`,
+  // `bg_stop` would answer "Unknown task", and a shutdown would signal nothing.
+  //
+  // What bounds the registry, then, is `MAX_REGISTRY_SIZE` plus one entry per process group still waiting
+  // to be stopped — the same shape the log dir's cap has, and for the same reason. Those extra entries are
+  // not permanent: a group is stopped by `bg_stop` or by a shutdown, or it dies on its own, and as soon as
+  // it has, the entry is an ordinary finished job and the next pass over the cap drops it. A session that
+  // daemonises a thousand times has a thousand live process groups, and no cap on a map of ids fixes that.
   for (const [id, job] of jobs) {
-    if (job.status !== "running") {
-      jobs.delete(id);
-      if (jobs.size <= MAX_REGISTRY_SIZE) return;
+    if (job.status === "running") continue;
+    // The flag is a shortcut, not an answer: it says a record was kept, and the group may be gone since.
+    if (job.groupRecord) {
+      if (hasLeftoverGroup(job)) continue;
+      job.groupRecord = false;
     }
+    jobs.delete(id);
+    if (jobs.size <= MAX_REGISTRY_SIZE) return;
   }
 }
 
@@ -340,8 +364,13 @@ function enforceRegistryCap(): void {
  * with its shell, still loses its sidecar immediately, so the common case creates no extra files.
  */
 function releaseJobRecord(job: BgJob): void {
-  if (hasLeftoverGroup(job)) writeMeta(job);
-  else unlinkQuietly(job.metaPath);
+  if (hasLeftoverGroup(job)) {
+    writeMeta(job);
+    job.groupRecord = true;
+  } else {
+    job.groupRecord = false;
+    unlinkQuietly(job.metaPath);
+  }
 }
 
 function describeJob(job: BgJob, includeId = true): string {
@@ -368,8 +397,11 @@ interface ShellSettings {
   shell: string;
   /** Pi's `shellCommandPrefix`, empty when unset. */
   commandPrefix: string;
-  /** Set when `shellPath` is configured but cannot be run: the tool then refuses every command. */
-  missingShellPath?: string;
+  /**
+   * Set when `shellPath` is configured but cannot be run: the tool then refuses every command, and says
+   * which half is wrong — nothing of that name is on PATH, or something is there that cannot be run.
+   */
+  brokenShellPath?: { path: string; reason: "not found" | "not executable" };
 }
 
 /**
@@ -385,15 +417,20 @@ interface ShellSettings {
  */
 function configuredSetting(key: string): string | null | undefined {
   for (const file of [join(process.cwd(), CONFIG_DIR_NAME, "settings.json"), join(getAgentDir(), "settings.json")]) {
-    let settings: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+      parsed = JSON.parse(readFileSync(file, "utf8"));
     } catch {
       // A missing, unreadable or malformed scope answers nothing; the other one may.
       continue;
     }
-    if (!Object.hasOwn(settings, key)) continue;
-    const value = settings[key];
+    // A scope has to be an object to mention a key. `JSON.parse("null")` succeeds and answers `null`,
+    // and `Object.hasOwn(null, key)` throws out of the tool, so one file written by a script with an
+    // unset variable would fail every command of the session with a message naming neither file. Pi
+    // reports the bad read and carries on with an empty scope; a scope that is not an object is one.
+    if (parsed === null || typeof parsed !== "object") continue;
+    if (!Object.hasOwn(parsed, key)) continue;
+    const value = (parsed as Record<string, unknown>)[key];
     if (value === null || typeof value === "string") return value;
   }
   return undefined;
@@ -417,37 +454,71 @@ function resolveShellSettings(): ShellSettings {
   const configured = configuredString("shellPath").trim();
   // A leading `~`, the way pi normalizes it.
   const shell = configured ? (configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured) : DEFAULT_SHELL;
-  // A configured shell that cannot be found is a broken setting, and Pi's `getShellConfig` refuses it by
+  // A configured shell that cannot be run is a broken setting, and Pi's `getShellConfig` refuses it by
   // name rather than letting every command fail as if the command were at fault.
-  if (configured && !shellPathExists(shell)) return { shell, commandPrefix, missingShellPath: shell };
+  const reason = configured ? unrunnableShell(shell) : undefined;
+  if (reason) return { shell, commandPrefix, brokenShellPath: { path: shell, reason } };
   return { shell, commandPrefix };
 }
 
 /**
- * Whether a configured shell can be run.
+ * The directories a bare command name is looked up in: the `PATH` a command of this session gets.
  *
- * Pi checks a configured path with `access(path, F_OK)` and throws otherwise, which also rejects a bare
- * name, because that check is relative to the working directory. A name with no separator is looked up
- * on PATH here, since `shellPath: "sh"` is a thing people write and means the shell on PATH. The answer
- * is cached with the rest of the shell settings, so this costs one scan per runtime.
+ * That is not this process's `PATH`. `buildEnv` puts `<agent-dir>/bin` in front of the environment handed
+ * to `spawn`, and libuv resolves a bare program name against the *child's* environment — which is what
+ * makes `shellPath: "bash"` work at all. A check that scans `process.env.PATH` answers a question about a
+ * different PATH than the one that runs the command, and refuses a shell the session could run: pi's bin
+ * dir is the documented place for the user's own executables, and the one directory every command of the
+ * session can see.
  */
-function shellPathExists(candidate: string): boolean {
-  if (candidate.includes("/") || candidate.includes("\\")) return isAccessible(candidate);
+function commandPathDirs(): string[] {
   const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  for (const dir of (process.env[pathKey] ?? "").split(delimiter)) {
-    if (dir && isAccessible(join(dir, candidate))) return true;
-  }
-  return false;
+  const entries = (process.env[pathKey] ?? "").split(delimiter).filter(Boolean);
+  const binDir = join(getAgentDir(), "bin");
+  return entries.includes(binDir) ? entries : [binDir, ...entries];
 }
 
-/** Pi's own existence check: `access(path, F_OK)`, spelled with try/catch. */
-function isAccessible(path: string): boolean {
-  try {
-    accessSync(path, fsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
+/**
+ * Why a configured shell cannot be run, or undefined when it can.
+ *
+ * "Can be run" means a regular file this user may execute, because that is what the child is about to do
+ * with it. Pi's own check is `access(path, F_OK)`, which a directory and a 0644 file both pass, and which
+ * is relative to the working directory, so Pi rejects a bare name outright. Copying it would put the
+ * failure back where the check exists to keep it: an unrunnable value reaches `spawn`, answers ENOENT or
+ * EACCES, and arrives as `Command exited with code 127` — a broken setting reading as a command that
+ * failed. A value with no separator is tried on the PATH the child gets, in order, which is how libuv
+ * resolves it too: a PATH entry holding a non-executable file is skipped, not fatal.
+ */
+function unrunnableShell(candidate: string): "not found" | "not executable" | undefined {
+  const bare = !(candidate.includes("/") || candidate.includes("\\"));
+  const candidates = bare ? commandPathDirs().map((dir) => join(dir, candidate)) : [candidate];
+  let blocked = false;
+  for (const path of candidates) {
+    const answer = shellCandidateState(path);
+    if (answer === "runnable") return undefined;
+    if (answer === "blocked") blocked = true;
   }
+  return blocked ? "not executable" : "not found";
+}
+
+/** What one PATH entry says about a candidate shell: run it, skip it, or nothing there. */
+function shellCandidateState(path: string): "runnable" | "blocked" | "missing" {
+  let stat: Stats;
+  try {
+    stat = statSync(path);
+  } catch {
+    return "missing";
+  }
+  if (!stat.isFile()) return "blocked";
+  // Windows has no executable bit to consult — to `access()` a `.cmd` script is no more executable than a
+  // text file is — so there the question is only whether the value is a file at all.
+  if (process.platform === "win32") return "runnable";
+  try {
+    accessSync(path, fsConstants.X_OK);
+  } catch {
+    return "blocked";
+  }
+  return "runnable";
 }
 
 function resolveShell(): string {
@@ -473,11 +544,7 @@ function buildEnv(ctx: ExtensionToolContext | undefined): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
 
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  const binDir = join(getAgentDir(), "bin");
-  const entries = (env[pathKey] ?? "").split(delimiter).filter(Boolean);
-  if (!entries.includes(binDir)) {
-    env[pathKey] = [binDir, ...entries].join(delimiter);
-  }
+  env[pathKey] = commandPathDirs().join(delimiter);
 
   for (const key of SESSION_ENV_KEYS) delete env[key];
   if (ctx) {
@@ -497,8 +564,15 @@ function buildEnv(ctx: ExtensionToolContext | undefined): NodeJS.ProcessEnv {
 // ── Spawning ─────────────────────────────────────────────────────────────────
 
 function writeMeta(job: BgJob): void {
+  // Written to a temp name in the same directory and renamed over the target, never truncated in place.
+  // `<agent-dir>/bg-tasks` is shared, and every other pi process reads these records at its own
+  // `session_start`: a reader that catches a half-written file cannot tell whose record it was, and either
+  // answer is bad — keeping it means adopting nothing, removing it strands a live command that another
+  // session is still waiting on (see `adoptJobs()`). A rename within a directory is atomic, so a reader
+  // sees either the old record or the new one. The temp is created 0600 like the record itself.
+  const tempPath = `${job.metaPath}${TEMP_SUFFIX}`;
   try {
-    const fd = openPrivate(job.metaPath, "w");
+    const fd = openPrivate(tempPath, "w");
     try {
       writeFileSync(
         fd,
@@ -526,8 +600,10 @@ function writeMeta(job: BgJob): void {
     } finally {
       closeSync(fd);
     }
+    renameSync(tempPath, job.metaPath);
   } catch {
-    // Metadata is only needed to re-adopt after a reload; losing it is not fatal.
+    // Metadata is only needed to re-adopt after a reload; losing it is not fatal. A temp left behind by a
+    // runtime that died here is collected by the retention walk.
   }
 }
 
@@ -783,8 +859,11 @@ async function stopLeftoverGroup(job: BgJob): Promise<boolean> {
   }
 
   // The record existed to name this group. With the group stopped, it is garbage: keeping it would make a
-  // finished task look stoppable, or adoptable, forever.
-  if (!processGroupExists(pid)) unlinkQuietly(job.metaPath);
+  // finished task look stoppable, or adoptable, forever — and would keep the job out of the registry cap.
+  if (!processGroupExists(pid)) {
+    unlinkQuietly(job.metaPath);
+    job.groupRecord = false;
+  }
   return true;
 }
 
@@ -959,6 +1038,16 @@ function pruneRetention(): void {
       continue;
     }
 
+    // A write interrupted by a crash leaves `<id>.json.tmp` behind. Nothing reads a temp, so nothing else
+    // would ever remove one: it is tightened here and ages out. A live runtime's own temp is only ever
+    // there for the moment a write and its rename take, so anything older than that is nobody's.
+    if (name.endsWith(TEMP_SUFFIX)) {
+      if (!name.startsWith("bg-")) continue;
+      tightenPrivate(path);
+      if (now - stat.mtimeMs > TEMP_FILE_MAX_AGE_MS) unlinkQuietly(path);
+      continue;
+    }
+
     const id = name.endsWith(".log") ? name.slice(0, -4) : name.endsWith(META_SUFFIX) ? name.slice(0, -META_SUFFIX.length) : undefined;
     if (!id?.startsWith("bg-")) continue;
 
@@ -1041,10 +1130,13 @@ function adoptJobs(): void {
 
     const metaPath = join(LOG_DIR, name);
     const meta = readMeta(metaPath);
-    if (!meta) {
-      unlinkQuietly(metaPath);
-      continue;
-    }
+    // A record that cannot be parsed is a record that cannot be judged: without the parsed `ownerPid`
+    // there is no ownership question to ask, and this may be another live session's only record of a
+    // command it is waiting on. Deleting it is the destructive guess — it leaves a running command with
+    // nothing to adopt it at the next reload, nothing to protect its log, and nothing to stop it. Writes
+    // are atomic, so an unparseable sidecar is an old install's or one a crash interrupted, and retention's
+    // age and count rules collect garbage without anyone having to guess about it.
+    if (!meta) continue;
 
     // Another live pi process owns this command and will report and stop it itself. Adopting it
     // here would mean this session's shutdown kills a command a different session is waiting on —
@@ -1098,6 +1190,8 @@ function adoptJobs(): void {
         signal,
         finishedAt: typeof meta.finishedAt === "number" ? meta.finishedAt : undefined,
         backgrounded: meta.backgrounded === true,
+        // The obligation itself, and the reason this entry is not evictable under registry pressure.
+        groupRecord: true,
       };
       jobs.set(id, job);
       // Claim it: with the previous runtime gone, this one is the only one that will stop the group.
@@ -1736,12 +1830,12 @@ function registerBashOverride(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: missing }], details: {}, isError: true };
       }
 
-      // Same for the shell itself: Pi's `getShellConfig` refuses a configured path it cannot find, naming
+      // Same for the shell itself: Pi's `getShellConfig` refuses a configured path it cannot run, naming
       // it. Left to `spawn`, a broken `shellPath` arrives as a command that exited 127, which reads like a
       // problem with the command, and every command the session runs would report that.
-      const missingShell = shellSettings().missingShellPath;
-      if (missingShell) {
-        const note = `Custom shell path not found: ${missingShell}\nCannot execute bash commands.`;
+      const broken = shellSettings().brokenShellPath;
+      if (broken) {
+        const note = `Custom shell path ${broken.reason}: ${broken.path}\nCannot execute bash commands.`;
         return { content: [{ type: "text", text: note }], details: {}, isError: true };
       }
 
@@ -1788,7 +1882,7 @@ function registerBgStop(pi: ExtensionAPI): void {
       const job = jobs.get(taskId);
       if (!job) {
         throw new Error(
-          `Unknown task: ${taskId}. The ID comes from the bash result details, and tasks older than the retention window are no longer tracked.`,
+          `Unknown task: ${taskId}. The ID comes from the bash result details, and a task is no longer tracked once its log and sidecar have been pruned.`,
         );
       }
 
