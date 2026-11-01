@@ -113,4 +113,17 @@ describe("foreground commands", () => {
     expect(result.details.status).toBe("killed");
     expect(text(result)).toContain("Command aborted");
   });
+
+  it("says the working directory is gone instead of blaming the shell", async () => {
+    // Pi's own tool checks the working directory before spawning and says what is wrong. Spawning into
+    // a directory that no longer exists fails with ENOENT, which this tool reports as the shell failing
+    // to start, so the model goes hunting for a missing bash instead of a deleted directory.
+    const missing = join(ext.agentDir, "no-such-directory");
+
+    const result = await ext.callTool("bash", { command: "echo hi" }, { context: { cwd: missing } });
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain("Working directory");
+    expect(text(result)).not.toContain("failed to start command");
+  });
 });

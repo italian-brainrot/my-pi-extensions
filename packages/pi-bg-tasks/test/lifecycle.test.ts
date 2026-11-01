@@ -20,6 +20,19 @@ function backdate(path: string, ageMs: number): void {
   utimesSync(path, when, when);
 }
 
+/** End a command the test started, whatever the assertions did. */
+function stopHard(pid: number): void {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
 function logNames(agentDir: string): string[] {
   return readdirSync(join(agentDir, "bg-tasks")).filter((name) => name.endsWith(".log"));
 }
@@ -167,5 +180,87 @@ describe("log retention", () => {
     await ext.callTool("bg_stop", { task_id: job.id, reason: "test cleanup" });
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     ext.dispose();
+  });
+
+  it("re-adopts a live command whose files have gone past the retention age", async () => {
+    // A dev server that has been quiet for longer than the retention window, then /reload: the fresh
+    // runtime has not adopted anything yet, so a prune that runs first sees only untracked files and
+    // sweeps the sidecar of a command that is still running. The command becomes invisible - no
+    // bg_wait, no bg_stop, and it survives the session's own shutdown.
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const first = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
+    const job = await startBackground(first, "sleep 120");
+    const logDir = join(agentDir.path, "bg-tasks");
+    expect(existsSync(join(logDir, `${job.id}.json`))).toBe(true);
+    backdate(job.logPath, 4 * DAY_MS);
+    backdate(join(logDir, `${job.id}.json`), 4 * DAY_MS);
+
+    vi.resetModules();
+    const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
+    await second.emit({ type: "session_start", reason: "reload" });
+
+    try {
+      const wait = await second.callTool("bg_wait", { timeout: 1 });
+      expect(wait.details.running, "the runtime that takes over a session takes over its commands too").toContain(job.id);
+      expect(existsSync(job.logPath), "and does not delete the log of a command that is still writing").toBe(true);
+
+      const stop = await second.callTool("bg_stop", { task_id: job.id, reason: "test cleanup" });
+      expect(text(stop)).toContain(`Task ${job.id} stopped`);
+      await waitFor(() => !isAlive(job.pid), "the adopted command to exit");
+    } finally {
+      stopHard(job.pid);
+      await second.emit({ type: "session_shutdown", reason: "quit" });
+      second.dispose();
+      first.dispose();
+      agentDir.dispose();
+    }
+  });
+
+  it("re-adopts a live command when the retained-count sweep runs past it", async () => {
+    // The same loss through the other retention rule: the command's files fall outside the newest 100
+    // logs, even though everything about the command is still running.
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const first = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
+    const job = await startBackground(first, "sleep 120");
+    const logDir = join(agentDir.path, "bg-tasks");
+    backdate(job.logPath, 10 * 60 * 1000);
+    backdate(join(logDir, `${job.id}.json`), 10 * 60 * 1000);
+    for (let i = 0; i < 105; i++) writeFileSync(join(logDir, `bg-newer${String(i).padStart(3, "0")}.log`), "newer\n");
+
+    vi.resetModules();
+    const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
+    await second.emit({ type: "session_start", reason: "reload" });
+
+    try {
+      const wait = await second.callTool("bg_wait", { timeout: 1 });
+      expect(wait.details.running).toContain(job.id);
+
+      const stop = await second.callTool("bg_stop", { task_id: job.id, reason: "test cleanup" });
+      expect(text(stop)).toContain(`Task ${job.id} stopped`);
+      await waitFor(() => !isAlive(job.pid), "the adopted command to exit");
+    } finally {
+      stopHard(job.pid);
+      await second.emit({ type: "session_shutdown", reason: "quit" });
+      second.dispose();
+      first.dispose();
+      agentDir.dispose();
+    }
+  });
+
+  it("holds the log dir inside the retained count during a session, not only at its start", async () => {
+    // Every truncated command leaves a full log behind, and a long-running interactive session never
+    // reloads: retention that only runs at session_start never runs at all.
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const ext = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
+    for (let i = 0; i < 105; i++) await ext.callTool("bash", { command: "seq 1 3000" });
+
+    expect(logNames(agentDir.path).length, "the README promises the newest 100 logs are kept").toBeLessThanOrEqual(100);
+
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+    ext.dispose();
+    agentDir.dispose();
   });
 });
