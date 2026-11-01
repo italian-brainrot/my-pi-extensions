@@ -242,12 +242,9 @@ Harness notes for this pass:
   makes leftover-group assertions possible; a finished job's result carries neither pid nor group id.
 - `pruneRetention()` deliberately does **not** call `ensureLogDir()`: a job that ends during teardown runs
   a retention pass, and creating the log dir there puts back a directory the test just deleted.
-- A full suite still leaves ~6 `/tmp/pi-ext-*` directories. They are not from this pass: several loads in
-  `test/lifecycle.test.ts` (the ones for live jobs, quit shutdown, `KEEP_RUNNING=0`, and the tracked-log
-  pin) neither reset modules nor pass an `agentDir`, so they reuse the module instance an earlier test
-  imported and write into _that_ load's agent dir — which the earlier test already deleted, so
-  `spawnJob`'s `ensureLogDir()` recreates it. Same reason a `backdate()` in one of those tests moves a file
-  in another test's directory. Fix by giving those loads `vi.resetModules()` and their own `agentDir`.
+- A full suite left ~6 `/tmp/pi-ext-*` directories, from loads that reused an earlier load's module and
+  agent dir. Fixed in pass 2 (`lifecycle.test.ts`, plus two `pi-takeover` files that never disposed their
+  `beforeAll` load); a clean run now leaves none.
 
 ---
 
@@ -438,3 +435,152 @@ Harness notes:
   runtime; that is deliberate (Pi would emit `session_start` again), and the third test does not depend on
   adoption.
 - A full suite leaves exactly 6 `/tmp/pi-ext-*` directories; the four files this pass added leave none.
+
+---
+
+## Pass 2 — fixer
+
+All 7 red tests green, none of them edited. `npm run check` passes end to end (deps, manifest, skills,
+tsc, biome, **243 tests**: 229 carried, 7 fixed, 7 new pins). Reproduce with
+`npx vitest --run packages/pi-bg-tasks` (86) or `npm test` (243).
+
+### F8 — the stop is about the group, not only about the leader
+
+Four entry points, one rule: once the leader is gone, the group is asked on its own account.
+
+- `killJob`'s grace timer: `job.status === "running" || hasLeftoverGroup(job)`. A leader that died on the
+  first SIGTERM no longer cancels the escalation for the members that ignored it. `signalJobTree` already
+  signals `-pid`, so the same call reaches them.
+- New `stopJobAndWait(job)`: the leader's window (kill, then race `getDone` against `SIGTERM_GRACE_MS +
+  1000`) and then `stopLeftoverGroup`, which is now conditional on `hasLeftoverGroup` — so a task whose
+  whole group dies on SIGTERM still pays exactly one window. `bg_stop`'s running branch calls it and says
+  in the result what it did to the group (`groupNote`, shared with the finished branch).
+- `killAllJobs`: one list of targets (`status === "running" || hasLeftoverGroup(job)`), and every target is
+  stopped by `stopJobAndWait`. `Promise.all` over `stopJobAndWait` starts every stop before awaiting any,
+  so the leaders are all signalled synchronously — the entry-time `leftovers` filter that was computed once
+  is gone, and a running job that becomes a leftover job is covered without a re-scan. Its cap is now two
+  windows: `2 * (SIGTERM_GRACE_MS + 1000)`.
+- `runWithTimeout`: before `finishedResult`, `if (job.killRequested) await stopLeftoverGroup(job)`. The
+  timeout release path is untouched — no kill was asked for there, and stopping the group of a task that
+  was deliberately left running would contradict "a backgrounded task survives a later abort".
+
+**The timing question pass 1 flagged.** `stop-reach`'s `>= 4000` belongs to a job that was _already
+finished_ when the shutdown looked at it: for that job the group stop _is_ the first and only window
+(SIGTERM, 5s poll, SIGKILL → ~5.15 s), and it is unchanged. The second window exists only for a job whose
+leader was running at entry — and there `killJob`'s timer fires its group SIGKILL at t=5 s while the
+leader's window is still open, so the two windows overlap: measured on that shape, `bg_stop` 5.11 s and
+the shutdown 5.11 s, not ~10 s. Nothing was widened. What the second window must not become is a cost paid
+always, so
+`test/stop-window.test.ts` pins the other side: a cooperative group gives a `bg_stop` and a shutdown that
+come back in under 2500 ms.
+
+`stopLeftoverGroup` also now waits up to `GROUP_REAP_MS` (1 s) after a SIGKILL for the group to actually
+disappear, so a caller waiting for a stop waits for the last signal it asked for, and so the "is the group
+gone" answer it returns is not a race against init reaping an orphan.
+
+### F9 — resolution 1: close it, the record outlives the runtime
+
+`markDone` and `finishedResult` now call `releaseJobRecord(job)`: keep the sidecar (`writeMeta`) when
+`hasLeftoverGroup(job)`, otherwise unlink it as before. The exit event has fired and Node has reaped the
+leader by then, so the check is exact, and a task whose group went empty with its shell still leaves no
+file behind (pinned). The sidecar gained `status`, `exitCode`, `signal` and `finishedAt` so a runtime that
+inherits the record reports the task as it was and can tell it from a live one.
+
+`adoptJobs` now has three outcomes for a sidecar that is ours: live leader → running task (as before);
+dead leader with a group that still exists and nothing living at the pid → a **finished** job in the
+registry (`finishedStatus` from the recorded exit code, `finishedAt` restored, `backgrounded` taken from
+the meta so a foreground-origin record does not appear in the `bg_wait` table); otherwise unlink, as
+before. It is claimed (`writeMeta`) because with the previous runtime gone this one is the only one that
+will signal that group. From there `killAllJobs`'s filter and `bg_stop` reach it with the same code as
+their own finished jobs — which is what `test/reload-leftover.test.ts` needed, and
+`test/leftover-record.test.ts` pins the handover, the by-ID stop, and that it is never reported as running.
+
+Collecting such a record: `stopLeftoverGroup` unlinks it when it ends with the group gone; a record whose
+group is still alive is now in `pruneRetention`'s protected set (alongside foreign-owned and this-runtime
+-running ids, computed in the same pass over the sidecars) so the count sweep cannot strand a live group;
+and once the group is gone the record is back under the age and count rules, and is unlinked outright at
+the next `session_start`. **No eager mid-session sweep** — `retention-in-session.test.ts` pins that a
+dead-pid sidecar is left in place (and tightened) by a mid-session pass, so a stale record can sit for up
+to the 3-day window. That is a 400-byte file, and it is the same rule that already governs every other
+sidecar.
+
+### F10 — a key that is present wins, `""` and `null` included
+
+`configuredSetting` resolves a key as "the innermost scope that mentions it": `Object.hasOwn` on the
+parsed scope, project-of-the-process-cwd first; a string (empty included) or `null` is the value, anything
+else — number, object, `undefined` — falls through to the next scope, and a scope that is missing,
+unreadable or not valid JSON answers nothing (`continue`, not a throw). `shellPath: null` and
+`shellCommandPrefix: ""` therefore mean unset, matching `deepMergeObjects`. Still resolved once per runtime:
+`shellSettings()` caches the whole `ShellSettings` object, both keys together, on first use.
+`test/settings-robustness.test.ts` pins the malformed-scope and non-string cases.
+
+### F11 — a broken `shellPath` is named, as an error result
+
+`resolveShellSettings` checks a _configured_ shell once per runtime and records `missingShellPath`; the
+bash `execute` answers `Custom shell path not found: <value>` + `Cannot execute bash commands.` with
+`isError`, next to the missing-working-directory check, and never spawns. Pi throws that exact string from
+`getShellConfig`; it stays a result here for the reason already recorded under F6. Deliberate divergence:
+Pi checks the configured value with `access(path, F_OK)`, which rejects a bare name (`shellPath: "sh"` is
+broken in Pi itself), while a value with no separator is looked up on `PATH` here — green tests
+(`settings-scopes`, `shell-precedence`) configure `sh` and `bash` by name. Documented in the README, along
+with the unchanged default-shell divergence.
+
+### Tests I touched, and why
+
+- `wait-listing.test.ts`, "lists finished background tasks even when nothing is running": added
+  `await sleep(200)` after the `isAlive` wait. Genuine flake, seen once in a full parallel run — `isAlive`
+  calls a signalled child finished the moment it is a zombie, the extension's exit handler lands a moment
+  later, and `bg_wait` then legitimately reports "1 task(s) finished". The neighbouring test in the same
+  file already does exactly this, with a comment saying so. No assertion changed.
+- `lifecycle.test.ts`: the loads the previous two passes blamed for the surviving temp dirs now use
+  `vi.resetModules()` and their own `agentDir`, and the two-runtime test now really has two registries (its
+  `bg_stop` cleanup gained a `waitFor`, since the shared-registry version was only stopping `kept` as a side
+  effect of `quit`). That note is deleted from this file.
+- Out of the loop's package but the same leak: `pi-takeover/test/extension.test.ts` and
+  `handoff.test.ts` loaded an extension in `beforeAll` and never disposed it — those were 4 of the 6
+  surviving `/tmp/pi-ext-*` directories. Both now have `afterAll(() => ext?.dispose())`.
+  **A clean full run now leaves 0 `/tmp/pi-ext-*` directories and no stray processes.**
+
+New pins: `test/leftover-record.test.ts` (3), `test/stop-window.test.ts` (2),
+`test/settings-robustness.test.ts` (2). Marker sleeps used here: 155, 157, 159, 161.
+
+### For pass 3 — what to attack
+
+- **The two-window cap against `teardownTimeout: 10_000`.** A shutdown that genuinely needs both windows
+  can wait up to 12 s; in a test that is a teardown timeout. Measure rather than assume: how long does a
+  quit take when a task is running, its leader dies on SIGTERM and a member ignores SIGKILL for a while
+  (an unreadable/`D`-state member, or a group whose leader was `SIGSTOP`ped)? Nothing in the suite pays
+  both windows fully today.
+- **`stopLeftoverGroup`'s record unlink** happens only when `!processGroupExists(pid)`. A member that
+  cannot be killed (uninterruptible sleep) keeps the group "existing", so the record survives and is now
+  also protected from retention by the live-group rule. Is that the right trade, and can a run accumulate
+  protected records (one per stuck group) without bound?
+- **The ownership chain for inherited records**: the adopting runtime rewrites `ownerPid`, so a third
+  runtime sees a live owner and leaves it alone. Reload twice, then kill the middle runtime without a
+  shutdown: does the record still find someone, and does `isOwnedByAnotherSession`'s recycled-pid rule
+  (F7) interact badly with a record that is now expected to be inherited repeatedly?
+- **`shellPathExists` uses `process.env.PATH`, while commands get `<agent-dir>/bin` prepended** by
+  `buildEnv`. A `shellPath` naming a program that lives only in `<agent-dir>/bin` resolves for the child
+  and not for the check, so the tool would refuse every command. Also: the check is `F_OK`, so a directory
+  or an unreadable file passes and the failure is back to a spawn error (this is Pi's behaviour too).
+- **`finishedAt` / `exitCode` carried in a sidecar** are trusted numbers on adoption. A truncated or
+  hand-edited sidecar, or one written by an older version, decides what `bg_wait` reports; check the
+  bounds (`finishedAt` before `startedAt`, absurd runtimes) and that nothing arithmetic-dependent keys off
+  them.
+- Whether the finished-record should be listed by `bg_wait` when `meta.backgrounded` was true: it is, and
+  `wait-listing.test.ts` does not cover it. The README's "finished in the foreground, not in the table"
+  rule is what decides it.
+- Still open from pass 1, unchanged: retention driven by completions, `tightenPrivate` on another
+  runtime's files, the recycled-`ownerPid` heuristic, Pi's `/bin/bash` → `bash` → `sh` fallback (now
+  documented in the README rather than merely absent).
+
+Harness notes:
+
+- `hasLeftoverGroup` is the only thing that distinguishes "the leader died" from "the group is gone", and
+  it is two `kill(2)` calls; it is now called from `markDone`, `finishedResult`, `releaseJobRecord`,
+  `killJob`'s timer, `killAllJobs`, and `pruneRetention`. A test that wants a group to look gone has to
+  make it actually gone (the reap poll means "about to be gone" reads as existing for up to 1 s).
+- `killAllJobs` caps at two windows, so a test asserting a shutdown waited must say which window it means;
+  a finished task at entry has one, a running task with an immune member has two that overlap.
+- A test that asserts on files under `agentDir` needs its own `agentDir` per test in this file — the log
+  dir is shared across the handover test by design and nothing else.

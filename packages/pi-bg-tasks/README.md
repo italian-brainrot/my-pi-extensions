@@ -5,11 +5,11 @@ instead of failing them**, plus two tools for working with those background jobs
 
 ## What it adds
 
-| Tool                               | What it does                                                                                                                                                                                                                                   |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bash` (replaces the built-in one) | Runs a command. Adds `timeout` (seconds, default 60) and `blocking`. When the timeout expires the command keeps running in the background and the tool returns its task ID and log path. `timeout: 0` starts it in the background immediately. |
-| `bg_wait`                          | Wait for **any** running background task to finish (like `wait -n`), then list every background task of the session with its status, run time, output size, exit code, and log path. Default timeout 3600s.                                    |
-| `bg_stop`                          | Stop a background task by ID: SIGTERM to its whole process group, then SIGKILL after a 5s grace period. A process the task left running in that group is stopped too.                                                                          |
+| Tool                               | What it does                                                                                                                                                                                                                                    |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bash` (replaces the built-in one) | Runs a command. Adds `timeout` (seconds, default 60) and `blocking`. When the timeout expires the command keeps running in the background and the tool returns its task ID and log path. `timeout: 0` starts it in the background immediately.  |
+| `bg_wait`                          | Wait for **any** running background task to finish (like `wait -n`), then list every background task of the session with its status, run time, output size, exit code, and log path. Default timeout 3600s.                                     |
+| `bg_stop`                          | Stop a background task by ID: SIGTERM to its whole process group, then SIGKILL after a 5s grace period. A process the task left running in that group is stopped too, including one that ignores SIGTERM while the task's own shell dies on it. |
 
 ```text
 > build the project                       bash { command: "npm run build", timeout: 5 }
@@ -123,8 +123,10 @@ concurrent `bash` call goes unnoticed.
 - **What a stop reaches is the task's process group**: the shell plus every process it started. A
   command that forks a worker and lets the shell exit (`npm run dev &`, `foo &`, a forking dev server)
   finishes immediately, and the worker is still in the task's group — `bg_stop` and a real shutdown
-  reach it there. A process that deliberately starts its own session (`setsid`, `systemd-run`) leaves
-  the group and is not stopped.
+  reach it there. It is also what a stop reaches when the task is _running_ and its shell is the member
+  that dies first: the job is reported over when its shell exits, and a worker that ignores SIGTERM is
+  then escalated to SIGKILL in its own right. A process that deliberately starts its own session
+  (`setsid`, `systemd-run`) leaves the group and is not stopped.
 - A task that was deliberately backgrounded is not killed when the run is aborted later. Aborting a
   run stops the command that call was waiting on, and nothing else.
 
@@ -133,6 +135,11 @@ concurrent `bash` call goes unnoticed.
 Job state (pid, log path, and owning process) is written next to the log, so `/reload`, `/new`,
 `/resume`, and `/fork` re-adopt jobs that are still alive and `bg_stop` and `bg_wait` keep working
 afterwards.
+
+A task that finished but left processes running in its own process group keeps its sidecar too, for as
+long as that group exists: the group id is the dead shell's pid, and the sidecar is the only record of
+it. That is what lets the runtime taking the session over stop what the previous one started. Such a
+record is taken over as a finished task, never as a running one, and is dropped once the group is gone.
 
 | Setting                    | Default              | Effect                                                                                                                                                                  |
 | -------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -146,8 +153,9 @@ retention pass runs.
 A log is pruned once it is older than 3 days, or once it falls outside the newest 100 logs; its
 sidecar goes with it. A pass runs when a command ends and when a session starts — a session that runs
 for days without reloading does not wait for a reload to keep the directory inside the cap. The log and
-sidecar of a job this runtime is still running are never touched, and neither are the files another
-live session owns, so the directory can sit over the cap by as many files as there are jobs running.
+sidecar of a job this runtime is still running are never touched, neither are the files another live
+session owns, and neither is the record of a process group that is still waiting to be stopped, so the
+directory can sit over the cap by as many files as there are jobs running or groups left to stop.
 
 ### Commands belong to the session that started them
 
@@ -196,10 +204,22 @@ Resolution is `settings.shellPath`, project settings of the **Pi process** worki
 then the agent directory, otherwise `bash`. The choice is made once per runtime, so a settings
 change needs `/reload`. On Windows, stopping a task uses `taskkill /T /F`.
 
+A configured value is checked before anything is spawned. A value with no path separator is looked up on
+`PATH`; if it cannot be found at all, every command answers `Custom shell path not found: <value>`
+instead of running something that cannot start. Pi throws the same message; here it is a tool result,
+so the model sees the setting is broken rather than a command that exited 127.
+
 `settings.shellCommandPrefix` is prepended to every command exactly as the built-in tool prepends it,
 so aliases, shell functions and an environment set up by the prefix work here too. The two keys are
-resolved per scope, the way Pi merges its settings: a project that sets only one of them still gets
-the other from the agent settings.
+resolved per scope, the way Pi merges its settings: a project that sets only one of them still gets the
+other from the agent settings, and a key that is _present_ in the project file wins whatever it holds —
+`"shellCommandPrefix": ""` turns an agent-level prefix off, and `"shellPath": null` falls back to the
+default shell. A value that is neither a string nor null is not usable and falls through to the other
+scope.
+
+Pi resolves the default itself: `/bin/bash`, then `bash` on `PATH`, then `sh`, and it rejects a
+configured `shellPath` that is a bare name. This extension spawns `bash`. A machine with no `bash` gets
+a failure here and a working `sh` from Pi.
 
 ## Development
 
@@ -210,6 +230,7 @@ npx vitest --run packages/pi-bg-tasks
 ```
 
 The tests spawn real processes, so they cover timeout release, killing (including the process group a
-finished task leaves behind), the task listing and its counts, output surviving the handover to the
-background, re-adoption after a reload, log retention while a session runs, the modes on the log files,
-and the environment handed to commands. See [docs/testing.md](../../docs/testing.md).
+task leaves behind, and what one runtime hands to the next), the task listing and its counts, output
+surviving the handover to the background, re-adoption after a reload, log retention while a session runs,
+the modes on the log files, and the environment handed to commands. See
+[docs/testing.md](../../docs/testing.md).

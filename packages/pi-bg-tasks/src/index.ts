@@ -15,11 +15,13 @@
  *   - Background jobs are process-scoped, not session-scoped. Their pid and log
  *     path are recorded next to the log, so a reloaded session re-adopts jobs
  *     that are still alive and bg_stop / bg_wait keep working.
- *   - Jobs are killed on real shutdown (reason "quit"), and so is anything a finished job left
- *     running in its own process group. Set PI_BG_TASKS_KEEP_RUNNING=0 to also kill them on /new,
- *     /resume, /fork and /reload (the previous behaviour).
- *   - A stop signals the job's whole process group: the shell plus everything it started, including
- *     a worker the shell forked and left behind before it exited.
+ *   - Jobs are killed on real shutdown (reason "quit"), and so is anything a job left running in its
+ *     own process group. Set PI_BG_TASKS_KEEP_RUNNING=0 to also kill them on /new, /resume, /fork and
+ *     /reload (the previous behaviour).
+ *   - A stop signals the job's whole process group: the shell plus everything it started, including a
+ *     worker the shell forked and left behind before it exited, and including a worker that ignores
+ *     SIGTERM when the shell itself dies on it. A task's sidecar is kept while its group still has
+ *     processes, so the runtime that takes the session over can stop that group too.
  *   - Logs live in `<agentDir>/bg-tasks` — the directory is 0700 and every file in it 0600, because
  *     a log is command output and a sidecar is a whole command line. They are pruned by age and by
  *     count, both while a session runs and when one starts.
@@ -32,10 +34,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomInt } from "node:crypto";
 import {
+  accessSync,
   chmodSync,
   closeSync,
   existsSync,
   fchmodSync,
+  constants as fsConstants,
   mkdirSync,
   openSync,
   readdirSync,
@@ -80,6 +84,8 @@ const LOG_DIR_MODE = 0o700;
 const PRIVATE_MODE = 0o600;
 
 const DEFAULT_TIMEOUT_SEC = 60;
+/** The shell to spawn when `shellPath` is unset. */
+const DEFAULT_SHELL = "bash";
 /** Same upper bound the built-in bash tool uses (max setTimeout delay). */
 const MAX_TIMEOUT_SEC = Math.floor(2_147_483_647 / 1000);
 const DEFAULT_BG_WAIT_TIMEOUT_SEC = 3600;
@@ -96,6 +102,8 @@ const MAX_RETAINED_LOGS = 100;
 const RETENTION_THROTTLE_MS = 60_000;
 /** How often a leftover process group is checked for having gone away. */
 const GROUP_POLL_MS = 150;
+/** How long to wait for a SIGKILLed group to be reaped before deciding it is still there. */
+const GROUP_REAP_MS = 1000;
 
 /** Model-facing limits come from pi's own truncation helpers. */
 const PARTIAL_PREVIEW_BYTES = 4096;
@@ -283,17 +291,22 @@ function getDone(job: BgJob): Promise<void> {
   return job.donePromise;
 }
 
+/** What a finished job reports, shared by the exit handler and by re-adoption. */
+function finishedStatus(exitCode: number | null, signal: NodeJS.Signals | null, killRequested: boolean): BgStatus {
+  // An adopted job has no exit handle, so a kill we requested shows up as
+  // "exited" unless the kill request itself is what ended it.
+  if (signal || killRequested) return "killed";
+  if (exitCode === null) return "exited";
+  return exitCode === 0 ? "completed" : "failed";
+}
+
 function markDone(job: BgJob, exitCode: number | null, signal: NodeJS.Signals | null): void {
   if (job.status !== "running") return;
   job.finishedAt = Date.now();
   job.exitCode = exitCode;
   job.signal = signal;
-  // An adopted job has no exit handle, so a kill we requested shows up as
-  // "exited" unless the kill request itself is what ended it.
-  if (signal || job.killRequested) job.status = "killed";
-  else if (exitCode === null) job.status = "exited";
-  else job.status = exitCode === 0 ? "completed" : "failed";
-  unlinkQuietly(job.metaPath);
+  job.status = finishedStatus(exitCode, signal, job.killRequested === true);
+  releaseJobRecord(job);
   job.resolveDone?.();
   enforceRegistryCap();
   // Retention runs when a command ends, not only when a session starts: the log dir only grows when
@@ -312,6 +325,23 @@ function enforceRegistryCap(): void {
       if (jobs.size <= MAX_REGISTRY_SIZE) return;
     }
   }
+}
+
+/**
+ * What happens to a finished job's sidecar.
+ *
+ * Usually it goes at once: the log is the durable part, and the sidecar exists only so a reload can
+ * find a command that is still running. One case is different. A task that forked a worker and let its
+ * shell exit leaves that worker in the process group the shell led, and the group id is the dead
+ * shell's pid — the sidecar is the only record of it. A replacement runtime (`/reload`, or a new pi
+ * over the same agent dir) decides what it is responsible for by reading sidecars, so dropping this one
+ * would leave the worker nobody can point at: it is kept while the group still exists, and retention
+ * and the next adoption drop it as soon as the group is gone. A normal task, whose group went empty
+ * with its shell, still loses its sidecar immediately, so the common case creates no extra files.
+ */
+function releaseJobRecord(job: BgJob): void {
+  if (hasLeftoverGroup(job)) writeMeta(job);
+  else unlinkQuietly(job.metaPath);
 }
 
 function describeJob(job: BgJob, includeId = true): string {
@@ -338,32 +368,86 @@ interface ShellSettings {
   shell: string;
   /** Pi's `shellCommandPrefix`, empty when unset. */
   commandPrefix: string;
+  /** Set when `shellPath` is configured but cannot be run: the tool then refuses every command. */
+  missingShellPath?: string;
 }
 
-/** One settings key, project scope of the pi process cwd first, the way pi merges its scopes. */
-function configuredSetting(key: string): string | undefined {
+/**
+ * One settings key, resolved as the innermost scope that _mentions_ it: the project settings of the pi
+ * process working directory, then the agent dir.
+ *
+ * Pi reads both files and deep-merges them, and its merge keeps a project value whenever the key is
+ * present — `deepMergeObjects` skips only an `undefined` value — so a JSON `""` or `null` in a project
+ * file overrides whatever the agent scope holds. That is how a project switches an agent-level
+ * `shellCommandPrefix` or `shellPath` off, and resolving a key as "the first scope with a non-empty
+ * string" silently ignores the request. A value that is neither a string nor null cannot be handed to a
+ * shell, so it falls through to the next scope.
+ */
+function configuredSetting(key: string): string | null | undefined {
   for (const file of [join(process.cwd(), CONFIG_DIR_NAME, "settings.json"), join(getAgentDir(), "settings.json")]) {
+    let settings: Record<string, unknown>;
     try {
-      const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-      const value = settings[key];
-      if (typeof value === "string" && value.trim().length > 0) return value;
+      settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     } catch {
-      // Missing or unreadable settings are fine; the other file may answer.
+      // A missing, unreadable or malformed scope answers nothing; the other one may.
+      continue;
     }
+    if (!Object.hasOwn(settings, key)) continue;
+    const value = settings[key];
+    if (value === null || typeof value === "string") return value;
   }
   return undefined;
 }
 
+/** The string a setting holds, or "" for unset and for an explicit null. */
+function configuredString(key: string): string {
+  const value = configuredSetting(key);
+  return typeof value === "string" ? value : "";
+}
+
 function shellSettings(): ShellSettings {
-  cachedShellSettings ??= { shell: configuredShell(), commandPrefix: configuredSetting("shellCommandPrefix") ?? "" };
+  cachedShellSettings ??= resolveShellSettings();
   return cachedShellSettings;
 }
 
-/** `shellPath` with a leading `~` expanded, the way pi normalizes it; `bash` when unset. */
-function configuredShell(): string {
-  const configured = (configuredSetting("shellPath") ?? "").trim();
-  if (!configured) return "bash";
-  return configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured;
+function resolveShellSettings(): ShellSettings {
+  const commandPrefix = configuredString("shellCommandPrefix");
+  // An explicit null or "" leaves shellPath unset, and unset means the default shell: `bash` here. How
+  // the default is found differs from Pi and the README says so.
+  const configured = configuredString("shellPath").trim();
+  // A leading `~`, the way pi normalizes it.
+  const shell = configured ? (configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured) : DEFAULT_SHELL;
+  // A configured shell that cannot be found is a broken setting, and Pi's `getShellConfig` refuses it by
+  // name rather than letting every command fail as if the command were at fault.
+  if (configured && !shellPathExists(shell)) return { shell, commandPrefix, missingShellPath: shell };
+  return { shell, commandPrefix };
+}
+
+/**
+ * Whether a configured shell can be run.
+ *
+ * Pi checks a configured path with `access(path, F_OK)` and throws otherwise, which also rejects a bare
+ * name, because that check is relative to the working directory. A name with no separator is looked up
+ * on PATH here, since `shellPath: "sh"` is a thing people write and means the shell on PATH. The answer
+ * is cached with the rest of the shell settings, so this costs one scan per runtime.
+ */
+function shellPathExists(candidate: string): boolean {
+  if (candidate.includes("/") || candidate.includes("\\")) return isAccessible(candidate);
+  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+  for (const dir of (process.env[pathKey] ?? "").split(delimiter)) {
+    if (dir && isAccessible(join(dir, candidate))) return true;
+  }
+  return false;
+}
+
+/** Pi's own existence check: `access(path, F_OK)`, spelled with try/catch. */
+function isAccessible(path: string): boolean {
+  try {
+    accessSync(path, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function resolveShell(): string {
@@ -429,6 +513,13 @@ function writeMeta(job: BgJob): void {
           // session that started it: see isOwnedByAnotherSession().
           ownerPid: process.pid,
           backgrounded: job.backgrounded,
+          // How the job ended, which is only worth anything for the sidecar of a job that ended while
+          // its process group survived. A runtime that takes the record over reports the task as it was
+          // instead of guessing, and can tell it apart from a task that is still running.
+          status: job.status,
+          exitCode: job.exitCode,
+          signal: job.signal,
+          finishedAt: job.finishedAt,
         }),
         "utf8",
       );
@@ -450,6 +541,10 @@ interface JobMeta {
   logPath?: unknown;
   ownerPid?: unknown;
   backgrounded?: unknown;
+  status?: unknown;
+  exitCode?: unknown;
+  signal?: unknown;
+  finishedAt?: unknown;
 }
 
 /** Parse a sidecar; undefined when it cannot be read or is not valid JSON. */
@@ -617,8 +712,13 @@ function killJob(job: BgJob): void {
 
   // Unref'd on purpose: whoever asked for this kill awaits it with a timer of their own that holds
   // the event loop, so the escalation must not be the last thing keeping the process alive.
+  //
+  // The job's own status is not enough to decide this: it is the status of the leader, and the leader is
+  // one member of the group it leads. A task whose shell dies on SIGTERM while a worker it started
+  // ignores SIGTERM is "killed" a moment later and the worker is still there, so the group gets the
+  // escalation on its own account.
   setTimeout(() => {
-    if (job.status === "running") signalJobTree(pid, "SIGKILL");
+    if (job.status === "running" || hasLeftoverGroup(job)) signalJobTree(pid, "SIGKILL");
   }, SIGTERM_GRACE_MS).unref?.();
 }
 
@@ -644,13 +744,14 @@ function signalJobTree(pid: number, sig: NodeJS.Signals): void {
 }
 
 /**
- * Stop what a finished task left running in its own process group.
+ * Stop what a task's process group still holds once its leader is gone.
  *
  * A spawned shell leads a process group, so everything it starts — including a worker it forks and
  * leaves behind (`npm run dev &`, a forking dev server, `foo &`) — stays in that group after the
  * shell exits and the task is reported as completed. Nothing else holds a handle on those processes:
  * the only way to reach them is the group id, which is the shell's pid, and a task that "finished"
- * is otherwise free to outlive the stop request, the session and the runtime.
+ * is otherwise free to outlive the stop request, the session and the runtime. The same is true a
+ * hundred milliseconds into a stop of a *running* task, when its shell is the member that died first.
  *
  * A finished pid can be given to an unrelated process, and `kill(-pid)` would then hit whatever group
  * that process leads, so the group is only signalled while nothing is living at the pid at all. If
@@ -674,8 +775,36 @@ async function stopLeftoverGroup(job: BgJob): Promise<boolean> {
     } catch {
       // The group went away between the check and the signal.
     }
+    // A SIGKILLed process is out of the group once its parent reaps it, and these ones were orphaned, so
+    // init does that. Give it a moment: whether the group is gone decides whether the record is still
+    // needed, and a caller that waits for a stop wants to wait for the last signal it asked for.
+    const reaped = Date.now() + GROUP_REAP_MS;
+    while (processGroupExists(pid) && Date.now() < reaped) await unrefDelay(GROUP_POLL_MS);
   }
+
+  // The record existed to name this group. With the group stopped, it is garbage: keeping it would make a
+  // finished task look stoppable, or adoptable, forever.
+  if (!processGroupExists(pid)) unlinkQuietly(job.metaPath);
   return true;
+}
+
+/**
+ * Stop one job and whatever its group still holds; says whether a group had to be stopped.
+ *
+ * Two windows, not one. The first is the leader's SIGTERM grace, and it is what every wait for the job
+ * resolves on. The second belongs to the group on its own account: a leader that dies on the first
+ * SIGTERM ends the job while a member that ignores SIGTERM is still running in the group the leader led.
+ * `killJob`'s escalation usually kills that group while the first window is still open, so the second is
+ * only waited out when something is genuinely refusing to die.
+ */
+async function stopJobAndWait(job: BgJob): Promise<boolean> {
+  if (job.status === "running") {
+    killJob(job);
+    const grace = sleep(SIGTERM_GRACE_MS + 1000);
+    await Promise.race([getDone(job), grace.promise]);
+    grace.cancel();
+  }
+  return stopLeftoverGroup(job);
 }
 
 /** Whether a finished job left processes behind in the group its shell led. */
@@ -802,14 +931,23 @@ function pruneRetention(): void {
   const now = Date.now();
   const logs: { name: string; id: string; mtimeMs: number }[] = [];
 
-  // Jobs another live pi session owns are off-limits to us, however old their files look.
-  const foreignIds = new Set<string>();
+  // Two classes of sidecar are off-limits to a prune. Jobs another live pi session owns, however old
+  // their files look; and a record whose leader is gone but whose process group is not, which is not
+  // stale — it is the only handle left on processes this runtime, or the one before it, still has to
+  // stop. Both are protected until the process or the group is gone, and then go by the age and count
+  // rules like any other file.
+  const protectedIds = new Set<string>();
   for (const name of names) {
     if (!name.endsWith(META_SUFFIX)) continue;
     const id = name.slice(0, -META_SUFFIX.length);
-    if (id.startsWith("bg-") && isOwnedByAnotherSession(readMeta(join(LOG_DIR, name)))) {
-      foreignIds.add(id);
+    if (!id.startsWith("bg-")) continue;
+    const meta = readMeta(join(LOG_DIR, name));
+    if (isOwnedByAnotherSession(meta)) {
+      protectedIds.add(id);
+      continue;
     }
+    const pid = typeof meta?.pid === "number" ? meta.pid : Number.NaN;
+    if (Number.isFinite(pid) && !processAt(pid) && processGroupExists(pid)) protectedIds.add(id);
   }
 
   for (const name of names) {
@@ -830,9 +968,9 @@ function pruneRetention(): void {
     tightenPrivate(path);
 
     // Never touch files that belong to a job this runtime is still tracking, or to one another
-    // session is still running.
+    // session is still running, or to a task whose group is still waiting to be stopped.
     const tracked = jobs.get(id);
-    if (tracked?.status === "running" || foreignIds.has(id)) continue;
+    if (tracked?.status === "running" || protectedIds.has(id)) continue;
 
     if (now - stat.mtimeMs > RETENTION_MS) {
       unlinkQuietly(path);
@@ -874,6 +1012,11 @@ function startAdoptedPoller(): void {
 /**
  * Take over the jobs left behind by a previous runtime, then prune.
  *
+ * Two kinds of record are taken over. A command whose process is still alive becomes a running task of
+ * this session. A task whose shell is gone but whose process group is not becomes a finished task whose
+ * group this runtime now has to stop: its sidecar was kept for exactly that, and without the record the
+ * worker a daemonised task forked would be nobody's after a reload.
+ *
  * The order is the point. At session_start this runtime's registry is still empty, so a prune that
  * ran first would see a long-quiet command's files as belonging to nothing and sweep its sidecar;
  * adoption then finds nothing to adopt, and the command this session has just become responsible for
@@ -912,30 +1055,57 @@ function adoptJobs(): void {
     if (isOwnedByAnotherSession(meta)) continue;
 
     const pid = typeof meta.pid === "number" ? meta.pid : Number.NaN;
-    if (!Number.isFinite(pid) || !isAlive(pid)) {
-      unlinkQuietly(metaPath);
-      continue;
-    }
-
-    const job: BgJob = {
+    const logPath = typeof meta.logPath === "string" ? meta.logPath : logPathFor(id);
+    const jobFields = {
       id,
       command: typeof meta.command === "string" ? meta.command : "(command unknown)",
       cwd: typeof meta.cwd === "string" ? meta.cwd : process.cwd(),
       pid,
-      logPath: typeof meta.logPath === "string" ? meta.logPath : logPathFor(id),
+      logPath,
       metaPath,
       startedAt: typeof meta.startedAt === "number" ? meta.startedAt : Date.now(),
-      status: "running",
-      exitCode: null,
-      signal: null,
       adopted: true,
-      // Nothing is awaiting an adopted job, so by definition it is a background task.
-      backgrounded: true,
     };
-    jobs.set(id, job);
-    getDone(job);
-    // Claim the sidecar, so a later reload of this process finds the job again.
-    writeMeta(job);
+
+    if (Number.isFinite(pid) && isAlive(pid)) {
+      const job: BgJob = {
+        ...jobFields,
+        status: "running",
+        exitCode: null,
+        signal: null,
+        // Nothing is awaiting an adopted job, so by definition it is a background task.
+        backgrounded: true,
+      };
+      jobs.set(id, job);
+      getDone(job);
+      // Claim the sidecar, so a later reload of this process finds the job again.
+      writeMeta(job);
+      continue;
+    }
+
+    // The leader is gone, but the processes it left in its own process group are not, and this sidecar is
+    // the only record of the group id. Adopt the record without adopting a task: the task is over, and
+    // what is inherited is the obligation to stop the group, which `killAllJobs` and `bg_stop` then do
+    // with the same leftover-group code as for their own finished jobs. It is not reported as running, and
+    // the record goes away as soon as the group does — by a stop, by a retention pass, or here.
+    if (Number.isFinite(pid) && processGroupExists(pid) && !processAt(pid)) {
+      const exitCode = typeof meta.exitCode === "number" ? meta.exitCode : null;
+      const signal = typeof meta.signal === "string" ? (meta.signal as NodeJS.Signals) : null;
+      const job: BgJob = {
+        ...jobFields,
+        status: finishedStatus(exitCode, signal, false),
+        exitCode,
+        signal,
+        finishedAt: typeof meta.finishedAt === "number" ? meta.finishedAt : undefined,
+        backgrounded: meta.backgrounded === true,
+      };
+      jobs.set(id, job);
+      // Claim it: with the previous runtime gone, this one is the only one that will stop the group.
+      writeMeta(job);
+      continue;
+    }
+
+    unlinkQuietly(metaPath);
   }
 
   enforceRegistryCap();
@@ -1343,7 +1513,9 @@ function finishedResult(job: BgJob, aborted: boolean): BgResult {
   const kept = Boolean(fullOutputPath);
   if (!kept) {
     unlinkQuietly(job.logPath);
-    unlinkQuietly(job.metaPath);
+    // The sidecar is the record of a live command, except for a task whose process group is still there
+    // to be stopped: that record has to outlive this runtime.
+    releaseJobRecord(job);
   }
 
   const full = kept ? readStructuredOutput(job.logPath) : { content: text, truncated: false };
@@ -1407,6 +1579,11 @@ async function runWithTimeout(
         : `timed out after ${timeoutSec}s and moved to background`;
       return backgroundResult(job, reason);
     }
+
+    // The leader's death ends the run, but a kill that was asked for is not over: if the leader died on
+    // the SIGTERM while something it started in the same process group ignores it, that is still the
+    // abort's to stop.
+    if (job.killRequested) await stopLeftoverGroup(job);
 
     return finishedResult(job, signal?.aborted === true);
   } finally {
@@ -1559,6 +1736,15 @@ function registerBashOverride(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: missing }], details: {}, isError: true };
       }
 
+      // Same for the shell itself: Pi's `getShellConfig` refuses a configured path it cannot find, naming
+      // it. Left to `spawn`, a broken `shellPath` arrives as a command that exited 127, which reads like a
+      // problem with the command, and every command the session runs would report that.
+      const missingShell = shellSettings().missingShellPath;
+      if (missingShell) {
+        const note = `Custom shell path not found: ${missingShell}\nCannot execute bash commands.`;
+        return { content: [{ type: "text", text: note }], details: {}, isError: true };
+      }
+
       if (resolvedTimeout === 0) return spawnBackground(command, cwd, ctx);
       return runWithTimeout(command, cwd, resolvedTimeout, signal, onUpdate, ctx);
     };
@@ -1590,7 +1776,8 @@ function registerBgStop(pi: ExtensionAPI): void {
     name: "bg_stop",
     label: "Background Task Stop",
     description:
-      "Stop a running background task: SIGTERM, then SIGKILL after a 5s grace window if it refuses to exit. Returns the final status.",
+      "Stop a background task: SIGTERM to its whole process group, then SIGKILL after a 5s grace window if it refuses " +
+      "to exit. Anything the task left running in that group is stopped too. Returns the final status.",
     parameters: Type.Object({
       task_id: Type.String({ description: "Task ID (from bash timeout or background spawn)" }),
       reason: Type.Optional(Type.String({ description: "Why the task is being stopped" })),
@@ -1619,7 +1806,7 @@ function registerBgStop(pi: ExtensionAPI): void {
               type: "text",
               text:
                 `Task ${job.id} is already ${describeJob(job, false)}.${reason ? ` Stop reason: ${reason}` : ""}` +
-                (stoppedGroup ? `\nProcesses it left in its process group (pgid ${job.pid}) were stopped too.` : "") +
+                groupNote(job, stoppedGroup) +
                 (logExists ? `\nLog: ${job.logPath}` : ""),
             },
           ],
@@ -1627,22 +1814,29 @@ function registerBgStop(pi: ExtensionAPI): void {
         };
       }
 
-      killJob(job);
-      const grace = sleep(SIGTERM_GRACE_MS + 1000);
-      await Promise.race([getDone(job), grace.promise]);
-      grace.cancel();
+      // The wait is over when the leader is reaped, but the stop is not: a leader that dies on the first
+      // SIGTERM while a worker it started ignores it leaves that worker in the group the leader led.
+      const stoppedGroup = await stopJobAndWait(job);
 
       return {
         content: [
           {
             type: "text",
-            text: `Task ${job.id} ${job.status === "running" ? "is still shutting down" : `stopped (${job.status})`}.\nLog: ${job.logPath}`,
+            text:
+              `Task ${job.id} ${job.status === "running" ? "is still shutting down" : `stopped (${job.status})`}.` +
+              groupNote(job, stoppedGroup) +
+              `\nLog: ${job.logPath}`,
           },
         ],
         details: { id: job.id, status: job.status, exitCode: job.exitCode, logPath: job.logPath },
       };
     },
   });
+}
+
+/** What a stop did to the processes a task left behind in its own process group. */
+function groupNote(job: BgJob, stoppedGroup: boolean): string {
+  return stoppedGroup ? `\nProcesses the task left in its process group (pgid ${job.pid}) were stopped too.` : "";
 }
 
 // ── bg_wait tool ─────────────────────────────────────────────────────────────
@@ -1781,21 +1975,21 @@ function withBlockingLock<T>(run: () => Promise<T>): Promise<T> {
 // ── Session lifecycle ────────────────────────────────────────────────────────
 
 async function killAllJobs(): Promise<void> {
-  const all = [...jobs.values()];
-  const running = all.filter((job) => job.status === "running");
-  // A task that finished while leaving processes in its own process group is not running, but this
-  // runtime started those processes, and no other session is going to stop them.
-  const leftovers = all.filter(hasLeftoverGroup);
-  if (running.length === 0 && leftovers.length === 0) return;
+  // Everything this runtime started that may still hold processes: a leader that is running, or a task
+  // that finished while leaving a worker in its own process group. The second class is not running, but
+  // this runtime started those processes — or inherited the record for them — and no other session is
+  // going to stop them.
+  const targets = [...jobs.values()].filter((job) => job.status === "running" || hasLeftoverGroup(job));
+  if (targets.length === 0) return;
 
-  for (const job of running) killJob(job);
-
-  const grace = sleep(SIGTERM_GRACE_MS + 1000);
+  // Every stop starts before any of them is awaited, so all the leaders are signalled up front and their
+  // grace windows overlap. The cap is two windows, because a stop can need both: the leaders' SIGTERM
+  // grace, then the group of a leader that died while a member of its group ignored the signal. killJob's
+  // escalation usually kills that group inside the first window, so the second is only waited out when
+  // something is genuinely refusing to die.
+  const grace = sleep(2 * (SIGTERM_GRACE_MS + 1000));
   try {
-    await Promise.race([
-      Promise.all([...running.map((job) => getDone(job)), ...leftovers.map((job) => stopLeftoverGroup(job))]),
-      grace.promise,
-    ]);
+    await Promise.race([Promise.all(targets.map((job) => stopJobAndWait(job))), grace.promise]);
   } finally {
     grace.cancel();
   }

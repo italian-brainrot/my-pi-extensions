@@ -182,6 +182,9 @@ describe("bg_wait task listing", () => {
   it("lists finished background tasks even when nothing is running", async () => {
     const job = await startBackground("echo done-at-last");
     await waitFor(() => !isAlive(job.pid), "the command to finish");
+    // Let the exit event land, so this wait has nothing left to see finish. `isAlive` calls a signalled
+    // child finished as soon as it is a zombie; the extension learns the exit code a moment later.
+    await sleep(200);
 
     const wait = await runtime().callTool("bg_wait", { timeout: 1 });
     expect(text(wait)).toContain("No background tasks are running.");

@@ -137,7 +137,15 @@ per-component costs, and that context size is the largest single response rather
   the harness or cover that part in a real `pi` session with `npm run dev`.
 - **Kill timers are cancelled, but a kill still takes a moment.** `pi-bg-tasks` cancels the timer of
   every wait that returns early and unrefs the SIGTERM→SIGKILL escalation timer, so a finished tool
-  call never holds the process open. A worker can still sit until a killed command actually exits.
+  call never holds the process open. A worker can still sit until a killed command actually exits. A
+  stop has two grace windows when the task's shell dies while something in its process group ignores
+  SIGTERM, so a shutdown assertion on that shape budgets for two, and a test that asserts a stop is
+  _fast_ must use a task whose whole group dies on the first signal.
+- **Marker sleeps must be unique across test files.** A `pi-bg-tasks` test that wants to see the
+  processes a task left behind scans `/proc` for a distinctive command line (`^sleep 143$`), because a
+  finished task's result carries neither pid nor group id. The scan is process-global and Vitest runs
+  files in parallel forks, so a marker reused in another file makes two tests see each other's
+  processes. Pick the next free number.
 - **Behaviour that lives per runtime needs a second process.** A cross-session bug — one pi process
   reaching into another's state — cannot be reproduced inside one runtime, because each load has its
   own module registry. Spawn a fixture that loads the same entry in its own process:

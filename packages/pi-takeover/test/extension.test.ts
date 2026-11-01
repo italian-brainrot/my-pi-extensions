@@ -6,7 +6,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { type LoadedExtension, loadExtension, packageDir } from "../../../test/helpers/extension.ts";
 
 const HANDOFF = "Review the diff and report what is still blocking.";
@@ -16,6 +16,9 @@ let ext: LoadedExtension;
 beforeAll(async () => {
   ext = await loadExtension({ packageDir: packageDir("pi-takeover") });
 });
+
+// The load made an agent dir and a working dir; nothing else removes them.
+afterAll(() => ext?.dispose());
 
 afterEach(async () => {
   // Every test starts clean: the extension's own cancel clears what it holds in memory as well as on

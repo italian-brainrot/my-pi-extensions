@@ -39,14 +39,19 @@ function logNames(agentDir: string): string[] {
 
 describe("reload and re-adoption", () => {
   it("re-adopts live jobs so bg_stop still reaches them after a reload", async () => {
-    const first = await loadExtension({ packageDir: packageDir("pi-bg-tasks") });
+    // Every load in this file gets `vi.resetModules()` and its own agent dir: a load that reuses an
+    // earlier load's module writes into _that_ load's agent dir, which the earlier test has already
+    // deleted, so the extension recreates a directory nobody is going to remove again.
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const first = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
     const job = await startBackground(first, "sleep 120");
-    const metaPath = join(first.agentDir, "bg-tasks", `${job.id}.json`);
+    const metaPath = join(agentDir.path, "bg-tasks", `${job.id}.json`);
     expect(existsSync(metaPath)).toBe(true);
 
     // A reload drops module state but keeps the agent dir, which is what re-adoption depends on.
     vi.resetModules();
-    const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: first.agentDir });
+    const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
     await second.emit({ type: "session_start", reason: "reload" });
 
     // Adoption claims the sidecar, so the job is now owned by this runtime and the next reload
@@ -61,6 +66,7 @@ describe("reload and re-adoption", () => {
     await second.emit({ type: "session_shutdown", reason: "quit" });
     second.dispose();
     first.dispose();
+    agentDir.dispose();
   });
 
   it("drops sidecars whose process is gone", async () => {
@@ -92,28 +98,44 @@ describe("reload and re-adoption", () => {
   });
 
   it("stops jobs on quit, and keeps them across a session replacement by default", async () => {
-    const replacement = await loadExtension({ packageDir: packageDir("pi-bg-tasks") });
+    // Two runtimes, so two module instances and two agent dirs: one registry shared between them would
+    // make the quit shutdown stop the first runtime's job, which is not what this asserts.
+    const keptDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const replacement = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: keptDir.path });
     const kept = await startBackground(replacement, "sleep 120");
     await replacement.emit({ type: "session_shutdown", reason: "new" });
     expect(isAlive(kept.pid)).toBe(true);
 
-    const quit = await loadExtension({ packageDir: packageDir("pi-bg-tasks") });
+    const quitDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const quit = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: quitDir.path });
     const killed = await startBackground(quit, "sleep 120");
     await quit.emit({ type: "session_shutdown", reason: "quit" });
     await waitFor(() => !isAlive(killed.pid), "quit shutdown to stop the process");
 
     await replacement.callTool("bg_stop", { task_id: kept.id, reason: "test cleanup" });
+    await waitFor(() => !isAlive(kept.pid), "the kept job to be stopped before the test ends");
     replacement.dispose();
     quit.dispose();
+    keptDir.dispose();
+    quitDir.dispose();
   });
 
   it("stops everything on session replacement when PI_BG_TASKS_KEEP_RUNNING=0", async () => {
-    const ext = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), env: { PI_BG_TASKS_KEEP_RUNNING: "0" } });
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const ext = await loadExtension({
+      packageDir: packageDir("pi-bg-tasks"),
+      agentDir: agentDir.path,
+      env: { PI_BG_TASKS_KEEP_RUNNING: "0" },
+    });
     const job = await startBackground(ext, "sleep 120");
 
     await ext.emit({ type: "session_shutdown", reason: "new" });
     await waitFor(() => !isAlive(job.pid), "the process to be stopped");
     ext.dispose();
+    agentDir.dispose();
   });
 });
 
@@ -169,7 +191,9 @@ describe("log retention", () => {
   });
 
   it("never deletes the log of a job this runtime is still tracking", async () => {
-    const ext = await loadExtension({ packageDir: packageDir("pi-bg-tasks") });
+    const agentDir = makeTempDir("pi-ext-agent-");
+    vi.resetModules();
+    const ext = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: agentDir.path });
     const job = await startBackground(ext, "sleep 120");
     backdate(job.logPath, 4 * DAY_MS);
     expect(statSync(job.logPath).isFile()).toBe(true);
@@ -180,6 +204,7 @@ describe("log retention", () => {
     await ext.callTool("bg_stop", { task_id: job.id, reason: "test cleanup" });
     await ext.emit({ type: "session_shutdown", reason: "quit" });
     ext.dispose();
+    agentDir.dispose();
   });
 
   it("re-adopts a live command whose files have gone past the retention age", async () => {
