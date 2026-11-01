@@ -1,7 +1,7 @@
 /**
  * Skills are installed as user skills rather than shipped in the Pi package, so they have to satisfy
  * Pi's own Agent Skills loader and their helper scripts have to stay runnable. None of this needs the
- * network or an Obscura binary: the scripts are only checked for syntax, usage output, and the error
+ * network or binaries: the scripts are only checked for syntax, usage output, and the error
  * path when no binary can be found.
  */
 
@@ -76,23 +76,6 @@ describe.each(scriptPaths().map((path) => ({ path })))("skill script $path", ({ 
   });
 });
 
-// Only the Obscura-backed skill has an external binary to go missing; every other skill's scripts are
-// plain shell over the repo, so they get only the checks above.
-describe.each(["browse.mjs", "web.sh"].map((name) => ({ name, path: join(skillsDir, "web-browsing", "scripts", name) })))(
-  "web-browsing script $name",
-  ({ path }) => {
-    it("fails loudly when the Obscura binary is missing", () => {
-      expect(existsSync(path), `${path} should exist`).toBe(true);
-      const result = spawnSync(path, ["doctor", "--port", "40002"], {
-        encoding: "utf8",
-        env: { ...process.env, OBSCURA_BIN: join(skillsDir, "definitely-not-a-binary") },
-      });
-      expect(result.status).not.toBe(0);
-      expect(`${result.stdout}${result.stderr}`).toMatch(/OBSCURA_BIN/);
-    });
-  },
-);
-
 describe("install-skills.mjs keeps the installed copy honest", () => {
   const script = resolve(repoRoot, "scripts", "install-skills.mjs");
 
@@ -135,25 +118,6 @@ describe("install-skills.mjs keeps the installed copy honest", () => {
       expect(result.status).toBe(1);
       expect(`${result.stdout}${result.stderr}`).toContain("not managed by this script");
       expect(readFileSync(join(installed, skill, "SKILL.md"), "utf8")).toBe("# not mine\n");
-    } finally {
-      temp.dispose();
-    }
-  });
-});
-
-describe("browse.mjs lifecycle without a server", () => {
-  it("reports not running instead of starting one", () => {
-    const temp = makeTempDir("pi-skill-");
-    const script = resolve(skillsDir, "web-browsing", "scripts", "browse.mjs");
-    try {
-      const result = spawnSync(script, ["status", "--port", "40001"], {
-        encoding: "utf8",
-        env: { ...process.env, WEB_CACHE_DIR: temp.path },
-      });
-      expect(result.stdout).toContain("not running");
-      expect(result.status).toBe(1);
-      // status must not have left a pid file behind, and no server should be listening.
-      expect(existsSync(join(temp.path, "cdp", "40001", "pid"))).toBe(false);
     } finally {
       temp.dispose();
     }

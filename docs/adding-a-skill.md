@@ -24,7 +24,7 @@ skills/<name>/
 - `test/skills.test.ts` loads `skills/` through Pi's own skill loader (a malformed skill fails the
   build) and checks that every script is executable, parses, and prints a usage block naming itself.
   A script that needs an external binary gets an extra check that it fails loudly when that binary is
-  missing (`web-browsing` has two). A script with logic of its own gets real tests — `loop.sh` in
+  missing. A script with logic of its own gets real tests — `loop.sh` in
   `audit-loop` has five against a throwaway git repo. Extend the file when a skill gains a script.
 
 ## Shipping and checking it

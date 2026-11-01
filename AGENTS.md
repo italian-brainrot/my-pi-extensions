@@ -33,7 +33,7 @@ Kills current session and starts a new one. Can be used for autonomous implement
 
 ### Skills
 
-Two skills - `web-browsing` and `audit-loop`.
+One skill - `audit-loop`.
 
 Skills are also saved to `/home/qq/distrobox/ubuntu/.agents/skills` so that they are available globally.
 
