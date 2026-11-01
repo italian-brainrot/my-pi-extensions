@@ -31,10 +31,16 @@ Injects MEMORY.md into system message after AGENTS.md. The workflow is - I manua
 
 Kills current session and starts a new one. Can be used for autonomous implement - review loop without concurrent conversations.
 
+### Skills
+
+Two skills - `web-browsing` and `audit-loop`.
+
+Skills are also saved to `/home/qq/distrobox/ubuntu/.agents/skills` so that they are available globally.
+
 ## Pi docs
 
-- Main documentation: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/README.md
-- Additional docs: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/docs
-- Examples: /home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/examples (extensions, custom tools, SDK)
+- Main documentation: `/home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/README.md`
+- Additional docs: `/home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/docs`
+- Examples: `/home/qq/distrobox/ubuntu/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/examples` (extensions, custom tools, SDK)
 
 Note that exact path might change with updates.
