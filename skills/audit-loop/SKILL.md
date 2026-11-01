@@ -2,7 +2,7 @@
 
 name: audit-loop
 description: An adversarial tester↔fixer audit loop over a repo. Trigger when user says "audit loop".
-compatibility: `takeover` tool available for session handoff; a repo with a runnable test gate.
+compatibility: takeover tool available for session handoff; a repo with a runnable test gate.
 ---
 
 # Audit loop (tester ↔ fixer, one session per pass)
