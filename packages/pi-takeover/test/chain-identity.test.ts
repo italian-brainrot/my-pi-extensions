@@ -9,10 +9,16 @@
  * clean cap. For a *different* conversation it is wrong in the same way F4 was: the tool refuses it for
  * takeovers it never made, and the README says "a session that did not arrive by takeover starts a new one".
  *
- * The two tests below are a pair, and a fix has to keep both. The first is the over-refusal. The second is
+ * The first two tests below are a pair, and a fix has to keep both. The first is the over-refusal. The second is
  * the reason the second half of the rule cannot just be "reset whenever there is no lineage": a session can
  * lose its takeover entry — a branch trimmed by `/tree` or a fork — and then its own chain is exactly what
  * must survive, or the cap can be walked through by trimming the branch and coming back.
+ *
+ * What answers both: `chain.json` names the conversation it belongs to. That field is written at every apply
+ * and re-written by the session a handoff landed in (a takeover's own replacement reaches `session_start`
+ * already holding the entry, before its file could be named as the owner), and a session that is not the one
+ * named starts a chain of its own whatever event brought it. The tests after the pair pin that rule from the
+ * inside: the field itself, the hop that hands the chain over, and each reason a session can arrive for.
  */
 
 import { readFileSync } from "node:fs";
@@ -141,4 +147,59 @@ describe("the conversation a chain belongs to", () => {
     expect(result.isError, "a trimmed branch reset the chain this session is standing in").toBe(true);
     expect(text(result)).toContain(`cap is ${CAP}`);
   });
+
+  it.each(["resume", "reload", "fork"] as const)("keeps the chain across a %s of the session the chain is standing in", async (reason) => {
+    // The rule cannot care which event brought a session back, only whether it is the one the chain is
+    // standing in — otherwise every reason that is not `startup` or `new` is a hole a spent chain falls
+    // through, and every reason that is one is a way to zero someone else's count.
+    await walkTheChain();
+    expect(chain().count).toBe(CAP);
+
+    await ext!.emit({ type: "session_start", reason }, ext!.makeContext(context(INCOMING)));
+
+    const result = await ext!.callTool("takeover", { prompt: HANDOFF }, { context: context(INCOMING) });
+    expect(result.isError, `a ${reason} of the owning session started a fresh chain`).toBe(true);
+    expect(text(result)).toContain(`cap is ${CAP}`);
+  });
+
+  it("names the conversation the chain belongs to", async () => {
+    // What makes the two rules above answerable at all: the counter has to say who it is standing in. A
+    // test that cannot see that field cannot tell "the count survived" from "the count was reset and this
+    // session's own lineage happened to cover for it".
+    await walkTheChain();
+
+    expect(chain().owner).toBe(`file:${INCOMING}`);
+    expect(chain().count).toBe(CAP);
+  });
+
+  it("hands the chain to the session a takeover created, before that session ever asks", async () => {
+    // A real hop, not a walk: the replacement reaches `session_start` with the entry the outgoing session
+    // wrote, and the file still names the outgoing session as its owner. If that is read as "someone
+    // else's chain", every hop of a chain starts a fresh cap and the brake is gone.
+    await walkTheChain();
+    const handed = chain();
+    expect(handed.owner).toBe(`file:${INCOMING}`);
+
+    const arrived = ext!.makeContext(context(INCOMING, [takeoverEntry(handed)]));
+    await ext!.emit({ type: "session_start", reason: "new", previousSessionFile: OUTGOING }, arrived);
+
+    expect(chain().owner, "the incoming session was treated as a stranger to its own chain").toBe(`file:${INCOMING}`);
+    expect(chain().count, "the incoming session's chain was reset under it").toBe(CAP);
+
+    const result = await ext!.callTool("takeover", { prompt: HANDOFF }, { context: context(INCOMING, [takeoverEntry(handed)]) });
+    expect(result.isError, "a session that arrived at the cap was handed a fresh chain").toBe(true);
+    expect(text(result)).toContain(`cap is ${CAP}`);
+  });
 });
+
+/** The lineage entry a takeover writes into the session it creates. */
+function takeoverEntry(chain: { id: string; count: number }): Record<string, unknown> {
+  return {
+    type: "custom",
+    id: "t1",
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    customType: "takeover",
+    data: { handoffId: "h", chainId: chain.id, position: chain.count, maxChain: CAP, prompt: HANDOFF },
+  };
+}

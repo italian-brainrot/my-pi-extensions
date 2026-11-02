@@ -77,12 +77,16 @@ session restores the session's own last choice, not the one the chain started wi
 ## Guard rails
 
 A takeover chain is a counting of consecutive handoffs, in `<agent-dir>/takeover/chain.json`. A chain is
-one run: a session that did not arrive by takeover starts a new one, so a loop is never refused for takeovers
-some earlier process already spent.
+one conversation's run, and the file says which conversation that is: the session a chain is standing in
+keeps its count across a `/resume`, a `/reload`, or a branch trimmed below its takeover entry, and any
+other session that starts — including one reached by `/resume` or rpc `switch_session` — begins a chain of
+its own. A loop is therefore never refused for takeovers some earlier conversation already spent, and a
+spent chain cannot be renewed by moving around in the session tree.
 
 - The chain is capped (default 12). At the cap the tool refuses and says so, and a handoff that crosses
   the cap while queued is dropped with one message into the session telling the agent to stop and report
-  to the human. A broken takeover cannot loop forever.
+  to the human. A broken takeover cannot loop forever. A `/takeover <prompt>` you typed yourself always
+  runs: the cap counts what the agents do to themselves, not what you ask for.
 - A message typed by the user cancels a queued handoff and starts a new chain. A human who intervenes
   should not have a session replaced under them a second later. This holds after a `/reload`, because the
   queue is read from disk every time rather than remembered.
@@ -90,22 +94,36 @@ some earlier process already spent.
   queued for over an hour expires, and the session is told that it did.
 - A handoff belongs to the session that queued it. Another session — or another pi sharing this agent
   dir — can report that a queue exists, but it cannot apply, cancel, or destroy what is in it.
-- Every dropped handoff is written to `<agent-dir>/takeover/discarded-<id>.md`, so a prompt is never
-  lost just because a session ended. The newest 20 are kept.
-- `/reload` keeps the queue: it lives on disk, keyed to the session that queued it.
+- A handoff is never in no place. It sits in `pending.json` until a session has it, and a dropped one goes
+  to `<agent-dir>/takeover/discarded-<id>.md` (the newest 20), so a prompt is not lost just because a
+  session ended. That includes the window while a confirmation is open, and a `/takeover <prompt>` typed
+  while a replacement is in flight is refused with a word, rather than queued into a session that is about
+  to be replaced.
+- With `PI_TAKEOVER_CONFIRM=1` the question is asked while the handoff is still queued, and it is bounded:
+  it ends after `PI_TAKEOVER_CONFIRM_TIMEOUT_MS` (default 5 minutes), or as soon as the session goes away.
+  Over rpc a confirmation is only a request to the client, and an unattended driver never answers one — so a
+  question that cannot be answered releases the session, keeps the handoff queued (it applies the next time
+  that session settles), and says plainly that nobody answered. Asking in a run nobody is driving is a way to
+  stop that run: the setting is for the keyboard.
+- `/reload` keeps the queue: it lives on disk, keyed to the session that queued it. A queue file this
+  extension cannot read — a hand-edited one, or one written by something else — is left alone, and treated
+  as nothing queued.
 
 ## Configuration
 
-Read when the extension loads, so a change needs a restart rather than `/reload`.
+Read when the extension loads, so a change needs a restart rather than `/reload`. A count that is not a
+plain run of digits is ignored with a warning on stderr; the default below is what runs.
 
-| Setting                 | Default | Effect                                                         |
-| ----------------------- | ------- | -------------------------------------------------------------- |
-| `PI_TAKEOVER_MAX_CHAIN` | `12`    | Takeovers per chain before more are refused; `0` means no cap  |
-| `PI_TAKEOVER_CONFIRM`   | off     | `1` asks before applying a queued handoff                      |
-| `PI_TAKEOVER_NAME`      | on      | `0` stops naming the incoming session after its handoff prompt |
-| `PI_TAKEOVER_DEBUG`     | off     | `1` writes what happened to stderr                             |
+| Setting                          | Default  | Effect                                                                     |
+| -------------------------------- | -------- | -------------------------------------------------------------------------- |
+| `PI_TAKEOVER_MAX_CHAIN`          | `12`     | Takeovers per chain before more are refused; `0` means no cap              |
+| `PI_TAKEOVER_CONFIRM`            | off      | `1` asks before applying a queued handoff                                  |
+| `PI_TAKEOVER_CONFIRM_TIMEOUT_MS` | `300000` | How long that question may hold a session; `0` waits for an answer forever |
+| `PI_TAKEOVER_NAME`               | on       | `0` stops naming the incoming session after its handoff prompt             |
+| `PI_TAKEOVER_DEBUG`              | off      | `1` writes what happened to stderr                                         |
 
-State: `<agent-dir>/takeover/` — `pending.json`, `chain.json`, `discarded-*.md` (the newest 20).
+State: `<agent-dir>/takeover/` — `pending.json` (the queue, and the session it belongs to), `chain.json`
+(the count, the chain id, and the session that owes it), `discarded-*.md` (the newest 20).
 
 ## Worth knowing
 

@@ -559,3 +559,151 @@ Things worth knowing that are not currently broken, so the fixer can spend the p
 5. `refuseAtCap` and the cap at apply time are only reachable through the tool's own queue, since a
    user-invoked `/takeover` forces position 1 — the human bypasses the brake by design; worth one line in the
    README's configuration table if it is not already obvious.
+
+---
+
+## Pass 4 — fixer
+
+Started from `9cda876` (346 green, 1 pin red). Finished: **371 green, 1 red** — the 8 pass-3 reds are
+green, the fence and the two pass-3 greens stayed green, and 16 more tests were added here (86 in
+`packages/pi-takeover` alone, up from 70). Reproduce with `npx vitest --run packages/pi-takeover`.
+Hostile shell (`PI_TAKEOVER_MAX_CHAIN=100 PI_TAKEOVER_CONFIRM=1 PI_TAKEOVER_CONFIRM_TIMEOUT_MS=1
+PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npm test`) is the same 371/1, and `/tmp` holds
+no `pi-ext-`/`takeover-`/`*-smoke-*` directory after either run.
+
+One pass-1 test was left as pass 3 repaired it (F16): the per-test session files in `sessionWithLineage` are
+kept, and the wording assertion (`no cap`) is what makes the section cache fail loudly instead of quietly. No
+tester-written assertion was rewritten in this pass; `test/apply-window.test.ts`, `test/chain-identity.test.ts`
+and `test/state-file-names.test.ts` gained tests next to theirs, and the new `it.each` in `test/config.test.ts`
+is mine. All `vi.resetModules()` calls are untouched.
+
+### F12 — the confirmation window
+
+The claim moved. `applyTakeover()` now asks, and only then takes the handoff out of the queue, so the
+question is asked while the prompt is still in `pending.json`: a session that quits, is resumed, is reloaded,
+or has its queue taken by another session during the dialog loses nothing, and `/quit` writes the
+`discarded-*.md` copy the README promises. `applying` is set for the whole of the function — the question
+included — instead of only around `newSession()`.
+
+The question is bounded, because Pi resolves a dialog to its default on a signal or a timeout (verified in
+both real UIs: rpc's `createDialogPromise`, and the TUI's `showExtensionConfirm` → a selector with a
+countdown that resolves `undefined` → `false`). `askBeforeReplacing` passes its own `AbortController` and
+`PI_TAKEOVER_CONFIRM_TIMEOUT_MS` (default 5 minutes, `0` to wait forever), owns a timer of the same length so
+it can tell a timeout from an answer, and `session_shutdown` dismisses the dialog of the session that is
+leaving. So an unanswered rpc confirmation now releases the session with the prompt still on disk rather than
+wedging the loop — checked against a real `pi --mode rpc` with `PI_TAKEOVER_CONFIRM=1`, which is exactly the
+reproduction pass 3 ran.
+
+The four outcomes are reported separately, and the sentence always says what the queue is doing now:
+`approved`, `declined` ("Takeover declined; the handoff is still queued…"), `unanswered` ("Nobody answered the
+takeover question; … In a run nobody is driving, nothing settles by itself — `/takeover-apply` runs it,
+`/takeover-cancel` drops it"), and `dismissed` (silent: the shutdown path already spoke for that session).
+
+**The boundary I chose, so the next pass can attack it deliberately rather than by surprise:** the claim
+still happens immediately before `newSession()`. The window in which the prompt lives only in a closure is
+therefore the replacement attempt itself — during which no human and no driver can interleave — and a
+replacement that throws runs the prompt in whatever session is still alive. A process killed inside
+`newSession()` still loses the prompt; making that recoverable too would mean keeping `pending.json` alive
+until the replacement lands, which re-introduces a double-run (the error path runs the prompt in place _and_
+the queue still holds it). The two new "while the dialog is open" tests assert the invariant the tester
+stated; they do not assert it across `newSession()`.
+
+Widening the window also moved a hazard, and it is closed: while the question is open the queue can change,
+so `queueStillHolds(handoff)` gates the apply after the answer. A `/takeover-cancel` (or another session's
+`takeover`) reached during the dialog is now the last word — a dialog that answers `yes` afterwards does not
+resurrect it, which the old ordering made unreachable. Covered by a new test.
+
+### F11 — the queue file is input
+
+`readHandoff()` checks the shape it hands out: `id` must match `/^[A-Za-z0-9._-]{1,100}$/` (it names a file),
+`prompt` must be a string, `sessionKey` must be a non-empty string, and `queuedAt` must parse as a date — so
+the age check cannot produce "waited NaN minutes", and `discarded-<id>.md` cannot name a path. A file that
+does not describe a handoff is left exactly where it is: nothing queued, nothing dropped, nothing announced
+to the session, and a `debugLog` line saying which field was rejected and why. `promptFileName()` sanitizes at
+the write as well — belt, not braces: `readHandoff` is the check.
+
+Chose rejecting over sanitizing-and-keeping, which is what lets the header comment keep saying a handoff
+addressed elsewhere is "left exactly where it is".
+
+### F13 — which conversation a chain belongs to
+
+`chain.json` gained `owner`, a session key, and the reset rule stopped reading the event's reason at all.
+`handChainToIncomingSession()` runs at every `session_start`: the session the file names keeps the chain; a
+session whose own lineage entry names that chain id adopts it (which is how a takeover's replacement keeps a
+chain it arrives inside — it reaches this event before its file can be recorded, and `nextChainPosition`'s
+`max(file.count, lineage.position)` means an interim reset cannot walk the cap); anything else starts a chain
+of its own. `applyTakeover` writes the owner as the outgoing session and `withSession` re-owns it for the
+incoming one, guarded on the chain id so a chain someone else started in the meantime is not adopted.
+
+The fence is green: a resume of the session the chain is standing in, with a branch trimmed below the takeover
+entry, is still refused at the cap — the file names that session, and the entry is not needed. Added probes for
+the field itself and for `resume`/`reload`/`fork` of the owning session, and for the hop that hands the chain
+over. The README's sentence is now literally what the code does, so it was kept and expanded rather than
+rewritten; the header comment says the same thing.
+
+### F14 — a takeover asked for during a replacement
+
+`/takeover <prompt>` checks `applying` before it queues: it says so ("A takeover is already replacing this
+session, so this prompt was not queued…") and leaves the queue alone. The no-argument form now reports "A
+takeover is replacing this session now." where it used to claim there was no handoff.
+
+### F15 — a count is digits or nothing
+
+`configuredCount()` takes the variable's name, accepts `^\d+$` (after trimming), and otherwise warns on stderr
+naming the variable and the fallback it settled on. `0x10`, `0b1`, `1_000`, `1,000`, `+12`, `1e2`, `12px` all
+land on the documented default; the same function now also reads `PI_TAKEOVER_CONFIRM_TIMEOUT_MS`, so the new
+knob inherits the rule, plus a test that `5m` lands on the bounded default rather than being used as a
+duration. `EXTENSION_CONFIG_ENV_KEYS` and the hostile-configuration list both know the new variable.
+
+### The two notes, taken
+
+- `packages/pi-takeover/test/session.test.ts` builds its child's environment with `withoutScrubbedEnv`
+  instead of spreading `process.env`, so the pi running the suite no longer hands its `PI_SESSION_*` and
+  `PI_MODEL` to the pi under test.
+- `test/helpers/hermetic-env.ts` deletes `SCRUBBED_ENV_KEYS` (configuration _and_ host keys) rather than only
+  the configuration list, which is what makes `test/repo.test.ts`'s "or it belongs to the host" allowance
+  mean something; a guard there now fails if the setup file stops deleting that list. The dev-script guard
+  triggers on any `node:child_process` import or any `spawn`/`execFile`/`fork`/`exec*` call (an aliased
+  `import { spawn as run }` is no longer invisible) and a temp dir made by anything under `tmpdir`; a script
+  that spawns **into** a temporary directory must import the scrub list, and one that spawns the user's own
+  pi must carry an explicit `INHERITS THE SHELL ENVIRONMENT` marker — added to `scripts/dev.mjs` (its own pi,
+  its own configuration) and `scripts/new-extension.mjs` (it runs `npm install` for the developer).
+- The human bypasses the cap by design (pass-3 note 5): now one line in the README's guard rails.
+
+### Deliberately not done
+
+- **An unanswered confirmation does not imply consent, and the apply is not re-driven after a timeout.**
+  Re-sending `/takeover-apply` from the decline path would ask again every `CONFIRM_TIMEOUT_MS` forever, and
+  timing out into consent defeats the setting. What an unattended run gets instead is a released session, a
+  prompt on disk, and a message that says plainly that nothing will settle by itself. This is the one place
+  where F12's evidence ("the loop stopped") is answered by honesty rather than by forward motion: with
+  `PI_TAKEOVER_CONFIRM=1` in a run nobody drives, the loop is meant to stop.
+- **The `takeover` tool is not gated on `applying`.** In `--print`/`--mode json` the incoming run executes
+  _inside_ `withSession`, i.e. while `applying` is still set, so a tool-side refusal would break exactly the
+  one-shot chaining the README promises. Only the human-facing command checks it.
+- Re-pinning pi, or touching `test/pins.test.ts`.
+
+### For the next tester
+
+Things that are true now and were not.
+
+1. `applying` is module-global and covers the confirmation window. During a dialog, another session's
+   `/takeover-apply` is refused silently and any human `/takeover <prompt>` is refused out loud; both handoffs
+   wait for their session's next settle. A test that leaves a dialog open holds `applying` for the whole file.
+2. The queue is consulted _after_ the answer: `queueStillHolds()` is the gate between an approved dialog and a
+   replacement. Any new route to a replacement has to pass it, or a cancel during the window is lost.
+3. `chain.json.owner` is a session key. Two contexts with the same key share a chain; a chain file with no
+   `owner` (any file written by hand, including every pre-pass-4 one) belongs to nobody, so the next
+   `session_start` resets it. Tests that seed a chain _and_ emit `session_start` now test something different
+   from tests that seed one and do not — that is intentional, and it is the F13 rule.
+4. An in-memory (`--no-session`) session's key is `id:<sessionId>` and every replacement mints a fresh one, so
+   such a chain's owner changes at every hop and the adoption path (lineage names the chain) is what keeps it
+   alive. A session file path never changes, so on-disk owners are stable.
+5. `PI_TAKEOVER_CONFIRM_TIMEOUT_MS` defaults to 300000. A dialog left open in a terminal now ends by itself
+   and the handoff stays queued, so an interactive "I walked away" is a decline by inattention — the notice
+   says so, and the handoff applies at the next settle.
+6. The state folder tolerates nothing it did not write: a `pending.json` that is not a handoff is inert and
+   invisible except in the debug log. If that silence is wrong, the place to say something is `readHandoff`'s
+   `reject()`, which knows exactly which field failed.
+7. `hermetic-env.ts` deletes `PI_CODING_AGENT_DIR` now. A test that spawns a `pi` must name its own agent dir;
+   one that forgets gets Pi's default rather than the parent pi's, so this is a safety net, not a trap.

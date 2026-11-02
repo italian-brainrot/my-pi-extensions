@@ -7,6 +7,10 @@
  * `npm run dev -- --model some/model` picks a model.
  *
  * Load a subset with `--only` (repeatable) or PI_DEV_PACKAGES="pi-bg-tasks pi-subagent".
+ *
+ * INHERITS THE SHELL ENVIRONMENT: this starts the user's own pi, in their own agent dir, where whatever
+ * they have configured is the point. A script that starts a throwaway pi scrubs instead — see
+ * `scripts/extension-smoke.mjs`, and the guard in `test/repo.test.ts` that makes the two states explicit.
  */
 
 import { spawnSync } from "node:child_process";

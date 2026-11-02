@@ -29,10 +29,13 @@
  * message into the current session telling the agent to report to the user instead of continuing. A
  * message typed by the user cancels a queued handoff and resets the chain: a human took the wheel.
  *
- * A chain is one run. The counter sits in the agent dir and outlives the process that wrote it, so a
- * session that did not arrive by takeover starts a new one; otherwise the cap would be a count of every
- * takeover this agent dir has ever seen, and a loop that spent its cap yesterday would be refused before
- * its first handoff today. The chain is what the incoming agent is told about, so it can wind down.
+ * A chain is one conversation's run. The counter sits in the agent dir and outlives the process that
+ * wrote it, so it names the session it belongs to, and a session that is not that one starts a new one;
+ * otherwise the cap would be a count of every takeover this agent dir has ever seen, and a loop that
+ * spent its cap yesterday would be refused before its first handoff today. Only the session key tells
+ * the two cases the README cares about apart — resuming the session a chain is standing in keeps its
+ * count, and a different conversation that arrives by `/resume` or `switch_session` starts its own. The
+ * chain is what the incoming agent is told about, so it can wind down.
  *
  * The queue is the file. `pending.json` is read on every question about the queue and never copied into
  * memory, because it is on disk precisely so that a `/reload` — which replaces this module and its
@@ -40,10 +43,24 @@
  * session, which is how the guard rails come undone: the queue would still be there for the settle, so
  * the session gets replaced under a user who has just typed something.
  *
+ * That file is input as much as it is output. The README documents another pi sharing this agent dir,
+ * and the queue is on disk so that something else can write it, so every field is checked where it is
+ * read and not trusted where it is used: `id` becomes a file name, `queuedAt` becomes an age. A queue
+ * file that does not describe a handoff is left alone — nothing queued, nothing dropped.
+ *
  * A handoff belongs to the session that queued it. Everything that changes the queue is handed the
  * handoff it changes, and a handoff addressed to another session — or to another pi sharing this agent
  * dir — is left exactly where it is: this session may report that a queue exists, but it cannot apply,
  * cancel, or destroy what is in it.
+ *
+ * A handoff is never between two places. It stays in the state folder — `pending.json`, then a
+ * `discarded-*.md` copy if it is dropped — until a session has it. That is what makes the confirmation
+ * safe: `PI_TAKEOVER_CONFIRM` asks while the handoff is still queued, so a session that quits, is
+ * resumed, or has its queue taken over during the question loses nothing. And the question is bounded:
+ * Pi's dialogs resolve to their default on a signal or a timeout, and over rpc one is only an
+ * `extension_ui_request` that an unattended driver never answers, so a parked question is a wedged loop.
+ * A replacement already in flight is also visible to the human: `/takeover <prompt>` typed during it
+ * says so and queues nothing, rather than leaving an entry addressed to a session that is being torn down.
  *
  * What the incoming session knows. Each takeover writes a custom entry into the new session — visible
  * in the transcript, invisible to the model — and the section this extension adds to that session's
@@ -58,11 +75,13 @@
  * lineage entry; the incoming one applies it to itself at `session_start`, since `setModel` acts on the
  * session whose `pi` it is called on and the outgoing session's handle is dead by then.
  *
- * Configuration, read when the module loads, so a change needs a restart rather than `/reload`:
- *   PI_TAKEOVER_MAX_CHAIN  takeovers per chain before refusing more (default 12, 0 for unlimited)
- *   PI_TAKEOVER_CONFIRM=1  ask the user before applying a queued handoff
- *   PI_TAKEOVER_NAME=0     do not name the incoming session after its handoff prompt
- *   PI_TAKEOVER_DEBUG=1    write what happened to stderr
+ * Configuration, read when the module loads, so a change needs a restart rather than `/reload`. A count
+ * that is not a plain run of digits is ignored with a word to stderr, never read as a number.
+ *   PI_TAKEOVER_MAX_CHAIN            takeovers per chain before refusing more (default 12, 0 for unlimited)
+ *   PI_TAKEOVER_CONFIRM=1            ask the user before applying a queued handoff
+ *   PI_TAKEOVER_CONFIRM_TIMEOUT_MS   how long that question may hold a session (default 300000, 0 to wait)
+ *   PI_TAKEOVER_NAME=0               do not name the incoming session after its handoff prompt
+ *   PI_TAKEOVER_DEBUG=1              write what happened to stderr
  */
 
 import { randomUUID } from "node:crypto";
@@ -77,8 +96,16 @@ import { Type } from "typebox";
 
 const DEFAULT_MAX_CHAIN = 12;
 
-const MAX_CHAIN = configuredCount(process.env.PI_TAKEOVER_MAX_CHAIN, DEFAULT_MAX_CHAIN);
+/** How long a confirmation may hold a session before it counts as "not now". */
+const DEFAULT_CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
+
+const MAX_CHAIN = configuredCount(process.env.PI_TAKEOVER_MAX_CHAIN, DEFAULT_MAX_CHAIN, "PI_TAKEOVER_MAX_CHAIN");
 const CONFIRM = isTruthy(process.env.PI_TAKEOVER_CONFIRM);
+const CONFIRM_TIMEOUT_MS = configuredCount(
+  process.env.PI_TAKEOVER_CONFIRM_TIMEOUT_MS,
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+  "PI_TAKEOVER_CONFIRM_TIMEOUT_MS",
+);
 const NAME_SESSION = !isFalsy(process.env.PI_TAKEOVER_NAME);
 const DEBUG = isTruthy(process.env.PI_TAKEOVER_DEBUG);
 
@@ -92,6 +119,9 @@ const APPLY_COMMAND = "takeover-apply";
 
 /** Custom-entry type holding a session's takeover lineage. */
 const ENTRY_TYPE = "takeover";
+
+/** A handoff's `id` names a file in the state folder, so it has to be one name and not a path. */
+const HANDOFF_ID = /^[A-Za-z0-9._-]{1,100}$/;
 
 /** A handoff left over from a session that is already gone is dropped past this age. */
 const PENDING_MAX_AGE_MS = 60 * 60 * 1000;
@@ -107,11 +137,21 @@ function isFalsy(value: string | undefined): boolean {
   return /^(0|false|no|off)$/i.test(value ?? "");
 }
 
-function configuredCount(value: string | undefined, fallback: number): number {
-  if (value === undefined || value.trim() === "") return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    process.stderr.write(`pi-takeover: ignoring PI_TAKEOVER_MAX_CHAIN "${value}", which is not a non-negative integer.\n`);
+/**
+ * A count from the environment, or the documented default with a word to stderr.
+ *
+ * Digits only. `parseInt` stops where the string stops, so `0x10` and `0b1` used to read as `0` — which
+ * this extension spells "no cap at all" — and `1_000` as `1`, silently taking away or jamming the loop's
+ * only brake. A count with anything odd in it is a typo, and the safe reading of a typo is the default
+ * the README names.
+ */
+function configuredCount(value: string | undefined, fallback: number, name: string): number {
+  const text = value?.trim() ?? "";
+  if (!text) return fallback;
+
+  const parsed = /^\d+$/.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    process.stderr.write(`pi-takeover: ignoring ${name} "${value}", which is not a plain non-negative integer; using ${fallback}.\n`);
     return fallback;
   }
   return parsed;
@@ -156,10 +196,12 @@ interface PendingHandoff {
   sessionKey: string;
 }
 
-/** How many takeovers the current chain has used. */
+/** How many takeovers the current chain has used, and which conversation it belongs to. */
 interface ChainState {
   id: string;
   count: number;
+  /** The session the chain is standing in; see `handChainToIncomingSession`. */
+  owner?: string;
   updatedAt: string;
 }
 
@@ -195,6 +237,9 @@ interface TakeoverEntry {
  */
 let applying = false;
 let api: ExtensionAPI | undefined;
+
+/** The confirmation a running `applyTakeover` is waiting on, so its own session can dismiss it. */
+let confirmation: { sessionKey: string; dismiss(why: "timeout" | "dismissed"): void } | undefined;
 
 /** Rendered prompt sections by session, and the sessions already told they hit the chain cap. */
 const sectionBySession = new Map<string, string>();
@@ -238,13 +283,59 @@ function removeFile(path: string): void {
 function readChain(): ChainState | undefined {
   const chain = readJsonFile<ChainState>(CHAIN_FILE);
   if (!chain || typeof chain.id !== "string" || typeof chain.count !== "number") return undefined;
-  return chain;
+  return { ...chain, owner: typeof chain.owner === "string" ? chain.owner : undefined };
 }
 
 function resetChain(reason: string): void {
   if (!existsSync(CHAIN_FILE)) return;
   removeFile(CHAIN_FILE);
   debugLog(`chain reset: ${reason}`);
+}
+
+/**
+ * Record that this chain now belongs to `owner`, while the file still names this chain.
+ *
+ * Every takeover re-owns the chain it just moved, because the session the handoff landed in is the one
+ * that owes the takeovers counted against the cap from there on. The chain id is checked so a chain some
+ * other conversation started in the meantime is not adopted by accident.
+ */
+function ownChain(chainId: string, owner: string): void {
+  const chain = readChain();
+  if (!chain || chain.id !== chainId || chain.owner === owner) return;
+  writeJsonFile(CHAIN_FILE, { ...chain, owner });
+  debugLog(`chain ${chainId.slice(0, 8)} now belongs to ${owner}`);
+}
+
+/**
+ * Decide whether the chain in the file belongs to the session that just started.
+ *
+ * A chain is one conversation's run, and `chain.json` is one counter per agent dir, so the file has to
+ * say which conversation it belongs to. The event's reason cannot tell that apart: resuming the session
+ * a chain is standing in must not hand the loop a fresh cap, while a _different_ conversation arriving
+ * by `/resume` or `switch_session` must not be refused for takeovers it never made. And "no lineage
+ * means a new chain" is worse still — a session whose branch was trimmed below its takeover entry has no
+ * lineage and is exactly the one whose count has to survive, or trimming a branch and coming back buys a
+ * fresh cap as often as you like.
+ *
+ * So: whoever the file names keeps it; a session whose own lineage entry names this chain adopts it, which
+ * is how a takeover's replacement keeps a chain it arrives inside — it reaches this event before its
+ * session file can be recorded as the owner; anything else starts a chain of its own, and the old one
+ * still counts for the sessions whose transcripts say they are in it (`nextChainPosition` reads those).
+ */
+function handChainToIncomingSession(ctx: ExtensionContext, reason: string): void {
+  const chain = readChain();
+  if (!chain) return;
+
+  const key = sessionKey(ctx);
+  if (chain.owner === key) return;
+
+  const lineage = lineageOf(ctx);
+  if (lineage?.chainId && lineage.chainId === chain.id) {
+    ownChain(chain.id, key);
+    return;
+  }
+
+  resetChain(`a session started (${reason}) that the chain in the file does not belong to`);
 }
 
 /**
@@ -287,14 +378,31 @@ function queueHandoff(prompt: string, ctx: ExtensionContext): PendingHandoff {
   return handoff;
 }
 
-/** The handoff in the queue, malformed ones rejected. Does not ask who it belongs to. */
+/**
+ * The handoff in the queue, malformed ones rejected. Does not ask who it belongs to.
+ *
+ * `pending.json` is input, not this extension's own output: it is on disk so that another load — or
+ * another pi sharing the agent dir, which the README documents — can write it. So nothing downstream may
+ * assume its fields are what they are for: an `id` becomes a file name, and a `queuedAt` becomes an age
+ * and a number of minutes in a message. A file that does not describe a handoff is left exactly where it
+ * is; the session has nothing queued, and the next `takeover` call replaces the file.
+ */
 function readHandoff(): PendingHandoff | undefined {
   const stored = readJsonFile<PendingHandoff>(PENDING_FILE);
   if (!stored) return undefined;
-  if (typeof stored.id !== "string" || !stored.id) return undefined;
-  if (typeof stored.prompt !== "string") return undefined;
-  if (typeof stored.sessionKey !== "string" || !stored.sessionKey) return undefined;
-  if (typeof stored.queuedAt !== "string") return undefined;
+
+  const reject = (why: string): undefined => {
+    debugLog(`pending.json is not a handoff: ${why}`);
+    return undefined;
+  };
+
+  if (typeof stored.id !== "string" || !HANDOFF_ID.test(stored.id)) return reject(`id ${JSON.stringify(stored.id)} is not one file name`);
+  if (typeof stored.prompt !== "string") return reject("prompt is not a string");
+  if (typeof stored.sessionKey !== "string" || !stored.sessionKey) return reject("sessionKey is missing");
+  if (typeof stored.queuedAt !== "string" || !Number.isFinite(Date.parse(stored.queuedAt))) {
+    return reject(`queuedAt ${JSON.stringify(stored.queuedAt)} is not a date`);
+  }
+
   return stored;
 }
 
@@ -314,7 +422,7 @@ function ownedHandoff(ctx: ExtensionContext): PendingHandoff | undefined {
   if (!handoff || handoff.sessionKey !== sessionKey(ctx)) return undefined;
 
   const age = Date.now() - Date.parse(handoff.queuedAt);
-  if (!Number.isFinite(age) || age <= PENDING_MAX_AGE_MS) return handoff;
+  if (age <= PENDING_MAX_AGE_MS) return handoff;
 
   discardHandoff(handoff, `it was queued ${Math.round(age / 60_000)} minutes ago`);
   notify(
@@ -323,6 +431,11 @@ function ownedHandoff(ctx: ExtensionContext): PendingHandoff | undefined {
     "warning",
   );
   return undefined;
+}
+
+/** Is this handoff still the one in the queue? Anything else means it is not this session's to apply. */
+function queueStillHolds(handoff: PendingHandoff): boolean {
+  return readHandoff()?.id === handoff.id;
 }
 
 /**
@@ -359,13 +472,24 @@ function discardHandoff(handoff: PendingHandoff, reason: string): void {
   // transcript that queued it is one the user would have to go looking for.
   try {
     mkdirSync(STATE_DIR, { recursive: true });
-    writeFileSync(join(STATE_DIR, `discarded-${handoff.id}.md`), `${handoff.prompt}\n`, "utf8");
+    writeFileSync(join(STATE_DIR, `discarded-${promptFileName(handoff.id)}.md`), `${handoff.prompt}\n`, "utf8");
   } catch {
     // A copy for looking at later is a courtesy, not a requirement.
   }
   pruneDiscardedPrompts();
 
   debugLog(`dropped handoff ${handoff.id}: ${reason}; kept a copy in ${STATE_DIR}`);
+}
+
+/**
+ * What a dropped prompt is filed under.
+ *
+ * `readHandoff` has already refused an id that is not a single name, so this is the second line of
+ * defence rather than the check itself: whatever reaches a write stays inside the state folder, which is
+ * where the notifications and `pruneDiscardedPrompts` both look for it.
+ */
+function promptFileName(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 100);
 }
 
 /**
@@ -531,10 +655,67 @@ async function carryModel(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void
 // ── Applying a handoff ───────────────────────────────────────────────────────
 
 /**
+ * Ask the user before replacing, while the handoff is still in the queue.
+ *
+ * The question gets a signal of our own and a timeout, because Pi resolves a dialog to its default when
+ * either fires. In the terminal that is a countdown the user can see; over rpc a dialog is only an
+ * `extension_ui_request`, and an unattended driver — which is how this extension is driven — never answers
+ * one, so the timeout is the only thing that ends the wait and a question that cannot be answered would
+ * park a session forever. Either way the handoff is untouched and stays queued.
+ *
+ * Whether a human said no and whether nobody said anything are kept apart, because what to do next is
+ * only the same for the queue and completely different for the reader of the message.
+ */
+async function askBeforeReplacing(
+  ctx: ExtensionCommandContext,
+  handoff: PendingHandoff,
+): Promise<"approved" | "declined" | "unanswered" | "dismissed"> {
+  const preview = handoff.prompt.length > 300 ? `${handoff.prompt.slice(0, 300)}…` : handoff.prompt;
+
+  const controller = new AbortController();
+  let ranOut: "timeout" | "dismissed" | undefined;
+  const ask = {
+    sessionKey: sessionKey(ctx),
+    dismiss(why: "timeout" | "dismissed") {
+      ranOut = why;
+      controller.abort();
+    },
+  };
+  confirmation = ask;
+
+  // This timer and Pi's own are set to the same length and started first, so a dialog that ends on its
+  // timeout is seen here as one too — the countdown is Pi's to draw, the verdict is ours.
+  const timer = CONFIRM_TIMEOUT_MS > 0 ? setTimeout(() => ask.dismiss("timeout"), CONFIRM_TIMEOUT_MS) : undefined;
+
+  try {
+    const approved = await ctx.ui.confirm(
+      "Take over this session?",
+      `${preview}\n\nThe current conversation ends, and this prompt starts a new session.`,
+      { signal: controller.signal, ...(CONFIRM_TIMEOUT_MS > 0 ? { timeout: CONFIRM_TIMEOUT_MS } : {}) },
+    );
+    return approved ? "approved" : ranOut === "timeout" ? "unanswered" : ranOut === "dismissed" ? "dismissed" : "declined";
+  } catch (error) {
+    // A UI that cannot ask is a UI that will not answer: treat that as no, with the handoff left queued.
+    debugLog(`the confirmation failed: ${errorMessage(error)}`);
+    return "unanswered";
+  } finally {
+    if (timer) clearTimeout(timer);
+    confirmation = undefined;
+  }
+}
+
+/**
  * Replace this session with a fresh one that starts with the handoff prompt.
  *
  * `freshChain` puts a user-invoked takeover at the head of a new chain; an agent-invoked one continues
  * the chain it came from.
+ *
+ * Nothing in here may leave a handoff in no place at all. It is claimed out of the queue only when the
+ * replacement is about to be attempted, so a session that quits, is resumed, or has its queue taken over
+ * during the confirmation still has its prompt on disk — and the reason the confirmation is worth
+ * answering at all is that it is asked before that claim. `applying` covers the whole of this function,
+ * including the question, so the only way a second takeover can be asked for during it is to be told to
+ * ask again later; a queue entry addressed to a session that is on its way out helps nobody.
  */
 async function applyTakeover(ctx: ExtensionCommandContext, options: { freshChain: boolean }): Promise<void> {
   if (applying) {
@@ -542,114 +723,145 @@ async function applyTakeover(ctx: ExtensionCommandContext, options: { freshChain
     return;
   }
 
-  const handoff = ownedHandoff(ctx);
-  if (!handoff) return;
-  if (!claimHandoff(handoff)) return;
-
-  // A user-invoked takeover is the human taking the wheel, so it heads a new chain whatever the file or
-  // this session's lineage says; an agent-invoked one continues the chain it came from.
-  if (options.freshChain) resetChain("a takeover was invoked by the user");
-  const { position, chainId } = options.freshChain ? { position: 1, chainId: randomUUID() } : nextChainPosition(ctx);
-
-  if (MAX_CHAIN > 0 && position > MAX_CHAIN) {
-    refuseAtCap(ctx, handoff, position);
-    return;
-  }
-
-  if (CONFIRM && ctx.hasUI) {
-    const preview = handoff.prompt.length > 300 ? `${handoff.prompt.slice(0, 300)}…` : handoff.prompt;
-    const approved = await ctx.ui.confirm(
-      "Take over this session?",
-      `${preview}\n\nThe current conversation ends, and this prompt starts a new session.`,
-    );
-    if (!approved) {
-      putHandoffBack(handoff);
-      notify(ctx, "Takeover cancelled; the handoff is still queued.", "info");
-      debugLog(`handoff ${handoff.id} was not confirmed`);
-      return;
-    }
-  }
-
-  const selection = selectionOf(ctx);
-
-  const info: TakeoverEntry = {
-    handoffId: handoff.id,
-    chainId,
-    position,
-    maxChain: MAX_CHAIN,
-    fromSession: ctx.sessionManager.getSessionFile(),
-    prompt: handoff.prompt,
-    ...(selection ? { model: selection } : {}),
-  };
-
-  // Counted before the replacement, not after it: a takeover that fails halfway still has to move the
-  // chain, or a broken apply would loop until the cap instead of stopping at it.
-  writeJsonFile(CHAIN_FILE, { id: chainId, count: position, updatedAt: new Date().toISOString() } satisfies ChainState);
-
   applying = true;
-
-  // `ctx` belongs to the session being replaced, and Pi marks it stale the moment that session is torn
-  // down. Everything read from it is read here, and the replacement's own context is kept for the
-  // error path, which may run after the replacement exists even though the call threw.
-  const outgoing = ctx.mode;
-  let replacement: Addressable | undefined;
-
   try {
-    const result = await ctx.newSession({
-      ...(info.fromSession ? { parentSession: info.fromSession } : {}),
-      setup: async (sessionManager) => {
-        // A custom entry: visible in the transcript, invisible to the model. Inside the new session it
-        // is the only trace of a handoff whose tool call stayed in the previous session.
-        sessionManager.appendCustomEntry(ENTRY_TYPE, info);
-        if (NAME_SESSION && !sessionManager.getSessionName()) {
-          sessionManager.appendSessionInfo(sessionNameFor(info));
-        }
-      },
-      withSession: async (next) => {
-        replacement = next;
-        sectionBySession.delete(sessionKey(next));
-        notify(next, `Takeover #${info.position}: fresh session, started from the handoff prompt.`, "info");
+    const handoff = ownedHandoff(ctx);
+    if (!handoff) return;
 
-        // A one-shot process would exit with the incoming run still going, so there the handoff is
-        // awaited. In the interactive and rpc modes the incoming run is the point of the takeover, and
-        // waiting for it here would hold the outgoing session's settle boundary open for its length.
-        const started = next.sendUserMessage(handoff.prompt);
-        if (next.mode === "tui" || next.mode === "rpc") {
-          void started.catch((error: unknown) => notify(next, `Takeover prompt failed: ${errorMessage(error)}`, "error"));
-        } else {
-          await started;
-        }
-      },
-    });
-
-    if (result.cancelled) {
-      putHandoffBack(handoff);
-      notify(ctx, "Takeover cancelled before the session was replaced.", "info");
-      debugLog(`handoff ${handoff.id} was cancelled by a session_before_switch handler`);
+    const answer = CONFIRM && ctx.hasUI ? await askBeforeReplacing(ctx, handoff) : "approved";
+    if (answer === "dismissed") {
+      // The session this apply belonged to is going away, and its own shutdown handler has already decided
+      // what happens to the queued prompt. Nothing left to say to a session that is leaving.
+      debugLog(`handoff ${handoff.id} was not confirmed: the session is shutting down`);
+      return;
+    }
+    if (answer !== "approved") {
+      // Say what is true now, not what this function did: the queue is the only place the prompt was, and
+      // another session, an expiry, or this session's own shutdown may have emptied it while we were asking.
+      const stillQueued = queueStillHolds(handoff);
+      const where = stillQueued
+        ? "the handoff is still queued, and applies the next time this session settles"
+        : "this session's handoff is no longer queued; its prompt is kept in the takeover state folder";
+      const notice =
+        answer === "unanswered"
+          ? `Nobody answered the takeover question; ${where}. In a run nobody is driving, nothing settles by itself — /takeover-apply runs it, /takeover-cancel drops it.`
+          : `Takeover declined; ${where}.`;
+      notify(ctx, notice, "info");
+      debugLog(`handoff ${handoff.id} was not confirmed (${answer})`);
       return;
     }
 
-    debugLog(`took over in ${outgoing}: ${info.fromSession ?? "in-memory session"} (chain ${chainId.slice(0, 8)} #${position})`);
-  } catch (error) {
-    // Losing the replacement must not lose the work: run the handoff wherever a session is still alive.
-    // A throw before the replacement leaves this extension's own `pi`; one after it can only be
-    // answered by the context the replacement handed back, because the old session is gone by then.
-    const message = `Takeover failed (${errorMessage(error)}); running the prompt in the current session instead.`;
-    debugLog(message);
+    // The queue may have moved while the question was open — the human may have cancelled this very
+    // handoff with `/takeover-cancel`, or another session may have pushed it out. Proceeding on a handoff
+    // the queue no longer holds would replace a session under someone who has just said not to.
+    if (!queueStillHolds(handoff)) {
+      notify(
+        ctx,
+        "The queued takeover is gone: it was cancelled, or another session queued over it. Its prompt is kept in the takeover state folder.",
+        "warning",
+      );
+      return;
+    }
+    claimHandoff(handoff);
 
-    // The agent is about to see its own handoff prompt arrive as a user message, and unless it is told
-    // otherwise it will read it as one from the user. Nothing was replaced in this branch, so the
-    // outgoing context is still good — Pi invalidates it only when that session is torn down.
-    notify(replacement ?? ctx, message, "error");
+    // A user-invoked takeover is the human taking the wheel, so it heads a new chain whatever the file or
+    // this session's lineage says; an agent-invoked one continues the chain it came from.
+    if (options.freshChain) resetChain("a takeover was invoked by the user");
+    const { position, chainId } = options.freshChain ? { position: 1, chainId: randomUUID() } : nextChainPosition(ctx);
 
-    // Pi hands `sendUserMessage` to the API and to a replacement context, never to a command context.
-    const sender: Addressable | undefined = replacement ?? api;
+    if (MAX_CHAIN > 0 && position > MAX_CHAIN) {
+      refuseAtCap(ctx, handoff, position);
+      return;
+    }
+
+    const selection = selectionOf(ctx);
+
+    const info: TakeoverEntry = {
+      handoffId: handoff.id,
+      chainId,
+      position,
+      maxChain: MAX_CHAIN,
+      fromSession: ctx.sessionManager.getSessionFile(),
+      prompt: handoff.prompt,
+      ...(selection ? { model: selection } : {}),
+    };
+
+    // Counted before the replacement, not after it: a takeover that fails halfway still has to move the
+    // chain, or a broken apply would loop until the cap instead of stopping at it. It belongs to the
+    // session being replaced until the replacement arrives, which re-owns it — the incoming conversation
+    // is the one that owes these takeovers.
+    writeJsonFile(CHAIN_FILE, {
+      id: chainId,
+      count: position,
+      owner: sessionKey(ctx),
+      updatedAt: new Date().toISOString(),
+    } satisfies ChainState);
+
+    // `ctx` belongs to the session being replaced, and Pi marks it stale the moment that session is torn
+    // down. Everything read from it is read here, and the replacement's own context is kept for the
+    // error path, which may run after the replacement exists even though the call threw.
+    const outgoing = ctx.mode;
+    let replacement: Addressable | undefined;
+
     try {
-      void Promise.resolve(sender?.sendUserMessage(handoff.prompt)).catch((sendError: unknown) => {
-        debugLog(`the fallback prompt failed too: ${errorMessage(sendError)}`);
+      const result = await ctx.newSession({
+        ...(info.fromSession ? { parentSession: info.fromSession } : {}),
+        setup: async (sessionManager) => {
+          // A custom entry: visible in the transcript, invisible to the model. Inside the new session it
+          // is the only trace of a handoff whose tool call stayed in the previous session.
+          sessionManager.appendCustomEntry(ENTRY_TYPE, info);
+          if (NAME_SESSION && !sessionManager.getSessionName()) {
+            sessionManager.appendSessionInfo(sessionNameFor(info));
+          }
+        },
+        withSession: async (next) => {
+          replacement = next;
+          const incoming = sessionKey(next);
+          sectionBySession.delete(incoming);
+          ownChain(chainId, incoming);
+          notify(next, `Takeover #${info.position}: fresh session, started from the handoff prompt.`, "info");
+
+          // A one-shot process would exit with the incoming run still going, so there the handoff is
+          // awaited. In the interactive and rpc modes the incoming run is the point of the takeover, and
+          // waiting for it here would hold the outgoing session's settle boundary open for its length.
+          const started = next.sendUserMessage(handoff.prompt);
+          if (next.mode === "tui" || next.mode === "rpc") {
+            void started.catch((error: unknown) => notify(next, `Takeover prompt failed: ${errorMessage(error)}`, "error"));
+          } else {
+            await started;
+          }
+        },
       });
-    } catch (fallbackError) {
-      debugLog(`no session was reachable for the fallback prompt: ${errorMessage(fallbackError)}`);
+
+      if (result.cancelled) {
+        putHandoffBack(handoff);
+        notify(ctx, "Takeover cancelled before the session was replaced.", "info");
+        debugLog(`handoff ${handoff.id} was cancelled by a session_before_switch handler`);
+        return;
+      }
+
+      debugLog(`took over in ${outgoing}: ${info.fromSession ?? "in-memory session"} (chain ${chainId.slice(0, 8)} #${position})`);
+    } catch (error) {
+      // Losing the replacement must not lose the work: run the handoff wherever a session is still alive.
+      // A throw before the replacement leaves this extension's own `pi`; one after it can only be
+      // answered by the context the replacement handed back, because the old session is gone by then.
+      const message = `Takeover failed (${errorMessage(error)}); running the prompt in the current session instead.`;
+      debugLog(message);
+
+      // The agent is about to see its own handoff prompt arrive as a user message, and unless it is told
+      // otherwise it will read it as one from the user. Nothing was replaced in this branch, so the
+      // outgoing context is still good — Pi invalidates it only when that session is torn down.
+      notify(replacement ?? ctx, message, "error");
+
+      // Pi hands `sendUserMessage` to the API and to a replacement context, never to a command context.
+      const sender: Addressable | undefined = replacement ?? api;
+      try {
+        void Promise.resolve(sender?.sendUserMessage(handoff.prompt)).catch((sendError: unknown) => {
+          debugLog(`the fallback prompt failed too: ${errorMessage(sendError)}`);
+        });
+      } catch (fallbackError) {
+        debugLog(`no session was reachable for the fallback prompt: ${errorMessage(fallbackError)}`);
+      }
     }
   } finally {
     applying = false;
@@ -840,15 +1052,12 @@ export default function (pi: ExtensionAPI): void {
     // all look at their own entries on the next run.
     sectionBySession.delete(sessionKey(ctx));
 
-    // A chain belongs to one run. The counter is in the agent dir and outlives the process that wrote
-    // it, so a session that did not arrive by takeover starts one — without this, the cap counts every
-    // takeover this agent dir has seen since a human last typed something, and the next unattended run
-    // is refused before its first handoff. Lineage-aware, because a takeover's own replacement lands
-    // here too: the entry the outgoing session wrote in `newSession({ setup })` is already on this
-    // session's branch by the time this event fires.
-    if ((event.reason === "startup" || event.reason === "new") && !lineageOf(ctx)) {
-      resetChain(`a session started (${event.reason}) with no takeover lineage`);
-    }
+    // A chain belongs to one conversation. The counter is in the agent dir and outlives the process that
+    // wrote it, so a session that is not the one a chain is standing in starts one — without this, the cap
+    // counts every takeover this agent dir has seen, and the next unattended run is refused before its
+    // first handoff. Which conversation a chain belongs to is decided from the file and the session's own
+    // lineage, not from the reason for this event: see `handChainToIncomingSession`.
+    handChainToIncomingSession(ctx, event.reason);
 
     // A replacement starts on the configured default model, so the incoming session has to be put back
     // on the one the outgoing agent chose. This is the only place that can: the outgoing session's `pi`
@@ -861,6 +1070,10 @@ export default function (pi: ExtensionAPI): void {
     const key = sessionKey(ctx);
     sectionBySession.delete(key);
     capAnnounced.delete(key);
+
+    // A question this session was asking will not be answered now. Pi resolves the dialog to its default
+    // through the signal, which leaves the handoff in the queue for the rule below to decide about.
+    if (confirmation?.sessionKey === key) confirmation.dismiss("dismissed");
 
     // A handoff queued in a session that is going away for good must not surface in an unrelated one
     // later. `/reload` and this extension's own replacement ("new") keep it. Asked of the file, not of
@@ -929,9 +1142,26 @@ export default function (pi: ExtensionAPI): void {
           chain
             ? `Chain ${chain.id.slice(0, 8)} has used ${chain.count} takeover${chain.count === 1 ? "" : "s"}${MAX_CHAIN > 0 ? ` of ${MAX_CHAIN} allowed` : " (no cap)"}.`
             : "No takeover chain in progress.",
-          queued ? "A handoff is queued and will apply when this turn ends." : "No handoff is queued for this session.",
+          applying
+            ? "A takeover is replacing this session now."
+            : queued
+              ? "A handoff is queued and will apply when this turn ends."
+              : "No handoff is queued for this session.",
         ];
         notify(ctx, lines.join(" "), "info");
+        return;
+      }
+
+      // A replacement already in flight is on its way to tearing this session down. Queuing into it would
+      // leave a handoff addressed to a session nothing will ever settle, sitting until the hour expires,
+      // and the human would hear nothing at all — a slash command never reaches the `input` handler that
+      // cancels a queue. So say so, and change nothing.
+      if (applying) {
+        notify(
+          ctx,
+          "A takeover is already replacing this session, so this prompt was not queued. Try /takeover again once the new session starts.",
+          "warning",
+        );
         return;
       }
 

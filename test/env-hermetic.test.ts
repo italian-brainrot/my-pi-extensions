@@ -22,6 +22,7 @@ import { isAlive, waitFor } from "./helpers/wait.ts";
 const HOST_CONFIGURATION: Record<string, string> = {
   PI_TAKEOVER_MAX_CHAIN: "100",
   PI_TAKEOVER_CONFIRM: "1",
+  PI_TAKEOVER_CONFIRM_TIMEOUT_MS: "1",
   PI_TAKEOVER_NAME: "0",
   PI_TAKEOVER_DEBUG: "1",
   PI_BG_TASKS_KEEP_RUNNING: "0",

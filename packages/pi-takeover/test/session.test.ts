@@ -19,6 +19,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { withoutScrubbedEnv } from "../../../test/helpers/config-env.mjs";
 import { makeTempDir, repoRoot, type TempDir } from "../../../test/helpers/extension.ts";
 import { waitFor } from "../../../test/helpers/wait.ts";
 
@@ -76,8 +77,12 @@ beforeAll(async () => {
     ],
     {
       cwd: cwd.path,
+      // This test starts a real process, so it owns that process's environment: the scrub list, not the
+      // shell's copy of it. It used to spread `process.env` and rely on `test/helpers/hermetic-env.ts`
+      // having deleted the extension configuration keys already, which left the pi running the suite
+      // handing its own `PI_SESSION_*` and `PI_MODEL` down to the pi under test.
       env: {
-        ...process.env,
+        ...withoutScrubbedEnv(process.env).env,
         PI_CODING_AGENT_DIR: agentDir.path,
         PI_OFFLINE: "1",
         PI_SKIP_VERSION_CHECK: "1",

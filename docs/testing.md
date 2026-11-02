@@ -153,6 +153,23 @@ per-component costs, and that context size is the largest single response rather
   tell a real reload from a cached one is an assertion the cached module cannot pass: delete the file
   between the two loads and expect the second load to have forgotten it
   (`packages/pi-takeover/test/extension.test.ts`).
+- **A faked dialog has to be able to stay unanswered.** An extension that asks the user something passes
+  Pi an `opts` object (`signal`, `timeout`), and Pi resolves the dialog to its default when either fires —
+  in rpc mode that is the _only_ thing that can end the wait, because a dialog there is an
+  `extension_ui_request` and an unattended driver never answers one. A test whose fake `confirm` answers
+  immediately cannot tell a bounded question from an unbounded one. Leave the fake's promise unresolved,
+  assert what the extension passed in `opts`, settle the wait with the event that ought to settle it, and
+  `Promise.race` the result against a timer so an unbounded wait fails as an assertion rather than as a
+  timeout (`packages/pi-takeover/test/apply-window.test.ts`).
+- **A state file is input, not only output.** Anything an extension keeps in the agent dir is shared with
+  another pi by design, so a suite that only ever lets the extension write it never sees what arrives from
+  the other side. Hand-write the file — a path where a name belongs, a date that is not a date — and assert
+  that nothing escaped the folder or got announced as a number
+  (`packages/pi-takeover/test/state-file-names.test.ts`).
+- **The window between two steps is where the bugs are.** Code that moves state from a file into a session
+  has a moment in the middle when the state is nowhere, and a test that looks only before and after cannot
+  see it. Hold the middle open — a faked `newSession()` whose promise the test has not resolved, a settle
+  that has not come — and assert from the disk rather than from the closure.
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in
   `dispose()`. Do not rely on env changes made after a load to affect module-level constants.
 - **The suite is hermetic against the shell that runs it.** Every package reads configuration from

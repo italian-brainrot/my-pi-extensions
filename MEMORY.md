@@ -67,6 +67,14 @@ real session, not assumed.
   are `createDialogPromise(opts, default, …)` — they emit `extension_ui_request` and resolve only when the client
   answers, unless the extension passes `opts.timeout` or `opts.signal`. A dialog awaited by an extension in an
   unattended rpc run therefore never returns. `ctx.hasUI === true` does not mean anyone is there to answer.
+- `ExtensionUIDialogOptions` (`signal`, `timeout`) is honoured in both real UIs, and both resolve to the dialog's
+  default rather than throwing: rpc's `createDialogPromise` short-circuits on `opts.signal?.aborted` and clears its
+  timeout in `cleanup`, and the TUI's `showExtensionConfirm` is `showExtensionSelector(title, ["Yes","No"], opts)` —
+  an aborted signal or an elapsed timer resolves `undefined`, which the wrapper turns into `false` (the timer also
+  draws a live countdown). An extension holding its own `AbortController` can therefore dismiss its own question
+  from an event handler, in either mode. While a TUI dialog is open the editor slot is replaced and
+  `programStatus.setBlocked("extension-dialog", { kind: "permission", message: title })` is set — a blocked program,
+  not a suggestion.
 - `sendUserMessage` always tags its `input` event `source: "extension"` and defaults `expandPromptTemplates` to
   **false**, so a handoff prompt or any extension-sent string starting with `/` is literal prompt text, never a
   command; pi-takeover's settle path passes `true` precisely to get its internal command dispatched. And a

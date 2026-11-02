@@ -109,6 +109,82 @@ describe("PI_TAKEOVER_CONFIRM", () => {
     expect(asked).toBe(false);
     expect(record.calls).toBe(1);
   });
+
+  it.each([
+    ["250", 250],
+    ["0", undefined],
+  ])("bounds the question when PI_TAKEOVER_CONFIRM_TIMEOUT_MS is %s", async (value, expected) => {
+    // An unanswered dialog is not a small deadlock: over rpc a confirmation is an `extension_ui_request`
+    // that only a client can answer, and the drivers this extension runs under do not answer it. Pi
+    // resolves a dialog to its default at a timeout, so the extension has to name one — and `0` has to
+    // mean "wait", the way a cap of 0 means "no cap".
+    ext = await loadExtension({
+      packageDir: packageDir("pi-takeover"),
+      env: { PI_TAKEOVER_CONFIRM: "1", PI_TAKEOVER_CONFIRM_TIMEOUT_MS: value },
+    });
+    await ext.callTool("takeover", { prompt: HANDOFF }, { context: { sessionFile: OUTGOING } });
+
+    const asked: unknown[] = [];
+    const { record, overrides } = replacementRecord();
+    (overrides.ui as any).confirm = async (_title: string, _message: string, options: unknown) => {
+      asked.push(options);
+      return false;
+    };
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    expect(asked).toHaveLength(1);
+    expect((asked[0] as any)?.timeout, `PI_TAKEOVER_CONFIRM_TIMEOUT_MS=${value} did not reach the dialog`).toBe(expected);
+    expect(record.calls).toBe(0);
+  });
+
+  it("uses a bounded default when the timeout is nonsense", async () => {
+    ext = await loadExtension({
+      packageDir: packageDir("pi-takeover"),
+      env: { PI_TAKEOVER_CONFIRM: "1", PI_TAKEOVER_CONFIRM_TIMEOUT_MS: "5m" },
+    });
+    await ext.callTool("takeover", { prompt: HANDOFF }, { context: { sessionFile: OUTGOING } });
+
+    const asked: any[] = [];
+    const { overrides } = replacementRecord();
+    (overrides.ui as any).confirm = async (_title: string, _message: string, options: any) => {
+      asked.push(options);
+      return false;
+    };
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    expect(asked[0]?.timeout, "a timeout that is not a count of milliseconds was used as one").toBeGreaterThan(60_000);
+  });
+
+  it("says so when the answer never arrives, rather than pretending a human refused", async () => {
+    // The over-rpc case in full: nobody answers, the extension's own timer ends the wait, the prompt is
+    // still queued, and the sentence the session is told has to say what actually happened — "declined"
+    // sends a human looking for a refusal that never came.
+    ext = await loadExtension({
+      packageDir: packageDir("pi-takeover"),
+      env: { PI_TAKEOVER_CONFIRM: "1", PI_TAKEOVER_CONFIRM_TIMEOUT_MS: "20" },
+    });
+    await ext.callTool("takeover", { prompt: HANDOFF }, { context: { sessionFile: OUTGOING } });
+
+    const notices: string[] = [];
+    const { record, overrides } = replacementRecord();
+    overrides.ui = {
+      notify: (message: string) => void notices.push(message),
+      confirm: (_title: string, _message: string, options: { signal?: AbortSignal }) =>
+        new Promise<boolean>((resolve) => {
+          options.signal?.addEventListener("abort", () => resolve(false));
+        }),
+    } as never;
+
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    const told = notices.join(" ");
+    expect(told).toMatch(/no answer|nobody answered/i);
+    expect(told).not.toMatch(/declined|cancelled/i);
+    expect(record.calls).toBe(0);
+    expect(JSON.parse(readFileSync(statePath(ext.agentDir, "pending.json"), "utf8")).prompt, "the unanswered handoff left the queue").toBe(
+      HANDOFF,
+    );
+  });
 });
 
 describe("PI_TAKEOVER_MAX_CHAIN", () => {

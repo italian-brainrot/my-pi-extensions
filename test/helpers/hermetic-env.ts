@@ -14,11 +14,13 @@
  * - a test that starts a real `pi` (`packages/pi-takeover/test/session.test.ts`) hands the whole
  *   environment to the child process.
  *
- * So this runs once per test file, before Vitest imports it, and deletes them. A test that wants one of
- * these variables sets it itself — through `loadExtension({ env })`, or with `test/helpers/env.ts` — and
- * `test/repo.test.ts` keeps the list in step with what the packages actually read.
+ * So this runs once per test file, before Vitest imports it, and deletes them — the extensions'
+ * configuration and Pi's own session state alike. Deleting the host keys is what makes the allowance in
+ * `test/repo.test.ts` honest: a variable a package reads is either scrubbed or a host variable, and a host
+ * variable that no load can override is just a hole in the same wall. A test that wants one sets it itself
+ * — through `loadExtension({ env })`, or with `test/helpers/env.ts`.
  */
 
-import { EXTENSION_CONFIG_ENV_KEYS } from "./config-env.mjs";
+import { SCRUBBED_ENV_KEYS } from "./config-env.mjs";
 
-for (const key of EXTENSION_CONFIG_ENV_KEYS) delete process.env[key];
+for (const key of SCRUBBED_ENV_KEYS) delete process.env[key];

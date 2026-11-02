@@ -5,6 +5,9 @@
  *
  * Creates the package, its README, a starter entry point, and a first test, then updates the root
  * manifest and the lock file so Pi and CI both see the new package.
+ *
+ * INHERITS THE SHELL ENVIRONMENT: it runs `npm install` and this repository's own scripts on the
+ * developer's behalf, not an extension under test, so the caller's configuration is theirs to keep.
  */
 
 import { spawnSync } from "node:child_process";

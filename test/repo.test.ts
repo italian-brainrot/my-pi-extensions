@@ -108,13 +108,26 @@ const scrubbed = new Set<string>(EXTENSION_CONFIG_ENV_KEYS);
 const hostOwned = new Set<string>(HOST_ENV_KEYS);
 const envReadByPackages = packages.flatMap((info) => envKeysRead(info.dir).map((key) => ({ key, name: info.name })));
 
+/** What a script that means to inherit the caller's environment has to say about itself. */
+const SHELL_ENV_MARKER = "INHERITS THE SHELL ENVIRONMENT";
+
 describe("the environment the extensions read", () => {
   it("is scrubbed by the test harness, or belongs to the host", () => {
     // A variable an extension reads as configuration and the harness does not scrub makes the suite mean
-    // something different in every shell: see test/env-hermetic.test.ts.
+    // something different in every shell: see test/env-hermetic.test.ts. `HOST_ENV_KEYS` are Pi's own
+    // session state rather than an extension's configuration — which is only a real answer because
+    // `test/helpers/hermetic-env.ts` deletes those too, so no ambient one survives into a test file.
     for (const { key, name } of envReadByPackages) {
       expect(scrubbed.has(key) || hostOwned.has(key), `${name} reads ${key}, which is in neither harness list`).toBe(true);
     }
+  });
+
+  it("scrubs every variable it claims to know about before each test file", () => {
+    // The other half of the allowance above: a key parked in the host list is only harmless if the setup
+    // file really removes it. A list that the harness reads one way and the setup file another is how a
+    // configuration variable becomes invisible to both guards at once.
+    const setup = readFileSync(resolve(repoRoot, "test/helpers/hermetic-env.ts"), "utf8");
+    expect(setup, "hermetic-env.ts must delete the host keys as well, or the host list is a loophole").toMatch(/SCRUBBED_ENV_KEYS/);
   });
 
   it("lists no variable no extension reads", () => {
@@ -124,17 +137,25 @@ describe("the environment the extensions read", () => {
     for (const key of scrubbed) expect(read.has(key), `scrubbed key ${key} is read by no extension`).toBe(true);
   });
 
-  it("is scrubbed by every dev script that starts a throwaway pi", () => {
+  it("is scrubbed by every dev script that starts a throwaway pi, or says it inherits the shell", () => {
     // A dev script prints evidence a human reads, so it has to be as hermetic as the suite: an ambient
     // `PI_TAKEOVER_MAX_CHAIN` used to reach the `pi` `scripts/extension-smoke.mjs` spawns, and every
     // lineage entry in its output reported the shell's cap as if it were the extension's.
     //
-    // `scripts/dev.mjs` is deliberately out: it starts the user's own pi, where their own configuration is
-    // the point. The invariant is about a run pointed at a temporary agent dir — one that owns its whole
-    // environment and prints what it measured.
+    // What counts as "starts a process" is read from the import as well as the call, because an aliased
+    // `import { spawn as run }`, an `execFile`, or a `fork` is the same act and used to be invisible to
+    // this guard. A script that spawns into a temporary directory owns its whole environment and has to
+    // import the scrub list; one that spawns the user's own pi is allowed, but only if it says so in the
+    // file, because "this run inherits whatever you have configured" is a decision, not an accident.
     for (const name of readdirSync(resolve(repoRoot, "scripts")).filter((entry) => entry.endsWith(".mjs"))) {
       const text = readFileSync(resolve(repoRoot, "scripts", name), "utf8");
-      if (!/spawn(Sync)?\(/.test(text) || !/mkdtemp/.test(text)) continue;
+      const spawns = /from\s+"node:child_process"/.test(text) || /\b(spawn|spawnSync|execFile|execFileSync|fork|exec)\w*\s*\(/.test(text);
+      if (!spawns) continue;
+
+      if (!/\bmkdtemp|tmpdir\b/.test(text)) {
+        expect(text, `scripts/${name} spawns with the shell's environment without saying so`).toContain(SHELL_ENV_MARKER);
+        continue;
+      }
 
       expect(text, `scripts/${name} runs a pi in a temp dir but does not import the scrub list`).toContain("test/helpers/config-env.mjs");
       expect(text, `scripts/${name} spreads the shell's environment into the pi it spawns`).not.toMatch(/\.\.\.\s*process\.env/);

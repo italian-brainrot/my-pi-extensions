@@ -21,6 +21,7 @@ export const EXTENSION_CONFIG_ENV_KEYS = [
   "PI_SUBAGENT_DEPTH",
   "PI_SUBAGENT_MAX_DEPTH",
   "PI_TAKEOVER_CONFIRM",
+  "PI_TAKEOVER_CONFIRM_TIMEOUT_MS",
   "PI_TAKEOVER_DEBUG",
   "PI_TAKEOVER_MAX_CHAIN",
   "PI_TAKEOVER_NAME",
@@ -31,7 +32,10 @@ export const EXTENSION_CONFIG_ENV_KEYS = [
  * thing under test: `PI_CODING_AGENT_DIR` is set by the harness and the scripts themselves, and the
  * session variables are Pi's, which `pi-bg-tasks` clears from the environment of every command it starts
  * and re-derives from the context. A `pi` started from inside another `pi` — which is exactly what runs
- * this repository's tests and scripts — has all of them set.
+ * this repository's tests and scripts — has all of them set. They are scrubbed as well as the
+ * configuration keys (`test/helpers/hermetic-env.ts` deletes both lists): the guard in `test/repo.test.ts`
+ * lets a package read a host key without scrubbing it per load, and that allowance is only worth anything
+ * if no ambient one reaches a test file in the first place.
  */
 export const HOST_ENV_KEYS = ["PI_CODING_AGENT_DIR", "PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
 
