@@ -217,6 +217,22 @@ describe("applying a handoff", () => {
     expect(ext.sent.map((message) => message.content)).toEqual([HANDOFF]);
   });
 
+  it("tells the session when a takeover failed and the prompt is run in place", async () => {
+    await queue();
+    const replacement: Replacement = { entries: [], sent: [], calls: 0 };
+    const { overrides } = outgoingContext(replacement, { throws: new Error("disk on fire") });
+
+    const notices: string[] = [];
+    overrides.ui = { notify: (message: string) => void notices.push(message), confirm: async () => true };
+
+    await ext.runCommand("takeover-apply", "", overrides);
+
+    // Nothing was replaced, so this session is still there and has to be told: the agent is going to see
+    // its own handoff prompt arrive as a user message, and without the notice it looks like the user sent it.
+    expect(notices.join(" ")).toContain("disk on fire");
+    expect(ext.sent.map((message) => message.content)).toEqual([HANDOFF]);
+  });
+
   it("uses the new session when the replacement itself breaks partway", async () => {
     await queue();
     const replacement: Replacement = { entries: [], sent: [], calls: 0 };

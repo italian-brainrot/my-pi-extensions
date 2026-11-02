@@ -39,18 +39,29 @@ real session, not assumed.
   `agent-loop.js`'s `createErrorToolResult` puts the thrown message in `content: [{ text: … }]` with
   `isError`, so throwing and returning an error result differ only in the sentence the model reads.
 - A custom entry appended in `newSession({ setup })` is visible through `getBranch()` in the new
-  session's first `before_agent_start`. That is how pi-takeover's `<takeover>` prompt section survives
+  session's first `before_agent_start`, and already at its `session_start`: `AgentSessionRuntime.newSession`
+  runs `setup` before `finishSessionReplacement` → `rebindSession` → `bindExtensions`, and the last of those
+  is what emits the event. So a `session_start` handler can ask "did this session arrive by takeover"
+  instead of guessing. That is how pi-takeover's `<takeover>` prompt section survives
   a reload or resume without any state in the process. In the `TranscriptContext` a provider sees, the
   system message carries `sections` and empty `content`, so a scripted model tests
   `message.sections.takeover` rather than the text.
+- The `input` event never fires for a slash command: `AgentSession.prompt` dispatches extension commands
+  before `_runInputHandlers`, and interactive-mode intercepts its built-ins (`/new`, `/resume`, `/quit`,
+  `/reload`, `/compact`, `!bash`) before `prompt` is reached at all. `InputSource` is
+  `"interactive" | "rpc" | "extension"`, and an rpc-driven prompt is `"rpc"` — only a CLI `--print`
+  argument arrives as `"interactive"`. Anything reacting to "a human took the wheel" cannot watch `input`
+  alone.
 - `setModel` and `setThinkingLevel` are on the extension API, not on any context, and a replacement
   session starts from the model in settings — a model the agent chose is session-scoped and lost. The
   change has to come from an extension handler running in the incoming session: pi-takeover writes
   `{provider, id, thinkingLevel}` into the lineage entry and applies it at `session_start` with
-  `reason === "new"`. That event is emitted by `AgentSession.bindExtensions`, before
-  `finishSessionReplacement` runs `rebindSession` and `withSession`, so the model is already right when
-  the handoff prompt is sent. Get the `Model` with `ctx.modelRegistry.find(provider, id)`. Guard on the
-  reason: on a resume the session's own later choice must win.
+  `reason === "new"`. That event is emitted by `AgentSession.bindExtensions`, called from
+  `rebindSession` inside `finishSessionReplacement`, before its `withSession` runs, so the model is already
+  right when the handoff prompt is sent. Get the `Model` with `ctx.modelRegistry.find(provider, id)`. Guard
+  on the reason: on a resume the session's own later choice must win. The mirror of that rule: `ui` is on
+  contexts and never on `ExtensionAPI`, so a `pi` kept at module scope can send messages and set models but
+  cannot tell anyone anything.
 - Pi's `getShellEnv` splits `PATH` only to test whether `<agent-dir>/bin` is already an entry: with it
   present it returns the configured string verbatim, otherwise `[binDir, currentPath].join(delimiter)` — it
   never filters. An empty entry survives, and bash, sh and libuv all read one as the child's working

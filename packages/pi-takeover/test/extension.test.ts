@@ -4,9 +4,9 @@
  * session.test.ts.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type LoadedExtension, loadExtension, packageDir } from "../../../test/helpers/extension.ts";
 
 const HANDOFF = "Review the diff and report what is still blocking.";
@@ -133,12 +133,67 @@ describe("the settle boundary", () => {
   it("finds the queued handoff again after a reload replaces the module", async () => {
     await ext.callTool("takeover", { prompt: HANDOFF });
 
-    // Same agent dir, new module instance: the queue has to come off disk.
+    // Same agent dir, new module instance: the queue has to come off disk. The `resetModules` is what
+    // makes that true — without it Vitest hands back the module the first load already has, and the
+    // test only proves that an in-memory variable survived.
+    vi.resetModules();
     const reloaded = await loadExtension({ packageDir: packageDir("pi-takeover"), agentDir: ext.agentDir });
     await reloaded.emit({ type: "agent_settled", aborted: false });
 
     expect(reloaded.sent.map((message) => message.content)).toEqual(["/takeover-apply"]);
     reloaded.dispose();
+  });
+
+  it("forgets a handoff that is no longer on disk", async () => {
+    await ext.callTool("takeover", { prompt: HANDOFF });
+    rmSync(state("pending.json"));
+
+    vi.resetModules();
+    const reloaded = await loadExtension({ packageDir: packageDir("pi-takeover"), agentDir: ext.agentDir });
+    await reloaded.emit({ type: "agent_settled", aborted: false });
+
+    expect(reloaded.sent).toEqual([]);
+    reloaded.dispose();
+  });
+
+  it("says so when a queued handoff expired instead of being applied", async () => {
+    // `peekHandoff` drops a handoff older than an hour. The agent was told the takeover would happen at
+    // the end of its turn, so the drop has to be said out loud rather than only to the debug log.
+    const sessionKey = `file:${ext.makeContext().sessionManager.getSessionFile()}`;
+    writeState("pending.json", {
+      id: "h-expired",
+      prompt: HANDOFF,
+      queuedAt: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
+      sessionKey,
+    });
+
+    const notices: string[] = [];
+    const ctx = ext.makeContext({ hasUI: true, ui: { notify: (message: string) => void notices.push(message) } });
+    await ext.emit({ type: "agent_settled", aborted: false }, ctx);
+
+    expect(ext.sent).toEqual([]);
+    expect(notices.join(" ")).toMatch(/takeover/i);
+  });
+});
+
+describe("the state folder", () => {
+  it("does not let dropped prompts fill the agent dir", async () => {
+    // Every dropped handoff writes `discarded-<id>.md` and nothing ever removes one, so an unattended
+    // loop grows the folder without limit. Old copies are the ones to lose.
+    mkdirSync(join(ext.agentDir, "takeover"), { recursive: true });
+    const old = Date.now() - 60 * 60 * 1000;
+    for (let i = 0; i < 40; i++) {
+      const path = join(ext.agentDir, "takeover", `discarded-old-${i}.md`);
+      writeFileSync(path, "an older prompt\n", "utf8");
+      utimesSync(path, old / 1000, old / 1000);
+    }
+
+    await ext.callTool("takeover", { prompt: HANDOFF });
+    await ext.emit({ type: "session_shutdown", reason: "quit" });
+
+    const kept = readdirSync(join(ext.agentDir, "takeover")).filter((name) => name.startsWith("discarded-"));
+    expect(kept.length).toBeLessThanOrEqual(30);
+    expect(kept.some((name) => readFileSync(join(ext.agentDir, "takeover", name), "utf8").includes(HANDOFF))).toBe(true);
   });
 });
 
@@ -214,6 +269,33 @@ describe("what the incoming session is told", () => {
     );
 
     expect(second.sections.takeover).toBe(first.sections.takeover);
+  });
+
+  it("tells the incoming session where the chain stands", async () => {
+    // The README promises the section says "its position in the chain, how many takeovers are left
+    // before the cap". This is the only place an agent in an unattended loop can learn it is near the
+    // cap before it calls the tool and is refused.
+    const options = { sections: {} as Record<string, string> };
+    await ext.emit(
+      { type: "before_agent_start", messageType: "user", prompt: HANDOFF, systemPrompt: "", systemPromptOptions: options },
+      sessionWithLineage({ ...lineage, position: 3, maxChain: 12 }),
+    );
+
+    const section = options.sections.takeover;
+    expect(section).toMatch(/\b3\b/);
+    expect(section).toMatch(/\b12\b/);
+  });
+
+  it("does not mention a cap there when the chain has none", async () => {
+    const options = { sections: {} as Record<string, string> };
+    await ext.emit(
+      { type: "before_agent_start", messageType: "user", prompt: HANDOFF, systemPrompt: "", systemPromptOptions: options },
+      sessionWithLineage({ ...lineage, position: 3, maxChain: 0 }),
+    );
+
+    const section = options.sections.takeover;
+    expect(section).toMatch(/\b3\b/);
+    expect(section).not.toMatch(/\b0\b/);
   });
 
   it("adds nothing to a session that did not arrive by handoff", async () => {
