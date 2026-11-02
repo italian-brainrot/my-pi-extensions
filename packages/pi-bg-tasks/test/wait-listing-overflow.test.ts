@@ -138,4 +138,28 @@ describe("a task listing with more running tasks than the cap", () => {
     expect(body).toMatch(/\(4 running tasks not listed; their logs are in /);
     expect(body).not.toMatch(/finished tasks not listed/);
   });
+
+  it("drops the oldest running rows when it has to drop any", async () => {
+    // The cap on running rows is a decision, but it should be the same decision the finished rows make: the
+    // rows kept are the newest. As written, `runningInfos.slice(0, LISTING_MAX_RUNNING_TASKS)` keeps the 100
+    // tasks that started *first*, so the four the model started last — the ones it just asked for, and the
+    // ones whose status it has no other way to ask about — are the invisible ones, under a sentence that does
+    // not say which four they are. Either the newest running tasks keep their rows, or the README and the
+    // sentence under the table have to say that the oldest do.
+    const RUNNING = 104;
+    const running: string[] = [];
+    for (let i = 0; i < RUNNING; i++) {
+      running.push(
+        (await ext!.callTool("bash", { command: `sleep 213 # listing-marker-213-${i}`, timeout: 0, blocking: false })).details.id,
+      );
+    }
+
+    const report = await ext!.callTool("bg_wait", { timeout: 0 });
+    const body = text(report);
+
+    expect(report.structuredContent.tasks.length).toBe(RUNNING);
+    const kept = running.filter((id) => body.includes(id));
+    expect(kept.length, `the table stays bounded: ${summary(report)}`).toBe(100);
+    expect(kept, "the newest running tasks are the ones with rows").toEqual(running.slice(-100));
+  });
 });

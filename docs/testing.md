@@ -145,7 +145,10 @@ per-component costs, and that context size is the largest single response rather
   variable, add it to `EXTENSION_CONFIG_ENV_KEYS`; `test/repo.test.ts` checks the list against what the
   packages actually read, in both directions. Verify it any time with
   `PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npm test` — that
-  is the suite with a hostile shell, and it must be as green as a clean one.
+  is the suite with a hostile shell, and it must be as green as a clean one. With
+  `pool: "forks"` and `isolate: true` every test file runs in its own process (two files in one run print
+  different `process.pid`s), so nothing a file leaves in `process.env` reaches another file's tests, and a
+  load that is never disposed cannot poison a later file — it only leaks its temp directories.
 - **Every load needs its `dispose()`, even after a teardown event.** A test that emits
   `session_shutdown` in its own body and then forgets the load leaks the temp working directory the
   harness made for it — a whole-suite run ends with directories in the temp dir, and they are only found

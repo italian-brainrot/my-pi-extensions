@@ -35,7 +35,9 @@ real session, not assumed.
   call that installed it.
 - A tool result reaches the model only through `content`. `details` and `structuredContent` go to the
   UI and nothing else, so anything the model must see is in `content`, and whatever goes there needs
-  its own cap; the full payload belongs in `details`.
+  its own cap; the full payload belongs in `details`. A tool that _throws_ is not special either:
+  `agent-loop.js`'s `createErrorToolResult` puts the thrown message in `content: [{ text: … }]` with
+  `isError`, so throwing and returning an error result differ only in the sentence the model reads.
 - A custom entry appended in `newSession({ setup })` is visible through `getBranch()` in the new
   session's first `before_agent_start`. That is how pi-takeover's `<takeover>` prompt section survives
   a reload or resume without any state in the process. In the `TranscriptContext` a provider sees, the

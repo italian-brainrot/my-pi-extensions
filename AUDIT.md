@@ -1443,3 +1443,254 @@ conventions live; a line here duplicating them would cost prompt space in every 
 - **Run the suite in a hostile shell too** (`PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md
   PI_BG_TASKS_KEEP_RUNNING=0 npm test`). It is the only way to see a hermeticity regression, and one test
   file's leak (a load never disposed) now shows up as another package's failure rather than as nothing.
+
+---
+
+## Pass 5 — tester
+
+Baseline: `016aeb5`, **301/301 green in 47 files** (145 in the package, 33 files), and re-measured at the
+start of this pass: the hostile shell (`PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md
+PI_BG_TASKS_KEEP_RUNNING=0 npm test`) is as green as a clean one, and a clean run leaves 0 `/tmp/pi-ext-*`
+directories and no marker processes. `pi-takeover`'s chain logic is green in that shell, so hermeticity has
+not regressed and nothing in it was touched.
+
+After the pass: **305 green, 8 red in 4 files** — 12 tests added, 8 of them red. In the package: **149 green,
+8 red, 157 tests, 36 files**. `tsc` and biome are clean; `npm run check` fails only on the 8. Reproduce with
+`npx vitest --run packages/pi-bg-tasks`.
+
+The four pass-4 fixes hold in every shape I could reach: the PATH hand-off is a line-for-line copy of Pi's,
+`shellsByCwd` answers where the child answers and what it found is what it spawns, the log-dir refusal is a
+result and recovers, the record rules delete only on an affirmative answer, and the harness keeps a hostile
+shell out of every package. What this pass found is not in those fixes: it is in the fourth precondition
+nobody wrote a check for, in what the tool says when `spawn` never produced a process, and in one window that
+cuts a character in half.
+
+### F23 — a command too big for the shell ends the call as a thrown `spawn E2BIG`
+
+Three environment preconditions answer as tool results — the working directory (F6), a configured shell
+(F11/F15), the log directory (F19) — because a thrown errno reaches the model as `createErrorToolResult`:
+`pi-agent-core/dist/agent-loop.js` turns whatever `execute` throws into
+`content: [{ text: error.message }]`. The fourth way the same call can fail is unhandled: `spawn` throwing
+**synchronously**.
+
+`child_process.spawn` throws rather than emitting `error` when the failure is detected before the fork. One is
+reachable from the command itself: `E2BIG`, the kernel's per-argument limit (`MAX_ARG_STRLEN`, 131072 bytes on
+Linux). The command goes to the shell as a single `-c` argument, so a command past that size cannot be started
+at all — measured here: 131071 bytes spawns, 131072 throws. `shellCommandPrefix` counts toward the same
+argument. A model writing a large heredoc or a base64 blob gets there. The other one is
+`ERR_INVALID_ARG_VALUE`, Node refusing an argument with a NUL byte.
+
+The whole spawn path is bypassed: `spawnJob`'s catch unlinks the log (good, pinned) and rethrows, so there is
+no job, no sidecar, no `proc.on("error")` note, no `structuredContent`, and the model reads the bare string
+`spawn E2BIG` — which names no limit, no argument and nothing to do about it. `timeout: 0` throws too. Pi's
+own tool throws for the same two inputs, so this is not a divergence from the host; it is the one remaining
+case where this extension answers with an errno after deciding, three times over, that it answers with a
+sentence.
+
+Red: `test/spawn-refused.test.ts` — three red tests (foreground, `timeout: 0`, and the NUL byte), each of
+which today fails with `the tool call rejected instead of answering: Error: spawn E2BIG` /
+`TypeError [ERR_INVALID_ARG_VALUE] …`. The foreground test also asserts the answer says `too long`: that
+wording is this pass's choice, because it is the shortest thing that tells a model what to do (split the
+command into a file). If a different wording lands and the README states the limit, the regex is the thing to
+change — say so here rather than bending the assertion to a bare errno.
+
+Direction: one catch around the log-open plus the spawn, next to the other three checks, returning an error
+result that names what was refused and why. That also covers the `openPrivate(logPath)` failure F19's check
+cannot see (ENOSPC, EMFILE, a filesystem that changed under the check) — the same hole, one function over, and
+the same fix.
+
+### F24 — a background spawn that produced no process is reported as a running task with `pid -1`
+
+`spawnJob` records `proc.pid ?? -1`. `child.pid` is `undefined` exactly when `spawn` failed before the fork,
+which is when there is definitively no process — a different thing from a process that started and failed,
+which is what the `error` handler and the 127 exit are for. The background path then answers:
+
+```text
+Command running in background with ID: bg-sb0f2p9w (pid -1).
+```
+
+with `details.status: "running"` and `details.pid: -1`, for a command that never existed. `bg_wait` corrects
+it one call later (`failed (exit 127)`), so the model has to disbelieve the message it was just given. Two
+reachable ways: a session whose `PATH` has no `bash` — the default shell, which is deliberately never checked —
+and a `shellPath` that is a runnable script with a missing `#!` interpreter, the hole the README says no
+`stat`/`access` pair can see. Both answer `spawn … ENOENT` with no pid (measured directly: `pid` undefined,
+one `error` event, no `exit` event).
+
+Red: `test/spawn-failed-background.test.ts` — two red tests (one per shape): no `pid -1` in the text, no `-1`
+in `details.pid`, no claim of a background task that is running, and the result is an error.
+
+Direction: `proc.pid === undefined` is not a job, and F23's catch already carries the reason. A `-1` in the
+model's face is never right: report the failure, or say there is no pid, but do not print one the OS did not
+hand out. While there: the `-1` sidecar that is written before the `error` event lands is what F21's
+`pid: -1` question is about — see "Attacked, no finding" for why deleting it is correct.
+
+### F25 — a preview can start in the middle of a character
+
+`readTail(path, 4096)` reads the last 4096 _bytes_ and decodes them, and where the window starts is whatever
+the file size makes it. If it starts on a continuation byte, the model is shown `U+FFFD` as the first
+character of the preview, and the label next to it is wrong by the same accident (`backgroundResult` prints
+`Buffer.byteLength(read)`, which counts the three bytes the replacement character took for the one byte that
+was read):
+
+```text
+Preview (last 4.0KB of 7.8KB):
+<U+FFFD>éééééééééééé…
+```
+
+One function over, `readLogWindow` already strips exactly this (`replace(/^\uFFFD+/, "")`, with a comment
+about split codepoints) before showing the tail of a log over 8 MB. `readTail` — used in exactly two places,
+the preview of a command that moved to the background and the partial output streamed while one runs — does
+not.
+
+Red: `test/preview-codepoint.test.ts` (2): a payload of `x`, 4000 two-byte characters, then `M` — 8002 bytes,
+so the window starts mid-character, verified against `tail -c 4096`, which starts `a9 c3 a9 …`. One test reads
+the preview in the moved-to-background result, one reads the partials streamed through `onUpdate`; both assert
+no `U+FFFD` anywhere in the text.
+
+Direction: strip leading replacement characters the way `readLogWindow` does, or move the window start back to
+a character boundary and say in the label how many bytes were actually read. Same family, worth deciding at the
+same time: `readStructuredOutput` cuts at 1 MiB and can leave a split character at the _end_ of
+`structuredContent.output` — not model-facing, so it is a judgement call, but it is the same three lines of
+thinking.
+
+### F26 — when the running cap bites, the tasks that disappear are the newest ones
+
+`taskSection` keeps `runningInfos.slice(0, LISTING_MAX_RUNNING_TASKS)` — the 100 that started _first_ — while
+the finished rows are kept with `finishedInfos.slice(-LISTING_MAX_FINISHED_TASKS)`, the newest. So of 104
+running tasks the four that disappear are the four the model just started and has no other way to ask about:
+the note says only "4 running tasks not listed", which of them is not stated, and `details.tasks` is not
+something a model can read. The README says "Every running task gets a row — up to 100 of them", which is true
+of no particular 100.
+
+Red: one test added to `test/wait-listing-overflow.test.ts`: 104 running tasks, 100 rows, and the rows kept
+must be `running.slice(-100)`. It fails today with the first 100 against the last 100.
+
+Direction: this is a decision, not a bug in the arithmetic — but it should be a _made_ one, and the
+asymmetry with the finished rows has no reason behind it in the comment ("a table truncated in the middle
+reads as a gap" argues for a different thing: keeping the newest running rows cuts the table at its start, not
+in its middle). Keep the newest running rows, or write the rule into the sentence under the table and the
+README. If the second is chosen, delete this test and say so here.
+
+### New pins, all green
+
+- `test/spawn-refused.test.ts` (2). A refused oversized command leaves the log dir exactly as it was — the log
+  opened before the spawn is taken back with it — and the blocking mutex survives a call that threw, which is
+  the thing that would silently wedge every later default `blocking` command of the session.
+- `test/spawn-failed-background.test.ts` (2). Once the error has landed, `bg_wait` lists no running row and no
+  running ID for the task, whatever the first answer ends up saying; and the foreground answer for the same
+  shell stays what it is — exit 127 with `[bg-tasks] failed to start command with …` in the output, so a fix
+  for the background path cannot quietly drop the reason.
+- The four pass-4 listing tests still pass with the new one in the file (104 spawns, one overlapping grace
+  window at shutdown).
+
+### Attacked, no finding
+
+Recorded so pass 6 does not spend time here.
+
+- **F22's remaining boundary is real but harmless, and the host owns it.** Pi reads only
+  `PI_OFFLINE`, `PI_PACKAGE_DIR`, `PI_STARTUP_BENCHMARK`, `PI_SKIP_VERSION_CHECK`, `PI_SHARE_VIEWER_URL`,
+  `PI_MANAGED_INSTALL_ROOT` and `PI_CODING_AGENT` from the environment (`grep -o 'process\.env\.PI_[A-Z_]*'`
+  over `pi-coding-agent/dist`); `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_MODEL`, `PI_PROVIDER` and
+  `PI_REASONING_LEVEL` are only ever written by it, and `pi-bg-tasks` clears them from every command and
+  re-derives them from the context. Nothing in the suite makes a model call, so `PI_CACHE_RETENTION` is inert.
+  The hostile run is 301/301.
+- **The fixtures' own `PI_*` knobs are not a hole either.** `PI_FAKE_LOG`/`PI_FAKE_RULES` (read by
+  `test/fixtures/fake-model.ts`) are ambient and are in neither harness list — and cannot be, since
+  `repo.test.ts`'s second direction forbids scrubbed keys no extension reads. Measured with both exported in
+  the shell: 8 failures, and they are exactly this pass's 8 reds. Every test that uses them names them itself.
+- **`commandPathValue` is Pi's `getShellEnv` line for line**, checked against the installed sources rather
+  than against `MEMORY.md`: same case-insensitive key choice (`Object.keys(process.env).find(k =>
+  k.toLowerCase() === "path") ?? "PATH"`), same `filter(Boolean)` used only for the "is the bin dir already
+  there" answer, same `[binDir, currentPath].filter(Boolean).join(delimiter)`, same
+  `{...process.env, [pathKey]: updatedPath}`; and `getBinDir()` is `join(getAgentDir(), "bin")`. The quirk the
+  key choice imports: with both `Path` and `PATH` in the environment, only the first one found gets the bin
+  dir, and the child's `$PATH` is untouched — verified with a session whose env has `Path` and no `PATH`
+  (bash then uses its own compiled default, and `$Path` carries the bin dir). Copying it is right; diverging
+  would be the finding.
+- **F18's "spawn what was found" does not change `argv[0]`.** libuv already hands the _resolved absolute path_
+  as `argv[0]` when it resolves a bare name on `PATH` — a script printing `$0` said
+  `argv0=/tmp/pi-ext-cwd-x4GdoX/argv0-sh` for `spawn("argv0-sh", …)` with a PATH holding it, identical to what
+  the extension's absolute path produces. So nothing that keys on its own name (bash's `sh` mode, a busybox
+  multi-call binary, a wrapper doing `dirname $0`) sees a change.
+- **F19's un-coverable cases.** Every way past `statSync`+`accessSync(W_OK|X_OK)` is the filesystem changing
+  under the check — ENOSPC, EDQUOT, EMFILE, a chmod from another process — and none can be produced
+  deterministically in this harness (`RLIMIT_NOFILE` is not reachable from inside the process). `appendToLog`'s
+  swallowed failure only hides the `[bg-tasks] failed to start command with …` note in a session whose log dir
+  broke between the check and the spawn, which needs the same unreachable interleaving. F23's direction —
+  converting the open-and-spawn block's throw into a result — is what closes the reachable half.
+- **F21's `pid: -1` should be deleted, not protected.** `-1` means `spawn` produced no pid, so no process and
+  no group: `isAlive(-1)` and `processGroupExists(-1)` are both false by their own `pid <= 0` guards, so a
+  reader that finds one unlinks it without signalling anything, and `releaseJobRecord` unlinks it in the
+  runtime that wrote it a moment later. The window in which such a record exists is between `writeMeta` at
+  spawn and the `error` event; nothing in it is stoppable, so nothing is lost.
+- **The record protections still pair up correctly.** `pruneRetention`'s protected-id scan needs a finite
+  `pid` to protect a live group, and a record without one names no group anyone could stop; foreign,
+  running and live-group ids are collected in one pass and applied per file, so a log and its sidecar are
+  always protected or removed together. Temps: never adopted, never counted as logs, tightened, collected past
+  60 s — re-checked against `adoptJobs`'s walk.
+- **F20's arithmetic and the caps' reach.** `droppedRunning`/`droppedFinished` match the rows kept in all four
+  combinations (≤cap both, running only, finished only, both over), the heading counts everything, and
+  `details.tasks`/`structuredContent.tasks` staying uncapped is not a model-facing cost: pi builds the
+  transcript from `content` only (`details` and `structuredContent` go to the UI), which is also why a thrown
+  tool error arrives as plain text and a `structuredContent` one never does.
+- **The harness's two layers hold under the attacks listed in pass 4.** The refcount cannot leak across test
+  files: with `pool: "forks"` and `isolate: true` each file runs in its own process (two files in one run
+  printed different `process.pid`s), so a leaked load cannot poison another package's file. No test writes one
+  of the ten variables to `process.env` (grep over `test/` and `packages/*/test`) — they all arrive through
+  `loadExtension({ env })` or `withEnv` around a _call_, which is not scrubbed; a `withEnv` wrapped around a
+  `loadExtension` would be, and no test does that. No package reads configuration through a bracket or computed
+  key, so `repo.test.ts`'s `process\.env\.(PI_[A-Z0-9_]+)` grep sees every read — worth knowing if a future
+  package refactors them behind a helper.
+- **The stop, adoption and ownership machinery**: unchanged from pass 2/3/4's records; nothing new reached it.
+
+### For pass 6 — what to attack
+
+- **F23's catch is a design decision, not just a try/catch.** It decides what a `bash` call may throw at all:
+  `Command is empty.` and `Invalid timeout:` still throw today (and Pi catches them the same way), so either
+  the rule is "the tool answers, it does not throw" and those two move too, or the README says which answers
+  arrive as thrown errors. Also decide whether the limit is a _checked_ precondition (a size test before
+  spawning, with the number in the README) or a caught errno.
+- **F24's boundary against F23's fix.** If `spawnJob` throws on a missing pid, `spawnBackground`/`runWithTimeout`
+  both have to convert it, and the `error` event that follows belongs to a job nobody registered — check that no
+  second report appears, and that `bg_stop` on the ID from a refused background start says "Unknown task"
+  rather than something about a group.
+- **The `#!` hole is still only documented.** Closing it means actually spawning the shell once per resolution
+  and deciding what a probe process costs — and now there is a second reason to look: F24's second red test is
+  exactly that hole producing a nonsense report.
+- **F18's cache is unbounded and its message still names no directory** (`Custom shell path not found: ./x`
+  from a session whose cwd the user did not choose). A Map keyed by directory, one entry per directory a module
+  instance has been asked about, across every session replacement in one process. Nothing caps it; nothing
+  needs to yet.
+- **F20's numbers (100 running, 30 finished) and F26's outcome.** If the newest-running decision is taken, the
+  README's "Every running task gets a row — up to 100 of them" and the sentence under the table both want a
+  look; if the oldest are defended, this pass's test goes and the README gains the rule.
+- **F22's fixture knobs** (`PI_FAKE_LOG`, `PI_FAKE_RULES`, `FAKE_PI_*`): ambient today, harmless because every
+  test names them. If anyone wants the guard to cover them, it needs a third list (`hermetic-env.ts` deletes
+  what is not extension configuration either) and `repo.test.ts` scanning `test/fixtures` too — currently it
+  scans `packages/*/src` only, which is why `PI_BIN` (read by `pi-takeover`'s session test) is invisible to it.
+- Carried forward, unchanged: everything still open in pass 3's and pass 4's lists —
+  `stopLeftoverGroup`'s early `return false`, `tightenPrivate` on files another live runtime owns, the
+  recycled-`ownerPid` rule, Pi's `/bin/bash` → `bash` → `sh` fallback (and this pass's default-shell red tests
+  sit right on top of it: an unfindable default shell is documented, the _report_ is not), retention driven by
+  completions, the numbers in a sidecar being trusted by the report, Windows being POSIX-shaped and
+  unexercised (`PATHEXT`, and `findConfiguredShell`'s backslash test treating a Linux filename containing `\`
+  as a path).
+
+### Harness notes
+
+- **Marker sleeps added this pass: 213 (`wait-listing-overflow`'s new test), 217 (`preview-codepoint`).**
+  `spawn-refused` and `spawn-failed-background` spawn nothing that survives their own call.
+- **`spawn` throws synchronously — it does not emit `error` — for two reachable inputs**: `E2BIG` at exactly
+  131072 bytes of one argument (131071 spawns), and `ERR_INVALID_ARG_VALUE` for a NUL byte in an argument. Both
+  are outside `proc.on("error")`, which is where the extension's spawn-failure handling lives.
+- **A failed `execve` is the opposite case**: a bare name not on `PATH`, or a script whose `#!` interpreter is
+  missing, gives an `error` event with **`child.pid === undefined`** and _no_ `exit` event. That is the only
+  way `-1` reaches a job's `pid`, and it is why the F24 tests use those two shapes.
+- **For byte-exact multi-byte payloads**, `printf 'x'; printf '\303\251%.0s' {1..4000}; printf 'M'` writes 8002
+  bytes with the shell alone — `tail -c 4096` on it starts `a9 c3 a9`, which is the split. Keep the payload's
+  total size even and the 4096-byte window starts on a continuation byte.
+- **`pi` turns a thrown tool error into a model-facing text result** (`createErrorToolResult(error.message)` in
+  `pi-agent-core/dist/agent-loop.js`), and builds the transcript from `content` alone. That is the reason this
+  file keeps saying "a result, not a throw", and the reason uncapped `details` cost nothing.
+- The new listing test spawns 104 tasks like its neighbour; with the marker comment
+  (`sleep 213 # listing-marker-213-<i>`) they stay distinguishable if a future pass needs to find one.
