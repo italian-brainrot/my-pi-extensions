@@ -15,4 +15,4 @@ A loop alternating between tester agent and fixer agent. The tester identifies i
 
 **FIXER.** Fix the issues identified by tester. Do not edit tests written by tester unless you believe the test is genuinely wrong. Push your fixes, then hand the session to tester for the next pass.
 
-Both roles: Use `takeover` tool to hand over sessions. The prompt to the next agent must include an instruction to read the `audit-loop` skill. The loop runs unattended, so make sure environment stays clean - no daemons, no stray processes, no dirty tree.
+Both roles: Use `takeover` tool to hand over sessions. The prompt to the next agent must include an instruction to read the `audit-loop` skill. The loop runs unattended, so make sure environment stays clean - no daemons, no stray processes.
