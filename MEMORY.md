@@ -62,6 +62,24 @@ real session, not assumed.
   on the reason: on a resume the session's own later choice must win. The mirror of that rule: `ui` is on
   contexts and never on `ExtensionAPI`, so a `pi` kept at module scope can send messages and set models but
   cannot tell anyone anything.
+- Pi's UI is mode-dependent in a way `hasUI` hides: print/`--no-session` bind `noOpUIContext` (`confirm` resolves
+  `false` immediately, `hasUI` false), while **rpc mode binds a real UI context** whose `confirm`/`select`/`input`
+  are `createDialogPromise(opts, default, …)` — they emit `extension_ui_request` and resolve only when the client
+  answers, unless the extension passes `opts.timeout` or `opts.signal`. A dialog awaited by an extension in an
+  unattended rpc run therefore never returns. `ctx.hasUI === true` does not mean anyone is there to answer.
+- `sendUserMessage` always tags its `input` event `source: "extension"` and defaults `expandPromptTemplates` to
+  **false**, so a handoff prompt or any extension-sent string starting with `/` is literal prompt text, never a
+  command; pi-takeover's settle path passes `true` precisely to get its internal command dispatched. And a
+  `prompt()` issued while `_isEmittingAgentSettled` is set is queued in `_deferredSettledActions` and replayed
+  after the emission, when a fresh run can be started normally — that is what makes a command handler reached
+  from `agent_settled` able to send another message or start a run.
+- `getBranch()` is a `parentId` walk from the leaf: compaction does not drop ancestors, so a custom entry written
+  at session creation stays on the branch for the session's whole life — but `navigateTree` moves the leaf and
+  `fork`/`createBranchedSession` copies only the path, so both can trim entries off the branch. Neither emits
+  `session_start` for the navigation itself, and a trimmed session reads as having no lineage.
+- `SessionManager.getSessionFile()` is undefined only for a non-persisted session (`--no-session`, and
+  `newSession()` on an in-memory runtime), while `newSession()` always mints a `sessionId` — a session without a
+  file still has a stable identity, and `--no-session` gives a replacement session a fresh id.
 - Pi's `getShellEnv` splits `PATH` only to test whether `<agent-dir>/bin` is already an entry: with it
   present it returns the configured string verbatim, otherwise `[binDir, currentPath].join(delimiter)` — it
   never filters. An empty entry survives, and bash, sh and libuv all read one as the child's working
