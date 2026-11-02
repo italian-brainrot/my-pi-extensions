@@ -960,3 +960,255 @@ comment where it is used.
   `afterEach` only knows the load in `ext`, and an undisposed load leaks its temp working dir.
 - The registry-pressure recipe from pass 3 still holds: 201 sequential foreground `true` commands, which
   leave no log and no sidecar, so the only files in the log dir are the ones under test.
+
+---
+
+## Pass 4 — tester
+
+Baseline: `200f672`, 270/270 green, 0 `/tmp/pi-ext-*` and no strays after a clean run. After the pass:
+**268 green, 19 red in 7 files**. Fifteen of those tests are this pass's (13 red, 2 green); four are
+pi-takeover tests that have nothing to do with `pi-bg-tasks` and are themselves finding F22. In the
+package: **122 green, 13 red in 4 files, 33 files total** (was 120 green, 28 files). `tsc` and biome are
+clean and `npm run check` fails only on the red ones. Reproduce with `npx vitest --run packages/pi-bg-tasks`.
+
+The four pass-3 fixes all hold in the shapes they were written for. Two of them broke at the edge where
+they meet something outside the extension — Pi's PATH, and the working directory of the command — and the
+unified PATH turned out to be the part that changed behaviour.
+
+### F17 — the PATH commands get is rebuilt, and a PATH entry that means "here" is dropped
+
+`commandPathDirs()` splits `PATH` on `delimiter`, `.filter(Boolean)`s it, and `buildEnv` joins the result
+back together. Pi's `getShellEnv` (utils/shell.js) does the same split **only to decide whether the bin dir
+is already an entry**, and then hands the configured string on: `hasBinDir ? currentPath :
+[binDir, currentPath].filter(Boolean).join(delimiter)`. An empty entry is not noise — bash, sh and libuv
+all read it as the current directory of the command (verified: with `PATH=:/usr/bin:/bin` and a child cwd
+holding `toolsh`, `spawn("toolsh", {cwd})` runs it; drop the empty entry and the same call is ENOENT).
+So a session whose `PATH` was assembled as `PATH=$SOMETHING:$PATH` with `$SOMETHING` unset — or with a
+trailing separator — can run a bare command out of its working directory with Pi's tool and gets
+`command not found`, exit 127, with this one. The README's "`<agent-dir>/bin` is prepended to `PATH`,
+matching the built-in tool" is the claim that does not hold: the bin dir is prepended, the rest is rebuilt.
+
+This is also a pass-3 regression in one branch: before `commandPathDirs`, `buildEnv` only wrote
+`env[pathKey]` when the bin dir was missing, so a `PATH` that already contained it was passed on verbatim,
+empties included, exactly as Pi does. Now it never is.
+
+Red: `test/shell-path-cwd.test.ts`, first three tests — a bare command that only an empty entry can find
+answers 127; the entries a command sees, asserted against the configured string entry by entry; and the
+bin-dir-already-on-PATH case, where pass 2 behaved like Pi and pass 3 does not.
+
+Direction: hand on what was configured — `binDir` first, then the configured string, no split-and-refilter.
+An empty entry then has to be answered honestly by the `shellPath` walk, where it means the cwd of the
+command, i.e. F18. If instead the rebuild is judged deliberate, the README sentence and the
+`commandPathDirs` comment ("the exact value `buildEnv` now puts into the environment" is about internal
+agreement, not about Pi) both have to say so.
+
+### F18 — a configured shell is resolved against the runtime's directory, not the command's
+
+`resolveShellSettings` resolves a `shellPath` value with `statSync`/`accessSync` from the **extension
+process**, and caches it once per runtime. The child is spawned with `cwd: ctx.cwd`, which is the _session_
+cwd, and those differ in real Pi: `SessionManager.open` takes the cwd from the session header
+(session-manager.js:1344), a replacement runtime is built with `cwd: sessionManager.getCwd()`
+(agent-session-runtime.js:134-138), while `SettingsManager` — and therefore `process.cwd()` — stays where
+pi was started (main.js:467). For a value with a separator that is relative, and for a bare name with a
+relative or empty PATH entry, the check and the child look at two different files. Both directions are bad:
+the session's own shell is refused for every command of the session, or the check passes, `spawn` fails
+with ENOENT, and a broken setting arrives as `Command exited with code 127` — the exact shape F11/F15 exist
+to prevent. Note this is not Pi's bug being re-reported: Pi's `access(path, F_OK)` is equally relative, but
+this extension's README promises "the question it answers is the one the child asks".
+
+Red: `test/shell-path-cwd.test.ts`, last two tests. `shellPath: "./session-dir-sh"` with the program in the
+session directory answers `Custom shell path not found`; `shellPath: "./runtime-dir-sh"` with the program
+in the runtime directory passes the check and then reports `exit_code: 127` and a `failed to start command
+with ./runtime-dir-sh` note.
+
+Direction: pick one and say which. (a) Keep "chosen once per runtime" per _directory_: cache the resolved
+answer under `(configured value, cwd)` — a session has one or two cwds, so the rule stays true in the sense
+the README means. (b) Make the agreement structural: let the walk return the absolute path it found and
+spawn that, so a bare name cannot disagree with itself, and treat a value containing a separator as relative
+to the spawn cwd (which needs the check to know the cwd, i.e. (a) anyway for the relative case). (c) Answer
+a relative value with its own message and never spawn it — simplest, but it loses the ability to say
+"found". Whatever is chosen, `settings-scopes`, `shell-precedence` and `shell-path-resolution` stay green,
+and F17's empty entries make an empty PATH entry mean the same cwd, so the two want one design.
+
+### F19 — an unusable log dir ends the call as a rejected promise carrying an errno
+
+The third environment precondition has no check. `ensureLogDir()` swallows the failure to create the
+directory ("A directory that cannot be created is reported by whatever writes into it next"), and the next
+write is `openPrivate(logPath, "w")` in `spawnJob`, which is not wrapped. With the log dir un-writable
+(`0500`, or a read-only agent dir) or replaced by a regular file — an old install, a stray `touch`, a
+half-finished `mv` — every command of the session ends as `EACCES: permission denied, open
+'…/bg-tasks/bg-guqfkzh1.log'` / `ENOTDIR: …`: a rejection rather than a result (the treatment F6 rejected
+for the working directory), naming a log file that never existed and never naming the directory a user
+could act on. The shell and the cwd both got a named, non-throwing answer; this one got neither.
+
+Red: `test/log-dir-unusable.test.ts`, three tests (un-writable dir, a file in its place, and a fourth
+control proving an ordinary first command still creates the dir and runs). The third test is a pin for the
+fix: a refusal must not be cached the way `brokenShellPath` is, so the session recovers when the directory
+becomes writable again.
+
+Direction: check before opening the log, next to `missingWorkingDirectory` — `statSync(LOG_DIR)` is a
+directory and `accessSync(LOG_DIR, W_OK | X_OK)` — and return an error result naming `LOG_DIR` with Pi's
+`Cannot execute bash commands.` tail. Do not cache the answer across the runtime.
+
+### F20 — the task listing drops running tasks past 30 and tells the model they were finished
+
+`taskSection` prints `LISTING_MAX_TASKS` (30) rows and closes with "(N older finished tasks not listed;
+their logs are in …)", where N is `infos.length - shown`. The comment above it reads "Running tasks sort
+first, so anything dropped here is an old finished one" — true only while fewer than 30 tasks are running.
+With 34 running tasks the table has 30 rows and the sentence says 4 finished tasks were left out, when the
+4 are running. The README states the opposite: "The listing shows the 30 newest tasks (running ones are
+always included)". A fan-out (`make -j40`, a watcher per package, a loop of `timeout: 0` calls) is enough
+to get there, and what the model is told is not just incomplete but wrong.
+
+Red: `test/wait-listing-overflow.test.ts` (2 tests): 34 running background tasks → 30 rows and a false
+note; then 34 running plus 4 finished → the note counts 8 "finished" omissions where only 4 are finished.
+`details.tasks`/`structuredContent.tasks` carrying all of them is pinned green in the same file.
+
+Direction: either make the code match the README — running tasks are not capped, the cap is on finished
+ones — and think about how wide a table that puts in front of the model when a session has 300 running
+tasks (`taskListing` pads a column per row with a `Math.max(...rows)` spread), or cap the rows and fix the
+note plus the README sentence. The note's count must describe the rows it describes either way.
+
+### F21 — `adoptJobs` deletes a sidecar that parses to something that is not a record
+
+F16's rule is "a record that cannot be parsed is left where it is", implemented as `if (!meta) continue`
+after `readMeta`. `readMeta` returns whatever `JSON.parse` answers, and the guard stops only the falsy
+ones. A sidecar that parses to `[]`, `42`, `"bg-nobody"` or `true` reaches the ownership question, which
+can only answer "nobody's" (no numeric `ownerPid`, no numeric `pid` → `procStateAndParent(-1)` →
+"absent"), and is unlinked. That is the destructive guess F16 was written to stop, one type error away:
+a reader that cannot recognise a record removes it, which is what an older or newer reader does to a format
+it does not know. `null` is the only non-object that is handled, which pass 3 pinned for the _settings_ walk
+(F13) but not here.
+
+Red: `test/sidecar-record-shapes.test.ts` (3 tests, `it.each` over `[]`, `42`, `"bg-nobody"`): a live
+background task's sidecar replaced with each value; a second runtime's `session_start` must not delete it,
+must not adopt it, and the age rule must be what collects it.
+
+Direction: `if (!meta || typeof meta !== "object") continue;`. While there, the same reader-side question
+applies to a _recognisable_ record whose fields have the wrong types (`{"pid": "123"}`): it is deleted too,
+by the same fall-through. Whether a record with an unreadable shape is the reader's to remove is the
+decision to record.
+
+### F22 — the suite is not hermetic: the shell the tests run in configures the extensions
+
+Every extension in this repo reads its configuration from the environment — pi-takeover
+`PI_TAKEOVER_MAX_CHAIN`/`_CONFIRM`/`_NAME`/`_DEBUG` at module load, pi-bg-tasks `PI_BG_TASKS_KEEP_RUNNING`
+at call time, pi-subagent `PI_SUBAGENT_MAX_DEPTH`/`_DEPTH`, pi-memory `PI_MEMORY_FILENAME`/`_MAX_BYTES`/`_DEBUG`.
+`loadExtension` sets `PI_CODING_AGENT_DIR` plus whatever a test asks for and passes the rest through, so
+the suite only means anything in a shell that configures nothing. This loop runs from pi sessions, and
+those inherit the user's shell: `~/.bashrc` exports `PI_TAKEOVER_MAX_CHAIN=100`, which is why 4 pi-takeover
+tests are red in this pass's numbers and why a fixer could waste a pass on them. Measured with
+`PI_MEMORY_FILENAME=HOST-NOTES.md PI_SUBAGENT_MAX_DEPTH=0 PI_BG_TASKS_KEEP_RUNNING=0
+PI_TAKEOVER_MAX_CHAIN=100 PI_TAKEOVER_CONFIRM=1`: **44 of the 89 tests in pi-memory, pi-subagent and
+pi-takeover fail** without a line of code changing. pi-bg-tasks guards its own children against exactly
+this ("no `PI_*` leftovers from a parent pi process"); the test process has no equivalent.
+
+Red: `test/env-hermetic.test.ts` (2 tests): with all ten variables set, a `takeover` call must not report a
+`/100` chain cap, and a `session_shutdown reason:"reload"` must still keep a running task — the second one
+matters because `PI_BG_TASKS_KEEP_RUNNING` is read at call time, so a load-time snapshot is not enough.
+
+Direction: in `loadExtension`, save and delete the extension-owned variables for the whole lifetime of the
+load (restored in `dispose()`), so an ambient value reaches an extension only when the test names it in
+`env:`. Keep the list next to the harness and consider `repo.test.ts` deriving it by grepping
+`process.env.PI_` out of the packages, so a new variable cannot be added without joining it.
+
+### New pins, all green
+
+- `test/many-records.test.ts` (1). F14's bound at a size a long session reaches: 12 daemonised tasks whose
+  records are the oldest finished jobs, then 201 sequential foreground fillers. Every record survives the
+  cap, `bg_wait` lists all 12 as finished, one `bg_stop` by ID stops one group and drops only that record,
+  and one shutdown stops the remaining 11 groups in **153 ms** — one overlapping grace window, not one per
+  group. No `.json.tmp` survives the run, and no `.json` survives its group. The 201 fillers cost ~0.4 s,
+  so the cap loop's per-entry `hasLeftoverGroup` re-check is not measurable at this size.
+- Two green tests inside the red files: the log-dir control (a first command still creates the dir and
+  runs) and the `structuredContent.tasks` counts in the listing-overflow file.
+
+### Attacked, no finding
+
+Recorded so pass 5 does not spend time here.
+
+- **`shellCandidateState`'s `X_OK` is the right question, not `R_OK`.** A mode-0111 file is a _start_ for
+  libuv: Linux checks `MAY_EXEC` for `execve`, so both a bare name and an absolute path run, and `/bin/sh`
+  then fails reading its own script with exit 2 — an ordinary command failure, not a spawn error. A 0644
+  file and a directory in a PATH entry are both skipped by libuv, which is what the check does; an
+  all-unrunnable PATH gives the child EACCES and the check refuses with "not executable" first. A mode-0755
+  script whose `#!` interpreter is missing really does reach `spawn` and answers ENOENT → exit 127, which
+  no `stat`/`access` check can see; that makes the README's "instead of running something that cannot
+  start" slightly stronger than the code, and is worth a wording fix, not a test.
+- **The two messages.** For a bare name whose only PATH candidate is unrunnable, libuv's own answer would
+  be ENOENT ("not found") while the extension says "not executable". Deliberate, pinned in pass 3, more
+  useful; both refuse the same way. A directory candidate sets the same flag — same reasoning.
+- **`~` in a configured value** is expanded (Pi's `access(F_OK)` would refuse the literal `~/…`), so this
+  extension accepts something Pi rejects, and a refusal quotes the expanded path rather than what the user
+  typed. Cosmetic, in the permissive direction.
+- **A value with a trailing separator, `PATH` entries with trailing separators, a symlinked shell, a missing
+  `<agent-dir>/bin`, `PATH` unset** — checked against `spawnSync`/`statSync` behaviour by hand and covered
+  by pass 3's `shell-path-resolution` pins; `join` collapses the separator cases identically for the check
+  and the child.
+- **The zombie-adopted-leader case stays unreachable here.** This container's PID 1 is systemd and it reaps
+  adopted orphans: 3.5 s after an orphaned leader exits, its pid is ESRCH and `kill(-pid, 0)` is ESRCH, so
+  `hasLeftoverGroup` reads the group as gone rather than the leader as alive. The condition for it to become
+  real is spelled out for whoever runs the suite elsewhere: a PID 1 that never reaps adopted orphans leaves
+  the leader a zombie forever, `processAt(pid)` stays true, and the record is dropped at the next
+  `session_start`.
+- **An obligation on disk but not in the registry of its owner.** Walked every path out of F14's fix: the
+  cap (re-checks before skipping), `markDone` and `finishedResult` (both set the flag and write the record
+  together), `adoptJobs`'s `jobs.has(id)` skip (same process, same registry), `pruneRetention`'s
+  live-group protection (re-derived from disk each pass), and `stopLeftoverGroup`'s unlink (only when the
+  group is gone). Nothing found.
+- **A live job with no sidecar** (pass 3's open question). The only consequence is invisibility to _other_
+  runtimes: this runtime still stops it (`jobs`), and its log is still protected from this runtime's passes
+  by `tracked?.status === "running"`. The reachable ways to get one are a `writeMeta` that fails after the
+  log opened — the same directory accepted one and refused the other, i.e. ENOSPC — and both are contrived;
+  no test. Note the flag is set regardless of whether the write succeeded (`releaseJobRecord`), so a failed
+  write leaves an in-memory obligation with no on-disk record, which is the correct local answer.
+- **`bg_wait` with hundreds of tasks**: 213 registry entries and 38 background tasks; the table caps at 30
+  rows (see F20), `details.tasks`/`structuredContent.tasks` carry all of them, and counts are cached per job
+  on size+mtime, so a listing after adoption is one scan per log, not one per wait.
+- **Who collects what, for temps** (F16's edges): a `.json.tmp` is never adopted (it does not end in
+  `.json`), never counted as a log, `tightenPrivate`d, and unlinked past 60 s; nothing else in the tree
+  reads or removes one. Re-pinned at 12 records in the new scale test.
+- **The sidecar's numbers, the recycled `ownerPid`, `tightenPrivate` on another runtime's files, retention
+  driven by completions, Pi's `/bin/bash` → `bash` → `sh` default, `stopLeftoverGroup`'s early
+  `return false`** — unchanged from the pass-2 and pass-3 records.
+
+### For pass 5 — what to attack
+
+- **F17 and F18 want one answer.** Mirroring Pi's PATH makes empty entries legal, and an empty entry means
+  the command's cwd — the same thing a relative value needs. Decide the caching rule first: a check that is
+  once-per-runtime cannot answer "where is `./x`" for two different `ctx.cwd` values. Then re-walk the
+  ordering rules (bin dir first, first runnable entry wins, `Path` vs `PATH` key casing on Linux, a PATH
+  entry that is a symlink to a directory), and make the README say what "found" means now that a bad
+  interpreter is known to slip through.
+- **F19's fix** must not become a cached per-runtime refusal (test 3 pins recovery), and `pruneRetention`
+  still must not re-create the log dir during teardown (`lifecycle.test.ts`'s pin). Also worth a look: the
+  `openPrivate` failure inside `appendToLog` is deliberately silent — a spawn-error note for a session whose
+  log dir is broken disappears entirely.
+- **F20's fix** on whichever side it lands: if running tasks are never capped, bound the model-facing table
+  some other way and check `taskListing`'s per-column `Math.max(...rows)` spread at 300 rows; if the rows
+  stay capped, the sentence under the table and the README's "running ones are always included" both move.
+- **F21's one line**, plus the decision about a record whose _fields_ have the wrong types.
+- **F22's scrub list**: every test that deliberately sets one of the ten variables must set it through
+  `env:` (pi-memory and pi-subagent mostly do; check the rest), and the list needs a guard so it does not
+  rot. This one is outside the loop's package and outside the loop's usual blast radius — a harness change
+  touches every package.
+- Still open and unchanged: everything listed as carried forward in pass 3.
+
+### Harness notes
+
+- Marker sleeps this pass: 191 (`wait-listing-overflow`), 193 (`many-records`), 197
+  (`sidecar-record-shapes`), 199 (`env-hermetic`).
+- **`bg_wait { timeout: 0 }` is the cheap way to get a listing** — the wait times out immediately and the
+  table is the whole answer.
+- A record only reaches the `bg_wait` table if the task was a _background_ task. The `timeout: 5`
+  daemonising shape from `record-cap.test.ts` leaves a **foreground-origin** record that is deliberately not
+  listed (`inherited-record.test.ts`); use `timeout: 0` when a test wants to see it.
+- Two of the new files change `process.env` before a load (`PATH`, the `PI_*` set). Restore them in
+  `afterEach`, and note that a test asserting on `process.env.PATH`-relative resolution has to
+  `process.chdir` — that is what makes F18 visible at all. `shell-path-resolution.test.ts` already chdirs to
+  a temp project dir, which is also where its project-scope `settings.json` lives.
+- A test that makes the log dir un-writable must `chmod` it back before `dispose()`, or the temp agent dir
+  cannot be removed and the run leaks.
+- `existsSync` takes one argument: the assertion message goes in `expect(value, message)`, not in the call.
+- **This session's shell exports `PI_TAKEOVER_MAX_CHAIN=100` (from `~/.bashrc`), so 4 pi-takeover tests are
+  red for every pass of this loop until F22 is fixed.** Do not chase them as regressions.
