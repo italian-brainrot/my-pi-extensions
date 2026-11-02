@@ -49,6 +49,15 @@ real session, not assumed.
   `finishSessionReplacement` runs `rebindSession` and `withSession`, so the model is already right when
   the handoff prompt is sent. Get the `Model` with `ctx.modelRegistry.find(provider, id)`. Guard on the
   reason: on a resume the session's own later choice must win.
+- Pi's `getShellEnv` splits `PATH` only to test whether `<agent-dir>/bin` is already an entry: with it
+  present it returns the configured string verbatim, otherwise `[binDir, currentPath].join(delimiter)` — it
+  never filters. An empty entry survives, and bash, sh and libuv all read one as the child's working
+  directory (`spawn(name, {env: {PATH: ":…"}, cwd})` runs `./name`). Rebuilding a `PATH` instead of handing
+  one on is a behaviour change, not a refactor.
+- `ctx.cwd` is the session's, not the process's: `SessionManager.open` takes the cwd from the session header
+  and a replacement runtime is built with `sessionManager.getCwd()`, while `SettingsManager` — so project
+  settings, and `process.cwd()` — stay where pi was started. Any path a tool resolves against itself
+  (settings values, `PATH` entries) is resolved against a different directory than the child resolves it.
 - Pi's settings are exactly two files, deep-merged project-over-agent: `<cwd>/.pi/settings.json` over
   `<agent-dir>/settings.json`. `deepMergeObjects` takes the project value unless the key is _absent_ there,
   so `""` and `null` override, and the loader does not validate ("a malformed value replaces instead of
