@@ -26,6 +26,13 @@
  *     a log is command output and a sidecar is a whole command line. They are pruned by age and by
  *     count, both while a session runs and when one starts.
  *   - Both shell settings the built-in tool honours apply here: `shellPath` and `shellCommandPrefix`.
+ *   - A call that cannot be made is answered with a sentence, not an errno: a working directory that is gone,
+ *     a configured shell that cannot be run, a log directory that cannot be written, and a command that cannot
+ *     be handed to a shell at all (longer than one argument, or holding a NUL byte). What still throws is a
+ *     call that makes no sense: an empty `command`, an out-of-range `timeout`.
+ *   - A spawn that produced no process is not a task: it gets no pid, no task ID, no sidecar and no row in any
+ *     listing, and the reason the exec failed is what the answer says. A command that started and then failed is
+ *     the other case, and it is reported as a finished command with its exit status.
  *   - Results carry `structuredContent` (as the built-in bash tool does) for programmatic callers
  *     such as codemode scripts: a finished command reports its output, a command moved to the
  *     background only its task text, and bg_wait every background task of the session.
@@ -116,6 +123,18 @@ const PARTIAL_PREVIEW_BYTES = 4096;
 const WHOLE_FILE_READ_CAP = 8 * 1024 * 1024;
 /** Cap for `structuredContent.output`, matching the built-in bash tool. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+/**
+ * How many bytes one argument to `execve` may hold. The whole command is one `-c` argument, so a command
+ * past this cannot be started at all: Linux's `MAX_ARG_STRLEN` is 32 pages and the terminating NUL is one of
+ * the bytes (measured here: 131071 bytes spawn, 131072 throw). This is not a check — the number belongs to
+ * the kernel and its page size, and `spawn`'s `E2BIG` is what answers — it is only what the refusal says.
+ */
+const MAX_SHELL_ARG_BYTES = 32 * 4096 - 1;
+/**
+ * How long to wait for a spawn that produced no process to name its reason. Node emits `error` for it on the
+ * turn the failure is read back, so this is a bound on the pathological case, not a normal wait.
+ */
+const SPAWN_FAILURE_WAIT_MS = 2000;
 /** Above this size a running job's log gets flagged in tool results. */
 const LARGE_LOG_WARN_BYTES = 50 * 1024 * 1024;
 
@@ -134,10 +153,11 @@ const LISTING_COMMAND_CHARS = 100;
 /**
  * Caps on the model-facing listing; `details.tasks` and `structuredContent.tasks` always carry every task.
  *
- * Running tasks come first and are listed up to `LISTING_MAX_RUNNING_TASKS`, so a session that started a
- * hundred watchers sees them. Finished tasks are what the cap is really for — they are the rows a session
- * accumulates without bound — and they get `LISTING_MAX_FINISHED_TASKS` rows, newest first. The sentence
- * under the table counts each kind it left out, so the cap can never be described wrongly.
+ * Running tasks come first and get `LISTING_MAX_RUNNING_TASKS` rows — the newest ones, so a session that
+ * started a hundred watchers still sees the hundred it last touched. Finished tasks are what the cap is really
+ * for — they are the rows a session accumulates without bound — and they get `LISTING_MAX_FINISHED_TASKS`
+ * rows, also the newest. The sentence under the table counts each kind it left out, so the cap can never be
+ * described wrongly.
  */
 const LISTING_MAX_RUNNING_TASKS = 100;
 const LISTING_MAX_FINISHED_TASKS = 30;
@@ -153,7 +173,16 @@ interface BgJob {
   id: string;
   command: string;
   cwd: string;
-  pid: number;
+  /**
+   * The process the spawn produced, or `undefined` when it produced none.
+   *
+   * `child.pid` is unset exactly when the spawn failed before there was a process to give an id to — a
+   * program the child could not exec, or a fork that never happened. That is a different thing from a
+   * process that started and then failed, which has a pid and an `error` or exit report of its own. No
+   * placeholder goes here: a pid the operating system never handed out cannot be reported, signalled, or
+   * written to a sidecar, so every reader has to answer for not having one.
+   */
+  pid?: number;
   logPath: string;
   metaPath: string;
   startedAt: number;
@@ -179,6 +208,8 @@ interface BgJob {
    * registry cap: the in-memory job is what carries that obligation. See `releaseJobRecord()`.
    */
   groupRecord?: boolean;
+  /** Why a spawn that produced no process failed, as the `error` event said it. */
+  startFailure?: string;
   proc?: ChildProcess;
   donePromise?: Promise<void>;
   resolveDone?: () => void;
@@ -383,7 +414,7 @@ function releaseJobRecord(job: BgJob): void {
 
 function describeJob(job: BgJob, includeId = true): string {
   const label = includeId ? `${job.id}: ` : "";
-  if (job.status === "running") return `${label}running (pid ${job.pid})`;
+  if (job.status === "running") return `${label}running (pid ${job.pid ?? "unknown"})`;
   const code = job.exitCode !== null ? `exit ${job.exitCode}` : job.signal ? `signal ${job.signal}` : "code unknown";
   return `${label}${job.status} (${code})`;
 }
@@ -633,6 +664,12 @@ function buildEnv(ctx: ExtensionToolContext | undefined): NodeJS.ProcessEnv {
 // ── Spawning ─────────────────────────────────────────────────────────────────
 
 function writeMeta(job: BgJob): void {
+  // A record names a process, or it names nothing. `pid` is undefined for a spawn that never produced a
+  // process, and such a job has no group to stop and nothing to re-adopt, so writing a record for it would
+  // put a made-up pid in front of every reader — a number that is someone else's process the moment it is
+  // written down.
+  if (job.pid === undefined) return;
+
   // Written to a temp name in the same directory and renamed over the target, never truncated in place.
   // `<agent-dir>/bg-tasks` is shared, and every other pi process reads these records at its own
   // `session_start`: a reader that catches a half-written file cannot tell whose record it was, and either
@@ -749,6 +786,92 @@ function isManagedByOtherProcess(pid: number): boolean {
 const backgroundListeners = new Set<(job: BgJob) => void>();
 
 /**
+ * A command refused before there was a process, in a sentence.
+ *
+ * Thrown so the tool can answer with it (see the bash tool's `run`) rather than let `pi` turn an errno into
+ * the whole reply: `message` is the text the model reads.
+ */
+class SpawnRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpawnRefused";
+  }
+}
+
+/**
+ * Say why the log-open plus the spawn failed, in terms of what to do about it.
+ *
+ * Three reachable ways, and none of them names itself usefully on its own:
+ *
+ *   - `E2BIG` — the command is longer than one argument can be (`MAX_SHELL_ARG_BYTES`), `shellCommandPrefix`
+ *     included, because the whole thing is handed to the shell as one `-c` argument.
+ *   - `ERR_INVALID_ARG_VALUE` — Node refuses an argument holding a NUL byte before libuv sees it.
+ *   - anything from `openPrivate` — the log dir changed between the precondition check and this open: out of
+ *     space, out of file descriptors, a permission set by another process.
+ *
+ * Pi's own tool throws for all three, so this is not a divergence from the host; it is the one place left
+ * where an environment failure would reach the model as an errno here.
+ */
+function spawnRefusal(shell: string, argBytes: number, error: unknown): SpawnRefused {
+  const code = (error as { code?: string } | undefined)?.code;
+  if (code === "E2BIG") {
+    return new SpawnRefused(
+      `Command is too long to start: ${argBytes} bytes in one argument, and one argument holds at most ${MAX_SHELL_ARG_BYTES} bytes. Put the command in a file and run the file.`,
+    );
+  }
+  if (code === "ERR_INVALID_ARG_VALUE") {
+    return new SpawnRefused("The command contains a null byte, which cannot be handed to a shell.");
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  return new SpawnRefused(`Cannot start the command with ${shell}: ${detail}`);
+}
+
+/**
+ * Open the log and start the process, in one place, because both fail before there is a process and the
+ * other has to be taken back with it. `spawn` reports a failure it notices after the fork through the
+ * `error` event; a refusal of the arguments never reaches the fork, so nothing downstream would hear of it.
+ */
+function openLogAndSpawn(shell: string, arg: string, cwd: string, env: NodeJS.ProcessEnv, logPath: string): ChildProcess {
+  const fd = openPrivate(logPath, "w");
+  try {
+    return spawn(shell, ["-c", arg], {
+      cwd,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", fd, fd],
+      env,
+    });
+  } finally {
+    // The child duplicated the descriptors at spawn; the parent copy is not needed.
+    closeSync(fd);
+  }
+}
+
+/**
+ * Wait for a spawn that produced no process to say why.
+ *
+ * `child.pid === undefined` means the exec failed, and Node emits `error` for it — with no `exit` event — on
+ * the turn the failure is read back; the job's own handler marks the job over in that same turn. Either one
+ * answers the question. The bound is only so that a caller can never hang on a runtime that answers neither:
+ * an unanswered question here is answered as "the command never started".
+ */
+function spawnFailureReason(job: BgJob): Promise<string> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      job.proc?.removeListener("error", onError);
+      resolve(value);
+    };
+    const onError = (error: Error) => finish(job.startFailure ?? error.message);
+    const timer = setTimeout(() => finish("the command never started"), SPAWN_FAILURE_WAIT_MS);
+    job.proc?.once("error", onError);
+    void getDone(job).then(() => finish(job.startFailure ?? "the command never started"));
+  });
+}
+
+/**
  * Start a command with stdout and stderr attached to a log file.
  *
  * The descriptors are handed to the child directly instead of wrapping the
@@ -773,30 +896,23 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
   // Resolved for this job's directory: the child resolves the program relative to the directory it is
   // started in, and for a configured `shellPath` this is already an absolute path.
   const shell = resolveShell(cwd);
+  const shellArg = withCommandPrefix(command);
 
-  const fd = openPrivate(logPath, "w");
   let proc: ChildProcess;
   try {
-    proc = spawn(shell.shell, ["-c", withCommandPrefix(command)], {
-      cwd,
-      detached: process.platform !== "win32",
-      stdio: ["ignore", fd, fd],
-      env: buildEnv(ctx),
-    });
+    proc = openLogAndSpawn(shell.shell, shellArg, cwd, buildEnv(ctx), logPath);
   } catch (error) {
     // Nothing can read an empty log left behind by a command that never started.
     unlinkQuietly(logPath);
-    throw error;
-  } finally {
-    // The child duplicated the descriptors at spawn; the parent copy is not needed.
-    closeSync(fd);
+    throw spawnRefusal(shell.shell, Buffer.byteLength(shellArg, "utf8"), error);
   }
 
   const job: BgJob = {
     id,
     command,
     cwd,
-    pid: proc.pid ?? -1,
+    // No placeholder for a spawn that produced no process: see the field's comment.
+    pid: proc.pid,
     logPath,
     metaPath,
     startedAt: Date.now(),
@@ -808,16 +924,28 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
     proc,
   };
   getDone(job);
-  jobs.set(id, job);
-  writeMeta(job);
-  enforceRegistryCap();
 
   proc.on("exit", (code, signal) => markDone(job, code, signal));
   proc.on("error", (err) => {
-    const note = `failed to start command with ${shell.shell}: ${err instanceof Error ? err.message : String(err)}`;
-    appendToLog(job.logPath, `\n[bg-tasks] ${note}`);
+    const detail = err instanceof Error ? err.message : String(err);
+    job.startFailure ??= detail;
+    appendToLog(job.logPath, `\n[bg-tasks] failed to start command with ${shell.shell}: ${detail}`);
     markDone(job, 127, null);
   });
+
+  // A spawn that produced no process is not a job: nothing is running, there is no pid to report, no group to
+  // stop, and nothing for a later runtime to adopt. So it enters no registry, gets no sidecar, and is not
+  // announced to a wait — the `error` event that carries the reason is what ends it, and the caller answers
+  // with it: the foreground caller as a command that exited 127 with the reason in its output, the background
+  // caller as a failure naming the reason where the task ID would have been.
+  if (job.pid === undefined) {
+    if (backgrounded) proc.unref();
+    return job;
+  }
+
+  jobs.set(id, job);
+  writeMeta(job);
+  enforceRegistryCap();
 
   if (backgrounded) {
     proc.unref();
@@ -860,7 +988,7 @@ function appendToLog(path: string, text: string): void {
 function killJob(job: BgJob): void {
   const { pid } = job;
   job.killRequested = true;
-  if (pid <= 0) return;
+  if (pid === undefined || pid <= 0) return;
 
   signalJobTree(pid, "SIGTERM");
 
@@ -914,7 +1042,7 @@ function signalJobTree(pid: number, sig: NodeJS.Signals): void {
  */
 async function stopLeftoverGroup(job: BgJob): Promise<boolean> {
   const { pid } = job;
-  if (!hasLeftoverGroup(job)) return false;
+  if (pid === undefined || !hasLeftoverGroup(job)) return false;
   try {
     process.kill(-pid, "SIGTERM");
   } catch {
@@ -966,7 +1094,7 @@ async function stopJobAndWait(job: BgJob): Promise<boolean> {
 
 /** Whether a finished job left processes behind in the group its shell led. */
 function hasLeftoverGroup(job: BgJob): boolean {
-  return job.status !== "running" && job.pid > 0 && !processAt(job.pid) && processGroupExists(job.pid);
+  return job.status !== "running" && job.pid !== undefined && job.pid > 0 && !processAt(job.pid) && processGroupExists(job.pid);
 }
 
 /**
@@ -1161,7 +1289,7 @@ function startAdoptedPoller(): void {
   adoptedTimer = setInterval(() => {
     let anyAdopted = false;
     for (const job of jobs.values()) {
-      if (!job.adopted || job.status !== "running") continue;
+      if (!job.adopted || job.status !== "running" || job.pid === undefined) continue;
       if (isAlive(job.pid)) {
         anyAdopted = true;
         continue;
@@ -1295,10 +1423,45 @@ function adoptJobs(): void {
 
 // ── Reading output ───────────────────────────────────────────────────────────
 
-function readTail(path: string, maxBytes: number): string {
+/**
+ * Decode a byte window that may begin or end in the middle of a character, and show neither half.
+ *
+ * A window cut out of the middle of a log starts wherever the file size makes it start and ends wherever the
+ * read stopped. Half a codepoint decodes as U+FFFD, and at the start of a window that character is the first
+ * thing a model is shown. A continuation byte (`10xxxxxx`) at the start is the tail of a character that began
+ * before the window; a lead byte whose continuation bytes fall past the end is the head of one that ends after
+ * it. Only one sequence can straddle either edge, so trimming those is enough — bytes the file itself got
+ * wrong are the command's business, not something this function invents.
+ */
+function decodeByteWindow(window: Buffer): string {
+  let start = 0;
+  while (start < window.length && (window[start]! & 0xc0) === 0x80) start++;
+
+  let end = window.length;
+  // The only sequence that can straddle the end begins in the last three bytes. Scan back from the end over
+  // continuation bytes to the lead byte of the final sequence, and drop it if its own length does not fit.
+  for (let i = window.length - 1; i >= Math.max(start, window.length - 3); i--) {
+    const byte = window[i]!;
+    if ((byte & 0xc0) === 0x80) continue;
+    const length = byte < 0x80 ? 1 : byte < 0xe0 ? 2 : byte < 0xf0 ? 3 : 4;
+    if (i + length > window.length) end = i;
+    break;
+  }
+
+  return window.subarray(start, end).toString("utf8");
+}
+
+interface LogTail {
+  text: string;
+  /** The bytes of the file this window covers, which is what the preview label counts. */
+  bytes: number;
+}
+
+/** The last bytes of a log, as a window that never cuts a character in half. */
+function readTail(path: string, maxBytes: number): LogTail {
   try {
     const size = statSync(path).size;
-    if (size === 0) return "";
+    if (size === 0) return { text: "", bytes: 0 };
     const bytesToRead = Math.min(size, maxBytes);
     const buffer = Buffer.alloc(bytesToRead);
     const fd = openSync(path, "r");
@@ -1307,12 +1470,12 @@ function readTail(path: string, maxBytes: number): string {
       const currentSize = statSync(path).size;
       const pos = Math.max(0, currentSize - bytesToRead);
       const bytesRead = readSync(fd, buffer, 0, bytesToRead, pos);
-      return buffer.subarray(0, bytesRead).toString("utf8");
+      return { text: decodeByteWindow(buffer.subarray(0, bytesRead)), bytes: bytesRead };
     } finally {
       closeSync(fd);
     }
   } catch {
-    return "";
+    return { text: "", bytes: 0 };
   }
 }
 
@@ -1335,12 +1498,8 @@ function readLogWindow(path: string): LogWindow {
     const fd = openSync(path, "r");
     try {
       const bytesRead = readSync(fd, buffer, 0, buffer.length, size - buffer.length);
-      // Drop the partial first line and any split-codepoint replacement char.
-      const content = buffer
-        .subarray(0, bytesRead)
-        .toString("utf8")
-        .replace(/^[^\n]*\n/, "")
-        .replace(/^\uFFFD+/, "");
+      // The window itself never starts mid-character, so what is left to drop is the partial first line.
+      const content = decodeByteWindow(buffer.subarray(0, bytesRead)).replace(/^[^\n]*\n/, "");
       return { content, size, windowed: true };
     } finally {
       closeSync(fd);
@@ -1400,7 +1559,8 @@ function readStructuredOutput(path: string): { content: string; truncated: boole
     const fd = openSync(path, "r");
     try {
       const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-      return { content: buffer.subarray(0, bytesRead).toString("utf8"), truncated: true };
+      // The cut is at the end of a window here, so it is the trailing half of a character to trim.
+      return { content: decodeByteWindow(buffer.subarray(0, bytesRead)), truncated: true };
     } finally {
       closeSync(fd);
     }
@@ -1513,7 +1673,8 @@ interface TaskInfo {
   status: BgStatus;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
-  pid: number;
+  /** Absent for a task that never had a process; every listed task of this runtime has one. */
+  pid?: number;
   command: string;
   runtimeSeconds: number;
   logPath: string;
@@ -1559,7 +1720,7 @@ function backgroundTasks(): TaskInfo[] {
 }
 
 function statusColumn(info: TaskInfo): string {
-  if (info.status === "running") return `running (pid ${info.pid}${info.adopted ? ", adopted" : ""})`;
+  if (info.status === "running") return `running (pid ${info.pid ?? "unknown"}${info.adopted ? ", adopted" : ""})`;
   const code = info.exitCode !== null ? `exit ${info.exitCode}` : info.signal ? `signal ${info.signal}` : "code unknown";
   return `${info.status} (${code})`;
 }
@@ -1617,10 +1778,12 @@ function taskSection(infos: TaskInfo[]): string[] {
   // that dropped running ones is not just incomplete, it is wrong.
   const runningInfos = infos.filter((info) => info.status === "running");
   const finishedInfos = infos.filter((info) => info.status !== "running");
-  // Of the finished ones the newest are kept, which are also the ones a model asks about; the rows stay in
-  // chronological order, and "older … not listed" then describes what was actually dropped. Past its own
-  // bound the running rows kept are the first ones in the table — a table truncated in the middle reads as
-  // a gap — and the note says only "running", because which of them went is not something it claims.
+  // Of each kind the newest are kept, and the rows stay in chronological order, so what a cap drops is always
+  // the oldest of that kind and the sentence under the table says so for both. The two kinds are capped the
+  // same way on purpose: the tasks a model just started are the ones it has no other way to ask about, and a
+  // running task has no log-only history behind it — its row is where its ID is. What a truncated table costs
+  // is the old news at the top, never the new news at the bottom.
+  const keptRunning = runningInfos.slice(-LISTING_MAX_RUNNING_TASKS);
   const keptFinished = finishedInfos.slice(-LISTING_MAX_FINISHED_TASKS);
   const droppedRunning = runningInfos.length - LISTING_MAX_RUNNING_TASKS;
   const droppedFinished = finishedInfos.length - LISTING_MAX_FINISHED_TASKS;
@@ -1632,7 +1795,7 @@ function taskSection(infos: TaskInfo[]): string[] {
     "",
     `Background tasks in this session (${infos.length} tracked, ${runningInfos.length} running):`,
     "",
-    ...taskListing([...runningInfos.slice(0, LISTING_MAX_RUNNING_TASKS), ...keptFinished]),
+    ...taskListing([...keptRunning, ...keptFinished]),
     ...(omitted.length > 0 ? ["", `(${omitted.join(" and ")} not listed; their logs are in ${LOG_DIR})`] : []),
   ];
 }
@@ -1645,7 +1808,7 @@ function startOutputPolling(job: BgJob, onUpdate: AgentToolUpdateCallback<BgTool
   let lastText = "";
   const timer = setInterval(() => {
     if (job.status !== "running") return;
-    const text = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
+    const { text } = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
     if (text === lastText) return;
     lastText = text;
     onUpdate({ content: [{ type: "text", text }], details: { id: job.id, status: "running", logPath: job.logPath } });
@@ -1655,18 +1818,22 @@ function startOutputPolling(job: BgJob, onUpdate: AgentToolUpdateCallback<BgTool
   return () => clearInterval(timer);
 }
 
+/** The pid a task was started with, for the model-facing line: only a process the OS actually made. */
+function pidNote(job: BgJob): string {
+  return job.pid === undefined ? "" : ` (pid ${job.pid})`;
+}
+
 /**
  * The result for a command that is still running and is now a background task. Whatever the command
  * printed so far is already in the log; say what is not there rather than leaving the model to guess.
  */
 function backgroundResult(job: BgJob, reason: string | undefined): BgResult {
-  // The preview is trimmed for display, but whether it was cut is judged on what was read, not on
-  // what is shown.
-  const read = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
-  const readBytes = Buffer.byteLength(read, "utf8");
-  const preview = read.trimEnd();
+  // The preview is trimmed for display, but the label counts the window of the file it was taken from, not
+  // the text that ends up on screen.
+  const tail = readTail(job.logPath, PARTIAL_PREVIEW_BYTES);
+  const preview = tail.text.trimEnd();
   const size = logSize(job.logPath);
-  const previewLabel = size > readBytes ? `Preview (last ${formatSize(readBytes)} of ${formatSize(size)}):` : "Preview:";
+  const previewLabel = size > tail.bytes ? `Preview (last ${formatSize(tail.bytes)} of ${formatSize(size)}):` : "Preview:";
 
   return {
     content: [
@@ -1674,8 +1841,8 @@ function backgroundResult(job: BgJob, reason: string | undefined): BgResult {
         type: "text",
         text: [
           reason
-            ? `Command ${reason} with ID: ${job.id} (pid ${job.pid}).`
-            : `Command running in background with ID: ${job.id} (pid ${job.pid}).`,
+            ? `Command ${reason} with ID: ${job.id}${pidNote(job)}.`
+            : `Command running in background with ID: ${job.id}${pidNote(job)}.`,
           `Output is being written to: ${job.logPath}`,
           "",
           ...(preview ? [previewLabel, preview] : ["(no output yet)"]),
@@ -1769,6 +1936,11 @@ async function runWithTimeout(
       grace.cancel();
     }
 
+    // A spawn that produced no process is not a task to move to the background, however quickly the timeout
+    // came due: wait for the `error` event that ends the job, and report the failure as the finished command
+    // it is, with the reason in its output.
+    if (job.status === "running" && job.pid === undefined) await spawnFailureReason(job);
+
     if (job.status === "running") {
       releaseToBackground(job);
       const reason = signal?.aborted
@@ -1844,9 +2016,25 @@ function abortWatch(signal: AbortSignal | undefined): { promise: Promise<"aborte
 
 // ── Background spawn ─────────────────────────────────────────────────────────
 
-function spawnBackground(command: string, cwd: string, ctx: ExtensionToolContext | undefined): BgResult {
+/**
+ * A command started with `timeout: 0`: the answer is the task, not its output, so it says what is not there.
+ *
+ * A spawn that produced no process is not a task. No ID, no pid, no row in any listing, and nothing in the log
+ * directory: the reason the exec failed is what the model needs, and it goes where the task ID would have been.
+ */
+async function spawnBackground(command: string, cwd: string, ctx: ExtensionToolContext | undefined): Promise<BgResult> {
   const job = spawnJob(command, cwd, ctx, true);
-  return backgroundResult(job, undefined);
+  if (job.pid !== undefined) return backgroundResult(job, undefined);
+
+  const reason = await spawnFailureReason(job);
+  // The only thing the log holds is the note the job's own `error` handler wrote, and that note is now in the
+  // answer. A command that never started leaves no file behind.
+  unlinkQuietly(job.logPath);
+  return refusal(
+    `Command failed to start: ${reason}\n` +
+      "Nothing was started, so there is no task to wait for or stop. The shell it would have run under cannot " +
+      "be exec'd: it is not on the command's PATH, or its `#!` interpreter is missing.",
+  );
 }
 
 // ── Bash tool override ───────────────────────────────────────────────────────
@@ -1881,6 +2069,17 @@ const BASH_PROMPT_GUIDELINES = [
   "bg_stop kills a task; bg_wait waits for any task to finish and lists every background task with its status, run time, output size, and log path.",
   "You can inspect PI_* environment variables for current model and session details.",
 ];
+
+/**
+ * Every way the bash tool refuses a call rather than making a task: one sentence the model can act on, no
+ * task, no exit code. The environment questions all answer this way — the working directory, a configured
+ * shell, the log directory, and a command that cannot be handed to a shell at all — because what `pi` shows
+ * for a thrown error is the message alone, with no `details` and no `structuredContent` next to it. What keeps
+ * throwing is a call that makes no sense: an empty `command`, an out-of-range `timeout`.
+ */
+function refusal(text: string): BgResult {
+  return { content: [{ type: "text", text } as TextContent], details: {}, isError: true };
+}
 
 /**
  * What is wrong with the working directory, if anything. Pi checks this before spawning for the same
@@ -1960,26 +2159,28 @@ function registerBashOverride(pi: ExtensionAPI): void {
       // directory that is gone fails with ENOENT, which reads as "the shell failed to start", and the
       // model goes looking for a missing bash instead of a deleted directory.
       const missing = missingWorkingDirectory(cwd);
-      if (missing) {
-        return { content: [{ type: "text", text: missing }], details: {}, isError: true };
-      }
+      if (missing) return refusal(missing);
 
       // Same for the shell itself: Pi's `getShellConfig` refuses a configured path it cannot run, naming
       // it. Left to `spawn`, a broken `shellPath` arrives as a command that exited 127, which reads like a
       // problem with the command, and every command the session runs would report that.
       const broken = resolveShell(cwd).brokenShellPath;
-      if (broken) {
-        const note = `Custom shell path ${broken.reason}: ${broken.path}\nCannot execute bash commands.`;
-        return { content: [{ type: "text", text: note }], details: {}, isError: true };
-      }
+      if (broken) return refusal(`Custom shell path ${broken.reason}: ${broken.path}\nCannot execute bash commands.`);
 
       const logDir = unusableLogDir();
-      if (logDir) {
-        return { content: [{ type: "text", text: logDir }], details: {}, isError: true };
-      }
+      if (logDir) return refusal(logDir);
 
-      if (resolvedTimeout === 0) return spawnBackground(command, cwd, ctx);
-      return runWithTimeout(command, cwd, resolvedTimeout, signal, onUpdate, ctx);
+      // The preconditions above are the ones this extension can ask about. What only `spawn` knows is that the
+      // command is too big for one argument, or holds a NUL byte, and what only the open knows is that the log
+      // dir changed since the check. Both throw before there is a process, so both are answered here, in the
+      // same shape; anything else this throws is a bug or a malformed call, and stays a throw.
+      try {
+        if (resolvedTimeout === 0) return await spawnBackground(command, cwd, ctx);
+        return await runWithTimeout(command, cwd, resolvedTimeout, signal, onUpdate, ctx);
+      } catch (error) {
+        if (error instanceof SpawnRefused) return refusal(error.message);
+        throw error;
+      }
     };
 
     // blocking is the default: commands that share mutable state run one at a time.
@@ -2081,7 +2282,8 @@ function structuredTask(info: TaskInfo) {
   return {
     id: info.id,
     status: info.status,
-    pid: info.pid,
+    // Only a pid the operating system handed out; `JsonValue` has no room for `undefined` either.
+    ...(info.pid === undefined ? {} : { pid: info.pid }),
     exit_code: info.exitCode,
     signal: info.signal,
     command: info.command,

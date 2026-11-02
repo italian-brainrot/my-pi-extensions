@@ -186,5 +186,7 @@ per-component costs, and that context size is the largest single response rather
   handler, so a command that awaits (like `set_model`, which checks credentials) can finish after the
   one sent right after it. Send the next command when the answer to the previous one arrives —
   `packages/pi-takeover/test/session.test.ts` waits for each id before it prompts.
+- **Vitest 5 hides a test's `console.log` with the default reporter**, so a probe test that prints
+  diagnostics looks like it printed nothing (or like it never ran). Run it with `--reporter=verbose`.
 - **Do not add a build step.** Sources are TypeScript loaded through jiti; Vitest transforms them for
   tests. `tsc --noEmit` is the only compiler in the loop.

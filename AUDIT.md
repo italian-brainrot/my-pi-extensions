@@ -1694,3 +1694,214 @@ Recorded so pass 6 does not spend time here.
   file keeps saying "a result, not a throw", and the reason uncapped `details` cost nothing.
 - The new listing test spawns 104 tasks like its neighbour; with the marker comment
   (`sleep 213 # listing-marker-213-<i>`) they stay distinguishable if a future pass needs to find one.
+
+---
+
+## Pass 5 — fixer
+
+All 8 red tests green, none of them rewritten, none deleted. `npm run check` passes end to end (deps,
+manifest, skills, tsc, biome, **324 tests in 53 files**: 313 carried, 11 new pins); the package is
+**168 tests in 39 files** (`npx vitest --run packages/pi-bg-tasks`). The suite is still as green in the hostile
+shell (`PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npm test`) as in
+a clean one, and a clean run leaves 0 `/tmp/pi-ext-*` directories and no marker processes. The only test files
+I touched are new ones plus one test appended to `test/wait-listing-overflow.test.ts`, which is the F26
+decision the tester offered as the alternative to deleting their test — I took the first branch, so their test
+stands and mine pins the half it does not reach.
+
+### F23 — the fourth precondition answers like the other three
+
+**One block, one catch.** `openLogAndSpawn()` holds the `openPrivate(logPath, "w")` and the `spawn` together:
+they are the two things that fail before there is a process, and the log opened for a spawn that never happened
+has to be taken back with it. So the log-open failure F19's check cannot see — `ENOSPC`, `EMFILE`, `EROFS`, a
+permission set by another process between the check and the open — is now refused in the same sentence shape as
+the command-size and NUL-byte cases.
+
+**Typed, so the catch is narrow.** `spawnJob`'s catch throws `SpawnRefused`, an `Error` subclass whose
+`message` _is_ the model-facing sentence, and `run()` converts only that:
+`if (error instanceof SpawnRefused) return refusal(error.message); throw error;`. `refusal(text)` is now the one
+shape all four refusals build (the working directory, the configured shell, the log dir, the refused spawn), so
+the shape cannot drift.
+
+**The wording the tester chose stands** — `too long` — and the answer names both numbers: the size of the
+argument and the limit (`MAX_SHELL_ARG_BYTES`). `withCommandPrefix(command)` is computed once in `spawnJob`, so
+the size quoted is the whole `-c` argument, prefix included (pinned). The NUL byte is
+`The command contains a null byte, which cannot be handed to a shell.`
+
+**Decision: the limit is a caught errno, not a checked precondition.** `MAX_ARG_STRLEN` is 32 _pages_, so the
+number is the kernel's and the page size's, and a separate `ARG_MAX` caps the whole argument-plus-environment
+block. A size check compiled into the extension would refuse commands another machine runs, and would be a
+second answer to a question `execve` answers exactly. `MAX_SHELL_ARG_BYTES` exists only to say what the refusal
+means, with the measurement next to it (131071 spawn, 131072 throw), and the README states it.
+
+**Decision: `Command is empty.` and `Invalid timeout:` stay throws, and the rule is written down twice** — in
+`refusal()`'s comment and in the README: everything the tool knows about the _environment_ is answered as a
+result; the only things thrown are calls that make no sense (an empty `command`, an out-of-range `timeout`).
+`foreground.test.ts` pins both throws; Pi catches them identically, and neither answer has a `details` or
+`structuredContent` worth losing, which is the only thing a refusal buys.
+
+### F24 — a spawn that produced no process is not a job
+
+`proc.pid ?? -1` is gone. **`BgJob.pid` is `number | undefined`**, and every reader that reports or signals a
+pid now has to answer for not having one: `killJob` (returns), `hasLeftoverGroup`, `stopLeftoverGroup`, the
+adopted poller, `describeJob`/`statusColumn` (print `unknown`, unreachable for registered jobs),
+`backgroundResult` (drops the `(pid …)` note entirely rather than printing `(pid undefined)`), and
+`structuredTask` (omits the key — `JsonValue` has no room for `undefined` either).
+
+**`spawnJob` returns before `jobs.set`, `writeMeta` and `announceBackground` when there is no pid.** That one
+placement carries the whole finding: no task ID is ever handed out, nothing enters the registry, so `bg_wait`
+lists no row and no running ID, `bg_stop` has no entry to talk about, a shutdown signals nothing, and no later
+runtime adopts it. The `error` handler is still attached — it is what ends the job and what writes the reason
+into the log for the foreground path.
+
+**The `-1` question from pass 4's "attacked, no finding" is decided: deleted, and the record is not written at
+all.** `writeMeta` returns for a job with no pid. A sidecar exists to name a process and, through it, a process
+group; a record naming neither answers nothing, and `-1` is somebody else's process the moment it is written
+down.
+
+**Both callers convert the failure, and neither prints a pid.** `spawnBackground` is async: when `pid` is
+undefined it awaits `spawnFailureReason(job)` (the `error` event's message, with `markDone` as the second answer
+and `SPAWN_FAILURE_WAIT_MS` = 2 s as the bound so no call can hang on a runtime that gives neither), unlinks the
+log that only ever held the note, and answers with a refusal naming the program and saying that nothing was
+started. `runWithTimeout` gets the same guard before the release-to-background branch —
+`if (job.status === "running" && job.pid === undefined) await spawnFailureReason(job)` — which is the only way a
+job with no pid could have reached `backgroundResult` (a very short `timeout` beating the `error` event). The
+foreground answer for the same broken shell is untouched: exit 127 with
+`[bg-tasks] failed to start command with <shell>: …` in the output, the tester's pin.
+
+**The two paths differ because the shapes differ, not because one was missed.** A finished command has an exit
+code and an output, so the reason goes there; a background start's slot for a reason is the task ID, and a task
+ID would be a lie. Both say the reason; neither invents a pid. **Exactly one answer appears per call**: the
+argument-refusal family throws once from `spawnJob` and is converted once in `run()`; the no-pid family never
+throws and registers nothing, so there is no second report behind it. `bg_stop` on an ID from a refused start is
+"Unknown task" — and there is no such ID to give it.
+
+### F25 — one window decoder, three reads through it
+
+`decodeByteWindow(buffer)` skips leading continuation bytes, then scans back over at most three bytes to the
+lead byte of the final sequence and drops it if its own length does not fit inside the window. Only one sequence
+can straddle either edge. Bytes the file itself got wrong are left alone — this trims what the _window_ split,
+not the command's own garbage.
+
+It replaces the leading-`U+FFFD` strip in `readLogWindow` (the partial-first-line drop stays), and is used by
+`readTail` — the preview of a moved-to-background command and the partials streamed while it runs — and by
+`readStructuredOutput`'s 1 MiB cut. **That cut is decided, as asked: trim it.** It is not model-facing, but a
+codemode caller is handed the same broken string, and it is the same three lines either way.
+
+**The preview label counts the window taken from the file, not the text shown.** `readTail` returns
+`{ text, bytes }` and `backgroundResult` labels with `bytes` (`bytesRead`). The old count was
+`Buffer.byteLength(decoded)`, which is wrong in both directions: longer when the log holds invalid UTF-8 (three
+bytes per replacement character for one byte read), shorter whenever the window had to drop a half character.
+"Last 4.0KB of 7.8KB" is a claim about the file, so it now measures the file. The README says so.
+
+Checked rather than assumed: Pi's `truncateTail` cannot split a character except inside its one byte-cut line,
+and `truncateStringToBytesFromEnd` already skips leading continuation bytes — the same fix, one function over in
+the host. Nothing to mirror there.
+
+### F26 — the newest running rows, and the rule in prose
+
+`runningInfos.slice(0, LISTING_MAX_RUNNING_TASKS)` became `slice(-LISTING_MAX_RUNNING_TASKS)`. Both kinds of row
+are now capped the same way — keep the newest, print oldest first — so what a cap drops is always the oldest of
+its kind, in one direction a model can reason about. The comment that argued the old choice ("a table truncated
+in the middle reads as a gap") argued for something else: keeping the newest running rows cuts the table at its
+start.
+
+The sentence under the table is **unchanged** — `(4 running tasks not listed; their logs are in …)`. Pass 4's
+pin requires that exact phrase, and it is not wrong: what it does not say is _which_ four, and the README now
+says that (`Every running task gets a row until there are 100 of them … both caps keep the newest tasks and
+print them oldest first`). Both cap comments carry the rule too.
+
+### README
+
+Four claims moved: the preview is whole characters and its byte count is the window (with the task ID and pid
+sentences next to it); the per-argument limit, the null byte and an unopenable log file are refused with a
+sentence, and a call that makes no sense is the only thing thrown; a command whose process was never created is
+never presented as running (foreground: exit 127 with the reason; `timeout: 0`: an error, no task ID, no pid,
+nothing in the log directory), which also corrected the `#!` paragraph that said such a failure "comes back as a
+command that exited 127"; and the listing's row rule. The sidecar paragraph gained "a record always names a
+process".
+
+### MEMORY.md
+
+No line added or changed. Nothing this pass needed from the host was new: the two spawn facts the fixes turn on
+(`spawn` throws rather than emitting `error` for refused arguments; `child.pid` is `undefined` when the exec
+failed, with an `error` event and no `exit` event) are in the harness notes above and in the code where they are
+acted on, and Pi's `truncateStringToBytesFromEnd` turning out to trim the same way `decodeByteWindow` does is a
+detail of one host function, not a rule every session needs. The one harness fact worth keeping near the tests —
+Vitest 5 hides a test's `console.log` under the default reporter — went to `docs/testing.md`, which is where
+those conventions live.
+
+### New pins, all green
+
+- `test/spawn-too-long.test.ts` (4). A command of exactly 131071 bytes runs (the refusal is not a precondition
+  that bites early); one byte more is refused and quotes both its own size and the limit; a long
+  `shellCommandPrefix` makes a short command too long, and the number quoted is the whole argument's; the NUL
+  byte is named as a null byte.
+- `test/spawn-no-process.test.ts` (4). The refusal names the program that failed to exec, and gives no ID, no
+  `details.id`, no `details.pid`, no `structuredContent`. The default-shell shape names `spawn bash ENOENT`, says
+  nothing was started, mentions no pid, and leaves the log dir empty. After such a start `bg_wait` answers "No
+  background tasks are running." with `tasks: []`, and a `bg_stop` asked for anyway answers "Unknown task" with
+  nothing on disk to find. And nothing survives a session replacement — the next runtime reads an empty directory
+  because no record was ever written.
+- `test/preview-structured-codepoint.test.ts` (2). `structuredContent.output` for a 1400001-byte log is
+  `truncated`, contains no `U+FFFD`, ends on a whole character, and is exactly 1048575 bytes — one character
+  short of 1 MiB, so a change that decodes the raw window again shows up. The preview label is exactly
+  `Preview (last 4.0KB of 7.8KB):`.
+- `test/wait-listing-overflow.test.ts` (+1). 104 running tasks: the 100 printed rows, read off the table in
+  order, are `running.slice(4)` — the four oldest are the ones with no row, and the note still counts them as
+  running.
+- The tester's three red files and their F26 test pass as written.
+
+### Deliberately left
+
+- **No test for the log-open half of the new catch.** `ENOSPC`, `EMFILE`, `EDQUOT` and a chmod from another
+  process all need the filesystem to change between `unusableLogDir()` and the open, which pass 5 measured as
+  not producible here. The structural fix is in; the branch is unreachable in the harness, not untested by
+  choice.
+- **A never-started job still has its log opened and taken back.** The foreground path needs the file to hold
+  the note; the background refusal writes it, reads the reason off the event, and unlinks it in the same turn. A
+  reader watching the directory during a call can see it for microseconds.
+- `shellsByCwd` unbounded, F18's message naming no directory, the `#!` probe, `stopLeftoverGroup`'s early
+  `return false`, `tightenPrivate` on files another live runtime owns, the recycled-`ownerPid` rule, Pi's
+  `/bin/bash` → `bash` → `sh` fallback, retention driven by completions, the numbers in a sidecar being trusted
+  by the report, Windows being POSIX-shaped: all unchanged, as carried.
+
+### For pass 6 — what to attack
+
+- **`MAX_SHELL_ARG_BYTES` is a literal in the message and in a test.** 131071 is right for a 4 KiB-page kernel;
+  on a 64 KiB-page one the kernel allows 2 MiB − 1 and both the sentence and `spawn-too-long.test.ts` would be
+  wrong. Is there a cheap way to get the page size (or the real threshold) from the machine without a probe
+  process per command?
+- **What else can still throw out of `run()` after the preconditions?** The conversion is `instanceof
+  SpawnRefused`, so the answer to "does the bash tool ever reject?" is now "only for a malformed call" — worth
+  attacking by enumeration: `buildEnv`, `resolveShell`, the sleep/abort machinery, `formatLog`/`truncateTail`,
+  `readStructuredOutput`, `outputCounts`. A throw that is not `SpawnRefused` is the finding, not the fix.
+- **The no-pid rule is carried by eight readers now.** Re-check every `.pid` read in `src/index.ts`: are the new
+  guards all necessary, and is any of them silently a no-op? `groupNote`'s `(pgid ${job.pid})` is the one place
+  that still interpolates the field unguarded (only reachable when a group was stopped, which requires a pid) —
+  worth a look for the same reason `pidNote` exists.
+- **`SPAWN_FAILURE_WAIT_MS` is chosen, not derived**, and it is a ref'd timer: a doomed background start holds
+  the runtime up to 2 s if the `error` event never arrives. Pass 5 measured the event arriving immediately for
+  both reachable shapes, so the interesting question is whether any shape exists where it does not (a signal
+  that kills the forked child before the exec? a seccomp refusal?).
+- **F22's fixture knobs** (`PI_FAKE_LOG`, `PI_FAKE_RULES`, `FAKE_PI_*`) and the rest of pass 4's and this
+  pass's carried lists, unchanged.
+
+### Harness notes
+
+- **Marker sleeps added this pass: 221 (`wait-listing-overflow`'s new test), 223 (`preview-structured-codepoint`
+  tail).** `spawn-too-long`, `spawn-no-process` and the structured-output test spawn nothing that outlives their
+  own call.
+- **A test for the `E2BIG` boundary is cheap and exact**: `echo MARKER #` padded with `#` to exactly 131071
+  bytes runs (output: one line), 131072 throws. Padding with `#` keeps the argument a comment, so the command
+  costs nothing and its size is the length of the string.
+- **For a _trailing_ split, make the payload an odd number of bytes.** `printf 'x'` then 700000 two-byte
+  characters is 1400001 bytes, so the 1 MiB cut lands on a lead byte and the trimmed window is 1048575 bytes. An
+  even-length payload cuts cleanly and the test proves nothing about the end of a window.
+- **`loadExtension({ env: { PATH: "/nonexistent-dir" } })` puts that on `process.env` for the whole load**, so
+  every command of that load fails to exec the default shell — which is how F24's first shape is reached without
+  touching the host. The harness restores `PATH` in `dispose()`; the load still needs its `dispose()`.
+- **A leftover log in the log dir is not automatically a leak**: a truncated command keeps its log by design.
+  What looked like F24 leaving a file behind was a probe command whose typo printed 131 KB. Read the file before
+  believing the symptom.
+- **Vitest 5 hides a test's `console.log` with the default reporter** — `--reporter=verbose` shows it. Worth
+  knowing the next time a probe test appears to print nothing.

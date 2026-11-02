@@ -76,7 +76,23 @@ already has everything. Output that had to be truncated keeps its log, and the r
 
 A command that was moved to the background returns the task ID, the pid, the log path, and the last
 4 KB of output printed so far — or `(no output yet)` when the command has printed nothing. The
-model is told to keep working rather than wait.
+model is told to keep working rather than wait. That preview is always whole characters: a window that
+would begin or end inside a character drops that character, and the byte count beside it is the window
+taken from the log, not the length of the text shown.
+
+A command that cannot be handed to a shell at all is refused the way the other things a command needs in
+order to start are — with a sentence naming what is wrong, not an errno. The whole command is one `-c`
+argument, so one longer than the kernel lets an argument be (131071 bytes on a Linux with 4 KiB pages,
+`shellCommandPrefix` included) is answered with its size and the limit in the message; so is a command
+holding a null byte, and so is a log file that cannot be opened. A call that makes no sense — an empty
+`command`, a `timeout` outside its range — is the only thing this tool throws instead of answering.
+
+A command whose process was never created is never presented as a running task. `spawn` fails that way for a
+session whose `PATH` has no `bash` — the default shell is deliberately never checked — and for a configured
+shell script whose `#!` interpreter is missing. Run in the foreground it is a command that exited 127 with the
+reason in its output; started with `timeout: 0` it is an error naming that reason, with no task ID, no pid, and
+nothing left in the log directory. A pid in a result is always a pid the operating system handed out, and a
+sidecar always names a real process.
 
 Finished results also carry `structuredContent` (`output`, `truncated`, `exit_code`,
 `wall_time_seconds`, and `full_output_path` when truncated) so programmatic callers such as
@@ -105,9 +121,11 @@ bg-7f3k2m1q  running (pid 4300)  1m12s  42 lines   3096 chars   ~/.pi/agent/bg-t
 - **log path** — the file to `Read`, or `(no log: …)` if retention removed it.
 
 Commands that finished in the foreground are deliberately not in this table: their output already
-reached the model and their log is gone. Every running task gets a row — up to 100 of them — and the
-newest 30 finished tasks get one; when anything is left out, the sentence under the table says what was,
-by kind. `details.tasks` and `structuredContent.tasks` always carry all of them, with
+reached the model and their log is gone. Every running task gets a row until there are 100 of them, and the
+newest 30 finished tasks get one. Both caps keep the **newest** tasks and print them oldest first, so when a cap
+bites the tasks left without a row are the oldest of their kind; when anything is left out, the sentence under
+the table says how many of each kind were. `details.tasks` and `structuredContent.tasks` always carry all of
+them, with
 `id`, `status`, `pid`, `exit_code`, `signal`, `command`, `runtime_seconds`, `log_path`,
 `log_exists`, `bytes`, `chars`, and `lines`.
 
@@ -172,7 +190,8 @@ the command again is enough.
 
 A sidecar is written to a temp name in the same directory and renamed into place, so a session reading
 the directory — which every pi sharing the agent dir does at its own start — never sees a half-written
-record. A record a reader cannot read — not valid JSON, JSON that is not an object, an object whose
+record. A record always names a process: none is written for a command whose spawn produced no process, so
+no reader is ever handed a pid that was never real. A record a reader cannot read — not valid JSON, JSON that is not an object, an object whose
 `pid` is not a number — is left where it is, because it may be a live session's only record of a command
 it is waiting on and the reader has nothing to go on otherwise; both it and a temp left by a process that
 died mid-write then age out under the rules above. Deleting a record is what an affirmative answer
@@ -246,8 +265,9 @@ Nothing of that name answers `Custom shell path not found: <value>`; something t
 answers `Custom shell path not executable: <value>`. Either way every command of the session in that
 directory answers that, followed by `Cannot execute bash commands.`, instead of trying to start the
 setting and reporting a command that exited 127. One thing no check of that kind can see: a script whose
-`#!` interpreter is missing is a perfectly executable file, so it does start, and the failure comes back
-as a command that exited 127 rather than as a broken setting. Pi throws its `not found` message; here
+`#!` interpreter is missing is a perfectly executable file, so it is started, and the failure comes back
+as a spawn that produced no process: a command that exited 127 with the reason in its output, or, with
+`timeout: 0`, an error naming the reason and no task at all. Pi throws its `not found` message; here
 both are tool results, so the model sees the setting is broken rather than a command that failed.
 
 `settings.shellCommandPrefix` is prepended to every command exactly as the built-in tool prepends it,

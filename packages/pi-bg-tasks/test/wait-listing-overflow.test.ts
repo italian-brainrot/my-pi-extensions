@@ -162,4 +162,29 @@ describe("a task listing with more running tasks than the cap", () => {
     expect(kept.length, `the table stays bounded: ${summary(report)}`).toBe(100);
     expect(kept, "the newest running tasks are the ones with rows").toEqual(running.slice(-100));
   });
+
+  it("keeps the newest running rows and prints them in the order they started", async () => {
+    // Which 100 of 104 running tasks get a row, and in what order they are printed, is one decision: the newest
+    // 100, oldest first, the same way the finished rows are capped and printed. So the tasks without a row are
+    // always the oldest of their kind, and the sentence under the table says how many of each kind went.
+    const RUNNING = 104;
+    const running: string[] = [];
+    for (let i = 0; i < RUNNING; i++) {
+      running.push(
+        (await ext!.callTool("bash", { command: `sleep 221 # listing-marker-221-${i}`, timeout: 0, blocking: false })).details.id,
+      );
+    }
+
+    const report = await ext!.callTool("bg_wait", { timeout: 0 });
+
+    // A row line starts with the ID; the line under it is the command.
+    const printed = text(report)
+      .split("\n")
+      .filter((line) => line.startsWith("bg-"))
+      .map((line) => line.slice(0, 11));
+
+    expect(printed.length, `the table stays bounded: ${summary(report)}`).toBe(100);
+    expect(printed, "the four oldest running tasks are the ones with no row, oldest first").toEqual(running.slice(4));
+    expect(text(report)).toMatch(/\(4 running tasks not listed; their logs are in /);
+  });
 });
