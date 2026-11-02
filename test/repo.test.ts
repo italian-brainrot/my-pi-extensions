@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { repoRoot } from "./helpers/extension.ts";
+import { EXTENSION_CONFIG_ENV_KEYS, HOST_ENV_KEYS, repoRoot } from "./helpers/extension.ts";
 
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
@@ -88,6 +88,40 @@ describe("the repository", () => {
   it("ignores node_modules and logs in git", () => {
     const gitignore = readFileSync(resolve(repoRoot, ".gitignore"), "utf8");
     expect(gitignore).toContain("node_modules");
+  });
+});
+
+/** Every `process.env.PI_*` an extension reads, with the package that reads it for the failure message. */
+function envKeysRead(dir: string): string[] {
+  const found = new Set<string>();
+  const sourceFiles = (readdirSync(join(dir, "src"), { recursive: true }) as string[]).filter((name) => name.endsWith(".ts"));
+  for (const file of sourceFiles) {
+    const text = readFileSync(join(dir, "src", file), "utf8");
+    for (const match of text.matchAll(/process\.env\.(PI_[A-Z0-9_]+)\b/g)) {
+      if (match[1]) found.add(match[1]);
+    }
+  }
+  return [...found];
+}
+
+const scrubbed = new Set<string>(EXTENSION_CONFIG_ENV_KEYS);
+const hostOwned = new Set<string>(HOST_ENV_KEYS);
+const envReadByPackages = packages.flatMap((info) => envKeysRead(info.dir).map((key) => ({ key, name: info.name })));
+
+describe("the environment the extensions read", () => {
+  it("is scrubbed by the test harness, or belongs to the host", () => {
+    // A variable an extension reads as configuration and the harness does not scrub makes the suite mean
+    // something different in every shell: see test/env-hermetic.test.ts.
+    for (const { key, name } of envReadByPackages) {
+      expect(scrubbed.has(key) || hostOwned.has(key), `${name} reads ${key}, which is in neither harness list`).toBe(true);
+    }
+  });
+
+  it("lists no variable no extension reads", () => {
+    // The other half of the guard: a list that only grows rots, and a stale entry hides the fact that the
+    // variable it names is gone.
+    const read = new Set(envReadByPackages.map(({ key }) => key));
+    for (const key of scrubbed) expect(read.has(key), `scrubbed key ${key} is read by no extension`).toBe(true);
   });
 });
 

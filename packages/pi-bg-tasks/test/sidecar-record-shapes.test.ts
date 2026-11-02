@@ -71,29 +71,50 @@ describe("a record that parses but is not a record", () => {
     ["a number", "42"],
     ["a string", '"bg-nobody"'],
   ] as const)("leaves %s where it is, like a record that does not parse at all", async (_label, contents) => {
-    const job = (await ext!.callTool("bash", { command: "sleep 197", timeout: 0 })).details as { id: string; pid: number };
-    const sidecar = sidecarOf(job.id);
-
-    writeFileSync(sidecar, contents);
-
-    const second = await startRuntime();
-    try {
-      expect(existsSync(sidecar), `a reader that cannot read a record does not remove it (${contents})`).toBe(true);
-
-      const wait = await second.callTool("bg_wait", { timeout: 1 });
-      const ids = ((wait.structuredContent.tasks as any[]) ?? []).map((task) => task.id);
-      expect(ids, "and it does not adopt what it cannot read").not.toContain(job.id);
-
-      expect(isAlive(job.pid), "the command it stood for stays its owner's to stop").toBe(true);
-
-      backdate(sidecar, 4 * DAY_MS);
-      await second.emit({ type: "session_start", reason: "reload" });
-      expect(existsSync(sidecar), "retention's age rule is what collects it").toBe(false);
-    } finally {
-      await stopQuietly(ext!, job.id);
-      await waitFor(() => !isAlive(job.pid), "the owning runtime to stop its own command");
-      await second.emit({ type: "session_shutdown", reason: "quit" });
-      second.dispose();
-    }
+    await leavesTheReaderAlone(contents);
   });
 });
+
+describe("a record whose fields are not the types this reader expects", () => {
+  // The same question one level in. `pid` is what answers "is this command over, and did it leave a group
+  // behind", and a record that cannot answer it is not evidence that nothing has to be stopped: deleting it
+  // is the same guess, made by a reader that met a writer it did not recognise.
+  it.each([
+    ["a string pid", '{"pid":"123456"}'],
+    ["a null pid", '{"pid":null}'],
+    ["no pid at all", '{"command":"sleep"}'],
+  ] as const)("leaves %s where it is and adopts nothing", async (_label, contents) => {
+    await leavesTheReaderAlone(contents);
+  });
+});
+
+/**
+ * Replace a live task's sidecar with `contents`, let a second runtime read the directory, and hold the line:
+ * it is not deleted, it is not adopted, and the age rule is what eventually collects it.
+ */
+async function leavesTheReaderAlone(contents: string): Promise<void> {
+  const job = (await ext!.callTool("bash", { command: "sleep 197", timeout: 0 })).details as { id: string; pid: number };
+  const sidecar = sidecarOf(job.id);
+
+  writeFileSync(sidecar, contents);
+
+  const second = await startRuntime();
+  try {
+    expect(existsSync(sidecar), `a reader that cannot read a record does not remove it (${contents})`).toBe(true);
+
+    const wait = await second.callTool("bg_wait", { timeout: 1 });
+    const ids = ((wait.structuredContent.tasks as any[]) ?? []).map((task) => task.id);
+    expect(ids, "and it does not adopt what it cannot read").not.toContain(job.id);
+
+    expect(isAlive(job.pid), "the command it stood for stays its owner's to stop").toBe(true);
+
+    backdate(sidecar, 4 * DAY_MS);
+    await second.emit({ type: "session_start", reason: "reload" });
+    expect(existsSync(sidecar), "retention's age rule is what collects it").toBe(false);
+  } finally {
+    await stopQuietly(ext!, job.id);
+    await waitFor(() => !isAlive(job.pid), "the owning runtime to stop its own command");
+    await second.emit({ type: "session_shutdown", reason: "quit" });
+    second.dispose();
+  }
+}

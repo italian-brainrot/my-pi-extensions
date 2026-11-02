@@ -14,8 +14,8 @@
  * its environment, and an ambient value must be asked for by name (`env: { … }`) to reach it.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
-import { loadExtension, packageDir } from "./helpers/extension.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadExtension, makeTempDir, packageDir } from "./helpers/extension.ts";
 import { isAlive, waitFor } from "./helpers/wait.ts";
 
 /** Every extension-owned variable in the repo, set to something that changes behaviour. */
@@ -88,6 +88,49 @@ describe("a load in a shell that configures the extensions", () => {
       await waitFor(() => !isAlive(pid), "the quit shutdown to stop the task");
     } finally {
       ext.dispose();
+    }
+  });
+
+  it("lets a test name a variable the shell also sets", async () => {
+    // Scrubbing is not the same as ignoring: a value a test asks for by name has to win over the one the
+    // shell exported, or a package could not test its own configuration at all from inside this loop.
+    configureHost(); // PI_TAKEOVER_MAX_CHAIN=100
+    // The first test in this file already imported pi-takeover, and its cap was taken at module load.
+    vi.resetModules();
+    const ext = await loadExtension({ packageDir: packageDir("pi-takeover"), env: { PI_TAKEOVER_MAX_CHAIN: "1" } });
+    try {
+      const result = await ext.callTool("takeover", { prompt: "Pick up where the last pass stopped." });
+
+      expect(text(result), "the test's cap is the one in force").toContain("takeover 1/1 of this chain");
+    } finally {
+      ext.dispose();
+    }
+  });
+
+  it("holds the scrub until every load is gone", async () => {
+    // Two loads can be alive at once and disposed in any order. Restoring the shell's value when the first
+    // one went would put it back under a load that is still running and still reading it at call time.
+    configureHost(); // PI_BG_TASKS_KEEP_RUNNING=0
+    const firstDir = makeTempDir("pi-ext-agent-");
+    const secondDir = makeTempDir("pi-ext-agent-");
+    const first = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: firstDir.path });
+    vi.resetModules();
+    const second = await loadExtension({ packageDir: packageDir("pi-bg-tasks"), agentDir: secondDir.path });
+
+    first.dispose();
+    try {
+      const started = await second.callTool("bash", { command: "sleep 209", timeout: 0 });
+      const pid = started.details.pid as number;
+
+      await second.emit({ type: "session_shutdown", reason: "reload" });
+      expect(isAlive(pid), "the ambient value is still out of reach of the load that is alive").toBe(true);
+
+      await second.emit({ type: "session_shutdown", reason: "quit" });
+      await waitFor(() => !isAlive(pid), "the quit shutdown to stop the task");
+    } finally {
+      second.dispose();
+      firstDir.dispose();
+      secondDir.dispose();
     }
   });
 });

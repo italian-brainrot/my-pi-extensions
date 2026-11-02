@@ -52,7 +52,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, constants as osConstants } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { TextContent } from "@earendil-works/pi-ai";
 import {
@@ -131,8 +131,16 @@ const COUNT_CHUNK_BYTES = 1024 * 1024;
 const COUNT_SCAN_CAP_BYTES = 16 * 1024 * 1024;
 /** Commands are shown on one line in the task listing. */
 const LISTING_COMMAND_CHARS = 100;
-/** Cap on the model-facing listing; `details.tasks` still carries all of them. */
-const LISTING_MAX_TASKS = 30;
+/**
+ * Caps on the model-facing listing; `details.tasks` and `structuredContent.tasks` always carry every task.
+ *
+ * Running tasks come first and are listed up to `LISTING_MAX_RUNNING_TASKS`, so a session that started a
+ * hundred watchers sees them. Finished tasks are what the cap is really for — they are the rows a session
+ * accumulates without bound — and they get `LISTING_MAX_FINISHED_TASKS` rows, newest first. The sentence
+ * under the table counts each kind it left out, so the cap can never be described wrongly.
+ */
+const LISTING_MAX_RUNNING_TASKS = 100;
+const LISTING_MAX_FINISHED_TASKS = 30;
 
 /** PI_* variables the built-in tool owns; they must never leak from a parent session. */
 const SESSION_ENV_KEYS = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"] as const;
@@ -390,13 +398,29 @@ function logSize(path: string): number {
 
 // ── Environment and shell resolution ─────────────────────────────────────────
 
-let cachedShellSettings: ShellSettings | undefined;
+let cachedShellConfig: ShellConfig | undefined;
 
-/** What the built-in tool takes from settings, resolved once per runtime. */
-interface ShellSettings {
-  shell: string;
+/**
+ * What the built-in tool takes from settings, read once per runtime.
+ *
+ * This is what the user _configured_. Whether a configured `shellPath` can be run is deliberately not part
+ * of it: that answer belongs to the directory the command runs in, and one runtime can run commands in more
+ * than one (see `resolveShell()`).
+ */
+interface ShellConfig {
+  /** The configured `shellPath`, `~`-expanded; empty when unset. */
+  configured: string;
   /** Pi's `shellCommandPrefix`, empty when unset. */
   commandPrefix: string;
+}
+
+/** What one working directory decided about `shellPath`. */
+interface ResolvedShell {
+  /**
+   * The program to spawn: the literal default when `shellPath` is unset, otherwise the file the check
+   * found, as an absolute path, so the child cannot resolve the same setting to a different file.
+   */
+  shell: string;
   /**
    * Set when `shellPath` is configured but cannot be run: the tool then refuses every command, and says
    * which half is wrong — nothing of that name is on PATH, or something is there that cannot be run.
@@ -442,63 +466,112 @@ function configuredString(key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function shellSettings(): ShellSettings {
-  cachedShellSettings ??= resolveShellSettings();
-  return cachedShellSettings;
+function shellConfig(): ShellConfig {
+  cachedShellConfig ??= readShellConfig();
+  return cachedShellConfig;
 }
 
-function resolveShellSettings(): ShellSettings {
+function readShellConfig(): ShellConfig {
   const commandPrefix = configuredString("shellCommandPrefix");
   // An explicit null or "" leaves shellPath unset, and unset means the default shell: `bash` here. How
   // the default is found differs from Pi and the README says so.
   const configured = configuredString("shellPath").trim();
   // A leading `~`, the way pi normalizes it.
-  const shell = configured ? (configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured) : DEFAULT_SHELL;
-  // A configured shell that cannot be run is a broken setting, and Pi's `getShellConfig` refuses it by
-  // name rather than letting every command fail as if the command were at fault.
-  const reason = configured ? unrunnableShell(shell) : undefined;
-  if (reason) return { shell, commandPrefix, brokenShellPath: { path: shell, reason } };
-  return { shell, commandPrefix };
+  return { configured: configured.startsWith("~") ? join(homedir(), configured.slice(1)) : configured, commandPrefix };
 }
 
 /**
- * The directories a bare command name is looked up in: the `PATH` a command of this session gets.
+ * One answer per working directory, and the shape of the rule "the shell is chosen once per runtime".
  *
- * That is not this process's `PATH`. `buildEnv` puts `<agent-dir>/bin` in front of the environment handed
- * to `spawn`, and libuv resolves a bare program name against the *child's* environment — which is what
- * makes `shellPath: "bash"` work at all. A check that scans `process.env.PATH` answers a question about a
- * different PATH than the one that runs the command, and refuses a shell the session could run: pi's bin
- * dir is the documented place for the user's own executables, and the one directory every command of the
- * session can see.
+ * The settings themselves are read once. What is keyed by directory is the answer to "can this be run, and
+ * where is it", because a relative `shellPath`, or a bare name with a relative or empty `PATH` entry, names
+ * a different file in each directory the commands run in. A runtime usually has one such directory, and Pi
+ * can give it another without restarting: `SessionManager.open` takes the cwd from the session header, so a
+ * resumed or forked session runs its commands somewhere else while this process, and this cache, stay.
+ * A directory that has been asked is never asked again, so a settings change still needs `/reload`.
  */
-function commandPathDirs(): string[] {
-  const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  const entries = (process.env[pathKey] ?? "").split(delimiter).filter(Boolean);
-  const binDir = join(getAgentDir(), "bin");
-  return entries.includes(binDir) ? entries : [binDir, ...entries];
+const shellsByCwd = new Map<string, ResolvedShell>();
+
+function resolveShell(cwd: string): ResolvedShell {
+  const { configured } = shellConfig();
+  // The default is never checked: refusing `bash` by name would blame a setting nobody configured, so its
+  // own failure is what reaches the model. Documented in the README.
+  if (!configured) return { shell: DEFAULT_SHELL };
+  // Resolved once, absolute: every relative thing below — the value itself, a relative `PATH` entry — is
+  // relative to the directory the child runs in, not to wherever pi was started.
+  const base = resolve(cwd);
+  const answer = shellsByCwd.get(base);
+  if (answer) return answer;
+  const resolved = findConfiguredShell(configured, base);
+  shellsByCwd.set(base, resolved);
+  return resolved;
 }
 
 /**
- * Why a configured shell cannot be run, or undefined when it can.
+ * The `PATH` a command of this session gets, as a value for the environment.
+ *
+ * Pi's `getShellEnv` (utils/shell.js), exactly: the configured string is split into entries only to decide
+ * whether pi's bin dir is already one of them, and otherwise handed on verbatim. Rebuilding it is not a
+ * no-op — `filter(Boolean)` drops an empty entry, and bash, sh and libuv all read an empty entry as the
+ * command's working directory. A session whose `PATH` was assembled as `PATH=$SOMETHING:$PATH` with
+ * `$SOMETHING` unset therefore loses a whole search directory under a rebuilt `PATH`, and runs the command
+ * with the built-in tool. It is also the branch this extension used to share, before one function started
+ * building the PATH for both the check and the environment.
+ */
+function commandPathValue(): { key: string; value: string } {
+  const key = Object.keys(process.env).find((name) => name.toLowerCase() === "path") ?? "PATH";
+  const current = process.env[key] ?? "";
+  const binDir = join(getAgentDir(), "bin");
+  const hasBinDir = current.split(delimiter).filter(Boolean).includes(binDir);
+  return { key, value: hasBinDir ? current : [binDir, current].filter(Boolean).join(delimiter) };
+}
+
+/**
+ * The directories a bare command name is searched in, in order, absolute.
+ *
+ * Derived from `commandPathValue()` — the same string the child is handed — so the check and the child
+ * cannot drift. Each entry is read relative to the directory the command runs in, because that is the
+ * directory the child reads it in: an empty entry is that directory itself, which is how an entry left empty
+ * by an unset shell variable behaves for bash, for sh and for libuv.
+ *
+ * This is not this process's `PATH`. libuv resolves a bare program name against the *child's* environment,
+ * which is what makes `shellPath: "bash"` work at all, and pi's bin dir is the documented place for the
+ * user's own executables — the one directory every command of the session can see.
+ */
+function commandSearchDirs(cwd: string): string[] {
+  return commandPathValue()
+    .value.split(delimiter)
+    .map((entry) => resolve(cwd, entry));
+}
+
+/**
+ * What to spawn for a configured `shellPath` in one working directory, or why nothing can be.
  *
  * "Can be run" means a regular file this user may execute, because that is what the child is about to do
  * with it. Pi's own check is `access(path, F_OK)`, which a directory and a 0644 file both pass, and which
  * is relative to the working directory, so Pi rejects a bare name outright. Copying it would put the
  * failure back where the check exists to keep it: an unrunnable value reaches `spawn`, answers ENOENT or
  * EACCES, and arrives as `Command exited with code 127` — a broken setting reading as a command that
- * failed. A value with no separator is tried on the PATH the child gets, in order, which is how libuv
- * resolves it too: a PATH entry holding a non-executable file is skipped, not fatal.
+ * failed. A value with no separator is tried on the `PATH` the child gets, in order, skipping entries that
+ * hold something unrunnable, which is how libuv resolves it too; a value with a separator is read relative
+ * to the directory the child runs in. Either way the answer is one absolute path and that path is what gets
+ * spawned: resolving a bare name twice, once here and once by libuv, can land on two different files.
+ *
+ * What no check of this kind can see is a script whose `#!` interpreter is missing: it is a runnable file,
+ * it starts, and it fails as a command. The README says so.
  */
-function unrunnableShell(candidate: string): "not found" | "not executable" | undefined {
-  const bare = !(candidate.includes("/") || candidate.includes("\\"));
-  const candidates = bare ? commandPathDirs().map((dir) => join(dir, candidate)) : [candidate];
+function findConfiguredShell(configured: string, cwd: string): ResolvedShell {
+  const bare = !(configured.includes("/") || configured.includes("\\"));
+  const candidates = bare ? commandSearchDirs(cwd).map((dir) => join(dir, configured)) : [resolve(cwd, configured)];
   let blocked = false;
   for (const path of candidates) {
     const answer = shellCandidateState(path);
-    if (answer === "runnable") return undefined;
+    if (answer === "runnable") return { shell: path };
     if (answer === "blocked") blocked = true;
   }
-  return blocked ? "not executable" : "not found";
+  // Never spawned — `execute` refuses on this — but the value has to be carried for the message, which
+  // quotes what the user wrote rather than the path that was searched.
+  return { shell: configured, brokenShellPath: { path: configured, reason: blocked ? "not executable" : "not found" } };
 }
 
 /** What one PATH entry says about a candidate shell: run it, skip it, or nothing there. */
@@ -521,17 +594,13 @@ function shellCandidateState(path: string): "runnable" | "blocked" | "missing" {
   return "runnable";
 }
 
-function resolveShell(): string {
-  return shellSettings().shell;
-}
-
 /**
  * The command line handed to the shell, with `shellCommandPrefix` in front of it exactly as the
  * built-in tool does. Without it a command that relies on aliases, shell functions or an environment
  * the prefix sets up works with Pi's own tool and fails with this one.
  */
 function withCommandPrefix(command: string): string {
-  const { commandPrefix } = shellSettings();
+  const { commandPrefix } = shellConfig();
   return commandPrefix ? `${commandPrefix}\n${command}` : command;
 }
 
@@ -543,8 +612,8 @@ function withCommandPrefix(command: string): string {
 function buildEnv(ctx: ExtensionToolContext | undefined): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
 
-  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-  env[pathKey] = commandPathDirs().join(delimiter);
+  const { key: pathKey, value: pathValue } = commandPathValue();
+  env[pathKey] = pathValue;
 
   for (const key of SESSION_ENV_KEYS) delete env[key];
   if (ctx) {
@@ -623,13 +692,19 @@ interface JobMeta {
   finishedAt?: unknown;
 }
 
-/** Parse a sidecar; undefined when it cannot be read or is not valid JSON. */
+/** Parse a sidecar; undefined unless the file holds a JSON object, which is what a record is. */
 function readMeta(metaPath: string): JobMeta | undefined {
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(metaPath, "utf8")) as JobMeta;
+    parsed = JSON.parse(readFileSync(metaPath, "utf8"));
   } catch {
     return undefined;
   }
+  // `JSON.parse` answers whatever the file holds, and `null`, `42`, `"bg-x"` and `[]` all parse. None of them
+  // is a record, and `adoptJobs` decides whether to delete what it has read, so the shape is settled here
+  // rather than left to the questions asked below it — an array is `typeof "object"`, so "an object" is not
+  // yet "not an array" either.
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as JobMeta) : undefined;
 }
 
 /**
@@ -695,11 +770,14 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
   const id = newId();
   const logPath = logPathFor(id);
   const metaPath = metaPathFor(id);
+  // Resolved for this job's directory: the child resolves the program relative to the directory it is
+  // started in, and for a configured `shellPath` this is already an absolute path.
+  const shell = resolveShell(cwd);
 
   const fd = openPrivate(logPath, "w");
   let proc: ChildProcess;
   try {
-    proc = spawn(resolveShell(), ["-c", withCommandPrefix(command)], {
+    proc = spawn(shell.shell, ["-c", withCommandPrefix(command)], {
       cwd,
       detached: process.platform !== "win32",
       stdio: ["ignore", fd, fd],
@@ -736,7 +814,7 @@ function spawnJob(command: string, cwd: string, ctx: ExtensionToolContext | unde
 
   proc.on("exit", (code, signal) => markDone(job, code, signal));
   proc.on("error", (err) => {
-    const note = `failed to start command with ${resolveShell()}: ${err instanceof Error ? err.message : String(err)}`;
+    const note = `failed to start command with ${shell.shell}: ${err instanceof Error ? err.message : String(err)}`;
     appendToLog(job.logPath, `\n[bg-tasks] ${note}`);
     markDone(job, 127, null);
   });
@@ -1130,12 +1208,12 @@ function adoptJobs(): void {
 
     const metaPath = join(LOG_DIR, name);
     const meta = readMeta(metaPath);
-    // A record that cannot be parsed is a record that cannot be judged: without the parsed `ownerPid`
-    // there is no ownership question to ask, and this may be another live session's only record of a
-    // command it is waiting on. Deleting it is the destructive guess — it leaves a running command with
-    // nothing to adopt it at the next reload, nothing to protect its log, and nothing to stop it. Writes
-    // are atomic, so an unparseable sidecar is an old install's or one a crash interrupted, and retention's
-    // age and count rules collect garbage without anyone having to guess about it.
+    // A record that cannot be read — not valid JSON, or valid JSON that is not an object — is a record that
+    // cannot be judged: without the parsed `ownerPid` there is no ownership question to ask, and this may be
+    // another live session's only record of a command it is waiting on. Deleting it is the destructive guess
+    // — it leaves a running command with nothing to adopt it at the next reload, nothing to protect its log,
+    // and nothing to stop it. Writes are atomic, so an unreadable sidecar is an old install's or one a crash
+    // interrupted, and retention's age and count rules collect garbage without anyone having to guess about it.
     if (!meta) continue;
 
     // Another live pi process owns this command and will report and stop it itself. Adopting it
@@ -1147,6 +1225,13 @@ function adoptJobs(): void {
     if (isOwnedByAnotherSession(meta)) continue;
 
     const pid = typeof meta.pid === "number" ? meta.pid : Number.NaN;
+    // Deleting a record is only safe once the reader can answer the question the record exists to answer:
+    // is this command over, and did it leave a process group that someone has to stop? That needs a usable
+    // pid. A record that reads as an object but whose pid is missing or is not a number — a writer older or
+    // newer than this one, a file edited by hand — is not answered "nothing to stop", it is left alone, by
+    // the same rule as the unreadable one above. This is the same mistake one type error away: a reader that
+    // cannot recognise a record removes it.
+    if (!Number.isFinite(pid)) continue;
     const logPath = typeof meta.logPath === "string" ? meta.logPath : logPathFor(id);
     const jobFields = {
       id,
@@ -1159,7 +1244,7 @@ function adoptJobs(): void {
       adopted: true,
     };
 
-    if (Number.isFinite(pid) && isAlive(pid)) {
+    if (isAlive(pid)) {
       const job: BgJob = {
         ...jobFields,
         status: "running",
@@ -1180,7 +1265,7 @@ function adoptJobs(): void {
     // what is inherited is the obligation to stop the group, which `killAllJobs` and `bg_stop` then do
     // with the same leftover-group code as for their own finished jobs. It is not reported as running, and
     // the record goes away as soon as the group does — by a stop, by a retention pass, or here.
-    if (Number.isFinite(pid) && processGroupExists(pid) && !processAt(pid)) {
+    if (processGroupExists(pid) && !processAt(pid)) {
       const exitCode = typeof meta.exitCode === "number" ? meta.exitCode : null;
       const signal = typeof meta.signal === "string" ? (meta.signal as NodeJS.Signals) : null;
       const job: BgJob = {
@@ -1501,8 +1586,13 @@ function taskListing(infos: TaskInfo[]): string[] {
     };
   });
 
-  // Pad every column except the last, where the path reads better unbroken.
-  const widths = rows[0]!.cells.map((_, column) => Math.max(...rows.map((row) => row.cells[column]!.length)));
+  // Pad every column except the last, where the path reads better unbroken. A loop, not a spread: the row
+  // count is bounded by the listing caps, but not by anything that wants a stack frame per row.
+  const widths = rows[0]!.cells.map((_, column) => {
+    let width = 0;
+    for (const row of rows) width = Math.max(width, row.cells[column]!.length);
+    return width;
+  });
   const lines: string[] = [];
   for (const row of rows) {
     lines.push(
@@ -1520,17 +1610,30 @@ function taskListing(infos: TaskInfo[]): string[] {
 function taskSection(infos: TaskInfo[]): string[] {
   if (infos.length === 0) return [];
 
-  const running = infos.filter((info) => info.status === "running").length;
-  const shown = infos.slice(0, LISTING_MAX_TASKS);
-  const omitted = infos.length - shown.length;
+  // `backgroundTasks()` puts the running ones first, so the two groups are contiguous. What the caps are for
+  // is the finished ones: they are what a long session piles up, and their rows are mostly history. Running
+  // tasks are what the model has to act on, so they get the whole listing up to a generous bound, and the
+  // sentence below counts each kind that was left out — a note about "older finished tasks" next to a table
+  // that dropped running ones is not just incomplete, it is wrong.
+  const runningInfos = infos.filter((info) => info.status === "running");
+  const finishedInfos = infos.filter((info) => info.status !== "running");
+  // Of the finished ones the newest are kept, which are also the ones a model asks about; the rows stay in
+  // chronological order, and "older … not listed" then describes what was actually dropped. Past its own
+  // bound the running rows kept are the first ones in the table — a table truncated in the middle reads as
+  // a gap — and the note says only "running", because which of them went is not something it claims.
+  const keptFinished = finishedInfos.slice(-LISTING_MAX_FINISHED_TASKS);
+  const droppedRunning = runningInfos.length - LISTING_MAX_RUNNING_TASKS;
+  const droppedFinished = finishedInfos.length - LISTING_MAX_FINISHED_TASKS;
+  const omitted: string[] = [];
+  if (droppedRunning > 0) omitted.push(`${droppedRunning} running task${droppedRunning === 1 ? "" : "s"}`);
+  if (droppedFinished > 0) omitted.push(`${droppedFinished} older finished task${droppedFinished === 1 ? "" : "s"}`);
 
   return [
     "",
-    `Background tasks in this session (${infos.length} tracked, ${running} running):`,
+    `Background tasks in this session (${infos.length} tracked, ${runningInfos.length} running):`,
     "",
-    ...taskListing(shown),
-    // Running tasks sort first, so anything dropped here is an old finished one.
-    ...(omitted > 0 ? ["", `(${omitted} older finished tasks not listed; their logs are in ${LOG_DIR})`] : []),
+    ...taskListing([...runningInfos.slice(0, LISTING_MAX_RUNNING_TASKS), ...keptFinished]),
+    ...(omitted.length > 0 ? ["", `(${omitted.join(" and ")} not listed; their logs are in ${LOG_DIR})`] : []),
   ];
 }
 
@@ -1794,6 +1897,37 @@ function missingWorkingDirectory(cwd: string): string | undefined {
   return isDirectory ? undefined : `Working directory is not a directory: ${cwd}\nCannot execute bash commands.`;
 }
 
+/**
+ * What is wrong with the log directory, if anything.
+ *
+ * The third environment a command needs, and it gets the same treatment as the other two: a result naming
+ * the thing a user can act on, not a thrown errno. `ensureLogDir()` swallows a failure to create the
+ * directory on purpose, and what writes into it next is the log itself, so an un-writable directory ends the
+ * call as `EACCES … '<log dir>/<id>.log'` out of the tool — a path that never existed, and never the
+ * directory that is the problem. A plain file sitting where `<agent-dir>/bg-tasks` should be (an old
+ * install, a stray `touch`, a half-finished `mv`) answers `ENOTDIR` the same way.
+ *
+ * Not cached, unlike the shell: unlike a setting, this can start working again inside a session — a
+ * permission fixed, a file removed — and a runtime that refused once must recover.
+ */
+function unusableLogDir(): string | undefined {
+  ensureLogDir();
+  let stat: Stats;
+  try {
+    stat = statSync(LOG_DIR);
+  } catch {
+    return `Cannot create the log directory: ${LOG_DIR}\nCannot execute bash commands.`;
+  }
+  if (!stat.isDirectory()) return `Log directory is not a directory: ${LOG_DIR}\nCannot execute bash commands.`;
+  // Execute as well as write: a directory without `X_OK` takes no entries, so it cannot open a file in itself.
+  try {
+    accessSync(LOG_DIR, fsConstants.W_OK | fsConstants.X_OK);
+  } catch {
+    return `Log directory is not writable: ${LOG_DIR}\nCannot execute bash commands.`;
+  }
+  return undefined;
+}
+
 function registerBashOverride(pi: ExtensionAPI): void {
   const original = createBashToolDefinition(process.cwd());
 
@@ -1833,10 +1967,15 @@ function registerBashOverride(pi: ExtensionAPI): void {
       // Same for the shell itself: Pi's `getShellConfig` refuses a configured path it cannot run, naming
       // it. Left to `spawn`, a broken `shellPath` arrives as a command that exited 127, which reads like a
       // problem with the command, and every command the session runs would report that.
-      const broken = shellSettings().brokenShellPath;
+      const broken = resolveShell(cwd).brokenShellPath;
       if (broken) {
         const note = `Custom shell path ${broken.reason}: ${broken.path}\nCannot execute bash commands.`;
         return { content: [{ type: "text", text: note }], details: {}, isError: true };
+      }
+
+      const logDir = unusableLogDir();
+      if (logDir) {
+        return { content: [{ type: "text", text: logDir }], details: {}, isError: true };
       }
 
       if (resolvedTimeout === 0) return spawnBackground(command, cwd, ctx);

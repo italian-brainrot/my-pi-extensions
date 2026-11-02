@@ -105,8 +105,9 @@ bg-7f3k2m1q  running (pid 4300)  1m12s  42 lines   3096 chars   ~/.pi/agent/bg-t
 - **log path** — the file to `Read`, or `(no log: …)` if retention removed it.
 
 Commands that finished in the foreground are deliberately not in this table: their output already
-reached the model and their log is gone. The listing shows the 30 newest tasks (running ones are
-always included); `details.tasks` and `structuredContent.tasks` carry all of them, with
+reached the model and their log is gone. Every running task gets a row — up to 100 of them — and the
+newest 30 finished tasks get one; when anything is left out, the sentence under the table says what was,
+by kind. `details.tasks` and `structuredContent.tasks` always carry all of them, with
 `id`, `status`, `pid`, `exit_code`, `signal`, `command`, `runtime_seconds`, `log_path`,
 `log_exists`, `bytes`, `chars`, and `lines`.
 
@@ -163,11 +164,19 @@ sidecar of a job this runtime is still running are never touched, neither are th
 session owns, and neither is the record of a process group that is still waiting to be stopped, so the
 directory can sit over the cap by as many files as there are jobs running or groups left to stop.
 
+The log directory is one of the things a command needs in order to start, and it is answered the way the
+other two are: if it cannot be written — not writable, or something that is not a directory sitting in
+its place — the tool returns an error naming the directory rather than the errno of a log file that was
+never created, and it starts nothing. That answer is not remembered, so fixing the directory and running
+the command again is enough.
+
 A sidecar is written to a temp name in the same directory and renamed into place, so a session reading
 the directory — which every pi sharing the agent dir does at its own start — never sees a half-written
-record. A record that cannot be parsed is left where it is, because it may be a live session's only
-record of a command it is waiting on, and the reader has nothing to go on otherwise; both it and a temp
-left by a process that died mid-write then age out under the rules above.
+record. A record a reader cannot read — not valid JSON, JSON that is not an object, an object whose
+`pid` is not a number — is left where it is, because it may be a live session's only record of a command
+it is waiting on and the reader has nothing to go on otherwise; both it and a temp left by a process that
+died mid-write then age out under the rules above. Deleting a record is what an affirmative answer
+licenses — this command is over, and it left no process group behind — never the absence of one.
 
 ### Commands belong to the session that started them
 
@@ -208,23 +217,38 @@ Pi process:
 | `PI_PROVIDER`, `PI_MODEL`          | Current model.          |
 | `PI_REASONING_LEVEL`               | Current thinking level. |
 
-`<agent-dir>/bin` is prepended to `PATH`, matching the built-in tool.
+`<agent-dir>/bin` is put on `PATH` for every command — first, unless it is already an entry — which is
+exactly the rule the built-in tool applies, the rest of it included: your own `PATH` is handed on as it
+stands, separators and all. An empty entry survives because bash, `sh` and the program loader all read
+one as the command's working directory, which is what a `PATH=$SOMETHING:$PATH` assembled with
+`$SOMETHING` unset leaves behind. Splitting `PATH` and dropping the empty entries loses a whole search
+directory the built-in tool keeps.
 
 ### Which shell runs the commands
 
 Resolution is `settings.shellPath`, project settings of the **Pi process** working directory first,
-then the agent directory, otherwise `bash`. The choice is made once per runtime, so a settings
-change needs `/reload`. On Windows, stopping a task uses `taskkill /T /F`.
+then the agent directory, otherwise `bash`. Those two files are read once per runtime, so a settings
+change needs `/reload`. Whether a configured value can be run is answered once per runtime per **working
+directory the commands run in**: one value means different files in different directories, and Pi can
+give a session a working directory of its own — it comes from the session header, while the process
+stays where `pi` was started. On Windows, stopping a task uses `taskkill /T /F`.
 
 A configured value is checked before anything is spawned, and the question it answers is the one the
-child asks: can a command of this session run this? A value with no path separator is looked up on the
-`PATH` commands get — `<agent-dir>/bin` first, then the rest, in that order, skipping entries that hold
-something unrunnable, exactly as the child resolves it. "Found" means a regular file that can be
-executed. Nothing of that name answers `Custom shell path not found: <value>`; something there that
-cannot be run answers `Custom shell path not executable: <value>`. Either way every command of the
-session answers that, followed by `Cannot execute bash commands.`, instead of running something that
-cannot start. Pi throws its `not found` message; here both are tool results, so the model sees the setting
-is broken rather than a command that exited 127.
+child asks: can a command of this session run this, starting from the directory that command runs in? A
+value with no path separator is looked up on the `PATH` commands get — `<agent-dir>/bin` first, then the
+rest, in that order, skipping entries that hold something unrunnable, exactly as the child resolves it.
+A value that does have a separator (`./mysh`, `tools/mysh`) is read relative to the directory the
+commands run in, and an empty `PATH` entry means that same directory. "Found" means a regular file that
+can be executed, and what gets spawned is that file by absolute path: a `PATH` that changes later cannot
+pick a different shell in the middle of a session.
+
+Nothing of that name answers `Custom shell path not found: <value>`; something there that cannot be run
+answers `Custom shell path not executable: <value>`. Either way every command of the session in that
+directory answers that, followed by `Cannot execute bash commands.`, instead of trying to start the
+setting and reporting a command that exited 127. One thing no check of that kind can see: a script whose
+`#!` interpreter is missing is a perfectly executable file, so it does start, and the failure comes back
+as a command that exited 127 rather than as a broken setting. Pi throws its `not found` message; here
+both are tool results, so the model sees the setting is broken rather than a command that failed.
 
 `settings.shellCommandPrefix` is prepended to every command exactly as the built-in tool prepends it,
 so aliases, shell functions and an environment set up by the prefix work here too. The two keys are

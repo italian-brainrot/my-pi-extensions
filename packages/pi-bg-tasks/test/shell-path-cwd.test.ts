@@ -126,6 +126,74 @@ describe("the PATH commands are handed", () => {
       ...configured.split(delimiter),
     ]);
   });
+
+  it("reads a relative PATH entry as the command's directory, the way the child does", async () => {
+    // An entry with no leading separator is what a `PATH=./tools:$PATH` in a project's editor settings
+    // leaves behind, and the child reads it relative to its own working directory. A check that resolves it
+    // against the runtime's directory looks at a file nobody named.
+    writeProgram(join(sessionDir.path, "tools"), "relative-entry-sh", "RELATIVE-ENTRY");
+    settings(agentDir.path, { shellPath: "relative-entry-sh" });
+
+    await startRuntime(["tools", "/usr/bin", "/bin"].join(delimiter));
+    const result = await ext!.callTool("bash", { command: "echo the-command" });
+
+    expect(result.isError, `the entry means ${join(sessionDir.path, "tools")}:\n${text(result)}`).toBeFalsy();
+    expect(text(result)).toContain("RELATIVE-ENTRY");
+    expect(text(result)).toContain("the-command");
+  });
+});
+
+describe("the shell a runtime chose", () => {
+  it("answers for each directory it runs commands in, not once for the process", async () => {
+    // A relative `shellPath` names a different file in each one. Pi can hand a running process a session
+    // whose commands go somewhere else — the cwd comes from the session header — so the answer cannot be
+    // cached against the runtime alone, and a directory that already answered is not asked again.
+    writeProgram(sessionDir.path, "per-dir-sh", "SESSION-DIR-SHELL");
+    const elsewhere = makeTempDir("pi-ext-cwd-");
+    settings(agentDir.path, { shellPath: "./per-dir-sh" });
+
+    try {
+      await startRuntime(join("/usr/bin", delimiter, "/bin"));
+
+      const here = await ext!.callTool("bash", { command: "echo the-command" });
+      expect(text(here)).toContain("SESSION-DIR-SHELL");
+
+      const other = await ext!.callTool("bash", { command: "echo the-command" }, { context: { cwd: elsewhere.path } });
+      expect(other.isError, `the other directory has no such shell:\n${text(other)}`).toBe(true);
+      expect(text(other), "and it is the setting that is named, not a command exit").toMatch(/Custom shell path not found: \.\/per-dir-sh/);
+
+      const back = await ext!.callTool("bash", { command: "echo the-command" });
+      expect(text(back), "the first answer is still there").toContain("SESSION-DIR-SHELL");
+    } finally {
+      elsewhere.dispose();
+    }
+  });
+
+  it("spawns the file it found, so a PATH change later cannot pick a different shell", async () => {
+    // The choice is once per runtime per directory, and since the answer is an absolute path a bare name is
+    // not resolved a second time — not by the check, and not by libuv either, against a PATH that has since
+    // moved out from under it.
+    writeProgram(extraBin.path, "chosen-sh", "FIRST");
+    settings(agentDir.path, { shellPath: "chosen-sh" });
+
+    await startRuntime([extraBin.path, "/usr/bin", "/bin"].join(delimiter));
+    const first = await ext!.callTool("bash", { command: "echo the-command" });
+    expect(text(first)).toContain("FIRST");
+
+    // The same name, elsewhere, on the PATH the *runtime* has from here on.
+    const moved = makeTempDir("pi-ext-bin-");
+    writeProgram(moved.path, "chosen-sh", "SECOND");
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = [moved.path, "/usr/bin", "/bin"].join(delimiter);
+      const second = await ext!.callTool("bash", { command: "echo the-command" });
+      expect(text(second), "the same file answers the second command").toContain("FIRST");
+      expect(text(second), "the name on the new PATH was not chosen instead").not.toContain("SECOND");
+    } finally {
+      process.env.PATH = savedPath;
+      moved.dispose();
+    }
+  });
 });
 
 describe("where a configured shellPath is resolved", () => {

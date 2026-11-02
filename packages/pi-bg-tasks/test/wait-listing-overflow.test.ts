@@ -91,4 +91,51 @@ describe("a task listing with more running tasks than the cap", () => {
     const note = /\((\d+) older finished tasks not listed/.exec(text(report));
     if (note) expect(Number(note[1]), `only ${4} tasks are finished`).toBeLessThanOrEqual(4);
   });
+
+  it("drops the oldest finished rows and says that it did", async () => {
+    // What the cap is actually for. Fifteen running tasks and more finished ones than fit: the running ones
+    // all keep their rows, and what goes are the oldest finished ones, which is the only thing the sentence
+    // under the table may then claim.
+    const finished: string[] = [];
+    for (let i = 0; i < 34; i++) {
+      finished.push((await ext!.callTool("bash", { command: "true", timeout: 0, blocking: false })).details.id);
+    }
+    for (const id of finished) await ext!.callTool("bg_stop", { task_id: id });
+    const running: string[] = [];
+    for (let i = 0; i < 15; i++) {
+      running.push((await ext!.callTool("bash", { command: `sleep ${MARKER}`, timeout: 0, blocking: false })).details.id);
+    }
+
+    const report = await ext!.callTool("bg_wait", { timeout: 0 });
+    const body = text(report);
+
+    expect(report.structuredContent.tasks.length).toBe(49);
+    for (const id of running) expect(body, `a running task always has a row: ${summary(report)}`).toContain(id);
+
+    const keptFinished = finished.filter((id) => body.includes(id));
+    expect(keptFinished.length, `the finished rows are capped: ${summary(report)}`).toBe(30);
+    expect(keptFinished, "and they are the newest ones").toEqual(finished.slice(-30));
+
+    expect(body).toMatch(/\(4 older finished tasks not listed; their logs are in /);
+    expect(body, "nothing was dropped that was running").not.toMatch(/running tasks? not listed/);
+  });
+
+  it("bounds the running rows too, and names them as running when it drops one", async () => {
+    // Running tasks are not capped by the finished cap, but the model-facing table is still bounded. The
+    // sentence under it has to say which kind went missing — the old one could only say "finished".
+    const RUNNING = 104;
+    const running: string[] = [];
+    for (let i = 0; i < RUNNING; i++) {
+      running.push((await ext!.callTool("bash", { command: "sleep 205", timeout: 0, blocking: false })).details.id);
+    }
+
+    const report = await ext!.callTool("bg_wait", { timeout: 0 });
+    const body = text(report);
+
+    expect(report.structuredContent.tasks.length).toBe(RUNNING);
+    expect(body, `the heading counts them all: ${summary(report)}`).toContain(`(${RUNNING} tracked, ${RUNNING} running)`);
+    expect(running.filter((id) => body.includes(id)).length, `the table stays bounded: ${summary(report)}`).toBe(100);
+    expect(body).toMatch(/\(4 running tasks not listed; their logs are in /);
+    expect(body).not.toMatch(/finished tasks not listed/);
+  });
 });

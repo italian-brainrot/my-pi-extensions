@@ -9,6 +9,9 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["packages/*/test/**/*.test.ts", "test/**/*.test.ts"],
+    // Runs before each test file is imported: the suite must not inherit the shell's configuration of the
+    // extensions. See test/helpers/hermetic-env.ts.
+    setupFiles: ["test/helpers/hermetic-env.ts"],
     isolate: true,
     pool: "forks",
     maxWorkers: Math.max(1, Math.min(4, availableParallelism() - 1)),

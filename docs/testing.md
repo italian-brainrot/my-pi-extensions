@@ -30,6 +30,14 @@ afterAll(() => ext?.dispose());
 
 - points `PI_CODING_AGENT_DIR` at a **temp agent dir** before importing, so anything the extension
   derives from `getAgentDir()` (log directories, settings lookups) is inside the test;
+- **deletes every extension-owned configuration variable** (`EXTENSION_CONFIG_ENV_KEYS` in the harness)
+  for the lifetime of the load, and puts the shell's values back when the last load in the file is
+  disposed. An ambient `PI_TAKEOVER_MAX_CHAIN` or `PI_MEMORY_FILENAME` therefore reaches an extension only
+  when the test names it in `env:` — read at module load or at call time. `test/helpers/hermetic-env.ts`
+  (a Vitest `setupFiles` entry) deletes the same list before each test file is imported, which covers the
+  three ways a load-time scrub cannot reach: a test file that imports its extension's source directly, Pi's
+  own loader in `test/load.test.ts`, and a child process a test starts, such as the real `pi` of
+  `pi-takeover`.
 - imports the package entry point and calls its factory with a **recording `ExtensionAPI`** built on
   a Proxy: `registerTool`, `on`, `registerCommand`, and friends are captured, and any other member
   throws with a message telling you to add it to the harness, so tests never silently skip a code
@@ -130,6 +138,14 @@ per-component costs, and that context size is the largest single response rather
   pass an explicit `agentDir` (from `makeTempDir()`) to every load and reset modules before each one.
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in
   `dispose()`. Do not rely on env changes made after a load to affect module-level constants.
+- **The suite is hermetic against the shell that runs it.** Every package reads configuration from
+  `PI_*` variables, and `test/env-hermetic.test.ts` fails if the harness lets a login shell's values in.
+  So do not set one of those variables on `process.env` and hope a load picks it up — name it in
+  `loadExtension({ env })`, which wins over anything ambient. If a package starts reading a new `PI_*`
+  variable, add it to `EXTENSION_CONFIG_ENV_KEYS`; `test/repo.test.ts` checks the list against what the
+  packages actually read, in both directions. Verify it any time with
+  `PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npm test` — that
+  is the suite with a hostile shell, and it must be as green as a clean one.
 - **Every load needs its `dispose()`, even after a teardown event.** A test that emits
   `session_shutdown` in its own body and then forgets the load leaks the temp working directory the
   harness made for it — a whole-suite run ends with directories in the temp dir, and they are only found

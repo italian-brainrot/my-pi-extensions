@@ -15,7 +15,7 @@
  * locked-down machine.
  */
 
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type LoadedExtension, loadExtension, makeTempDir, packageDir } from "../../../test/helpers/extension.ts";
@@ -39,9 +39,9 @@ async function startRuntime(): Promise<LoadedExtension> {
  * Run a command and stay a result either way, so the test can say what the tool answered. A rejection is
  * what Pi turns into "Error: …" for the model, and what a caller of the tool sees as a failed call.
  */
-async function attempt(runtime: LoadedExtension, command: string): Promise<any> {
+async function attempt(runtime: LoadedExtension, command: string | Record<string, unknown>): Promise<any> {
   try {
-    return await runtime.callTool("bash", { command });
+    return await runtime.callTool("bash", typeof command === "string" ? { command } : command);
   } catch (error) {
     return { rejected: error instanceof Error ? error.message : String(error) };
   }
@@ -123,5 +123,39 @@ describe("a log dir that has to be created", () => {
     expect(result.structuredContent?.exit_code).toBe(0);
     expect(text(result)).toContain("made-the-dir");
     expect(existsSync(logDir()), "the log dir is created on the first command").toBe(true);
+  });
+});
+
+describe("what a refusal leaves behind", () => {
+  it("refuses a background start the same way, having started nothing", async () => {
+    // `timeout: 0` goes down the same door, and a refusal must not have opened a log or written a sidecar
+    // on the way to saying it cannot.
+    const runtime = await startRuntime();
+    expect((await attempt(runtime, "echo first")).structuredContent?.exit_code).toBe(0);
+    chmodSync(logDir(), 0o500);
+    const files = readdirSync(logDir()).sort();
+
+    const result = await attempt(runtime, { command: "sleep 201", timeout: 0 });
+
+    expect(result.rejected, `a tool result, not a rejection:\n${result.rejected ?? ""}`).toBeUndefined();
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain(logDir());
+    expect(readdirSync(logDir()).sort(), "no log and no sidecar for a command that never started").toEqual(files);
+
+    const report = await runtime.callTool("bg_wait", { timeout: 0 });
+    expect(report.structuredContent?.tasks ?? [], "and nothing became a task").toEqual([]);
+  });
+
+  it("carries a log dir that is not a directory through session start", async () => {
+    // `adoptJobs()` lists the log dir and `pruneRetention()` walks it again; neither may turn the same
+    // errno into an exception on the way in, or the session cannot even start.
+    writeFileSync(logDir(), "not a directory\n");
+
+    const runtime = await startRuntime();
+    expect(existsSync(logDir()), "nothing replaced the file with a directory on the way past").toBe(true);
+
+    const result = await attempt(runtime, "echo second");
+    expect(result.rejected, `the command answers, not the loader:\n${result.rejected ?? ""}`).toBeUndefined();
+    expect(text(result)).toContain(logDir());
   });
 });

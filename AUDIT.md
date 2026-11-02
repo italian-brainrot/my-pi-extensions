@@ -1212,3 +1212,234 @@ Recorded so pass 5 does not spend time here.
 - `existsSync` takes one argument: the assertion message goes in `expect(value, message)`, not in the call.
 - **This session's shell exports `PI_TAKEOVER_MAX_CHAIN=100` (from `~/.bashrc`), so 4 pi-takeover tests are
   red for every pass of this loop until F22 is fixed.** Do not chase them as regressions.
+
+---
+
+## Pass 4 — fixer
+
+All 15 of this pass's red tests green; none of them rewritten. The four pi-takeover reds went green with
+F22, as the tester said they would — the chain logic was not touched. `npm run check` passes end to end
+(deps, manifest, skills, tsc, biome, **301 tests**: 272 carried, 15 fixed, 14 new pins; 145 in the package,
+33 files). Reproduce with `npx vitest --run packages/pi-bg-tasks` (145) or `npm test` (301). A clean run
+again leaves 0 `/tmp/pi-ext-*` directories and no stray processes, and the whole suite is now green with all
+ten extension variables set in the shell — see F22.
+
+The two README-vs-code claims that were wrong in the permissive direction (`<agent-dir>/bin` "matching the
+built-in tool", "instead of running something that cannot start") were made true by changing the code, and
+the two that were wrong in the narrowing direction ("the question it answers is the one the child asks",
+"running ones are always included") by changing the code as well. The one claim no check can support — a
+script whose `#!` interpreter is missing — is now said honestly in the README instead.
+
+### F17 — the `PATH` is handed on, not rebuilt
+
+Chose the tester's recommended direction: mirror Pi. `commandPathDirs()` (split → `filter(Boolean)` →
+rejoin) is gone, replaced by `commandPathValue()`, which is Pi's `getShellEnv` line for line: split the
+configured string only to decide whether `<agent-dir>/bin` is already an entry, then use `currentPath`
+itself, or `[binDir, currentPath].filter(Boolean).join(delimiter)`. An empty entry therefore survives into
+the child, where bash, `sh` and libuv all read it as the command's working directory, and the
+bin-dir-already-present branch behaves like pass 2's did. `buildEnv` calls it; so does the check, through
+`commandSearchDirs(cwd)`, so the two still cannot drift.
+
+The comment that claimed the old function produced "the exact value `buildEnv` now puts into the
+environment" was true and useless — internal agreement, not agreement with the host. `commandPathValue`'s
+comment now says what the value has to agree with: Pi's, and why `filter(Boolean)` is not a no-op.
+
+### F18 — one answer for F17 and F18: resolve where the child resolves, cache per directory, spawn what was found
+
+The tester's option (b) plus the caching half of (a), which the tester noted (b) needs anyway.
+
+- **`ShellSettings` is split in two.** `ShellConfig` is what the two settings _say_ — `configured` (the
+  `shellPath`, `~`-expanded) and `commandPrefix` — read exactly once per runtime, which keeps
+  `environment.test.ts`'s "selects the shell once per runtime" and the `shellCommandPrefix` pins true.
+  `ResolvedShell` is what one working directory decided about it: `{ shell, brokenShellPath? }`.
+- **`resolveShell(cwd)` answers for the directory the command runs in**, cached in `shellsByCwd`, keyed by
+  `resolve(cwd)`. The rule recorded in code and README: the settings are read once per runtime; the _answer
+  to "can this be run, and where is it"_ is once per runtime **per working directory**, because a relative
+  value, a relative `PATH` entry and an empty one all mean that directory, and Pi hands a replacement
+  session a new one (session-header cwd) without restarting the process or this cache. A directory already
+  asked is never asked again, so a settings change still needs `/reload`.
+- **A bare value is searched on `commandSearchDirs(cwd)`** — `commandPathValue().value.split(delimiter)`
+  mapped through `resolve(cwd, entry)`, so an empty entry is the command's directory and a relative entry is
+  read from it, which is what libuv does. A value with a separator is `resolve(cwd, value)`.
+- **What gets spawned is the absolute path that was found.** That is the structural half: a bare name
+  resolved twice — once by the check, once by libuv against a child `PATH` that `buildEnv` rebuilds per
+  command — can land on two different files. Now it is resolved once per directory and every command of the
+  session starts that file, so a `PATH` change inside a runtime cannot swap the shell under the session
+  (pinned). The _commands_ still get the PATH the session has, verbatim: only the shell's own resolution is
+  fixed. `DEFAULT_SHELL` is still spawned as the literal `bash` and is still never checked
+  (`shell-path-resolution`'s last pin).
+- Both directions of the disagreement now answer as a named result: `./session-dir-sh` in the session
+  directory runs; `./runtime-dir-sh`, which only the runtime can see, is `Custom shell path not found:
+  ./runtime-dir-sh` with no `exit_code`, instead of a check that passes and a child that reports 127.
+
+`withCommandPrefix` reads `ShellConfig`, so it does not depend on the directory and stays chosen once.
+
+### F19 — the log dir is a precondition, answered as a result
+
+`unusableLogDir()` sits next to `missingWorkingDirectory` in `execute`: `ensureLogDir()` (so the normal case
+of a directory that does not exist yet stays normal), then `statSync` must answer a directory, then
+`accessSync(W_OK | X_OK)` — a directory without `X_OK` takes no entries, so it cannot open a file in itself.
+Three messages, each naming `LOG_DIR` and ending with Pi's `Cannot execute bash commands.`:
+`Cannot create the log directory: …`, `Log directory is not a directory: …`,
+`Log directory is not writable: …`. Nothing is spawned, so no log, no sidecar and no task.
+
+**Not cached**, unlike every other answer in that part of the file: the tester's third test pins recovery,
+and a permission fixed mid-session is worth recovering from. `spawnJob` keeps its own `ensureLogDir()` so it
+stays self-contained, and `pruneRetention` still never creates the directory (`lifecycle.test.ts`'s pin).
+
+### F20 — the note describes the rows, and there are now two caps
+
+`LISTING_MAX_TASKS` became `LISTING_MAX_FINISHED_TASKS` (30) and `LISTING_MAX_RUNNING_TASKS` (100).
+
+- **Running tasks are not capped by the finished cap** — that is the README's promise and the shape the model
+  has to act on. They have a bound of their own (100) so the table cannot become 300 rows, and when that one
+  bites the sentence says which kind went missing.
+- **Finished rows are now the newest 30** (`.slice(-30)`, rows still printed chronologically), where the old
+  code printed the _oldest_ 30 under a note saying "older finished tasks not listed". That was a second
+  wrongness in the same sentence, in the other direction.
+- The sentence counts each kind it left out: `(4 running tasks not listed; their logs are in …)`,
+  `(4 older finished tasks not listed; …)`, or `(N running tasks and M older finished tasks not listed; …)`.
+  `details.tasks`/`structuredContent.tasks` stay uncapped (pass 3 pinned that).
+- `taskListing`'s per-column `Math.max(...rows)` spread became a loop, so the row count is not also a stack
+  argument count.
+- README: "The listing shows the 30 newest tasks (running ones are always included)" became what the code
+  does — every running task up to 100, the newest 30 finished ones, and a sentence naming what was left out.
+
+### F21 — a record is deleted on an affirmative answer, never on the absence of one
+
+Two changes, one rule.
+
+- `readMeta` now answers "a record": a JSON object, or undefined. `null`, `42`, `"bg-x"` **and `[]`** all
+  parse and none of them is a record — an array is `typeof "object"`, so checking for an object is not
+  enough on its own. `adoptJobs`'s `if (!meta) continue` then covers all of it, and `pruneRetention`'s
+  protected-id scan sees the same undefined it saw before.
+- **The decision the tester asked for: a record whose fields have the wrong types is also left alone.** In
+  `adoptJobs`, `if (!Number.isFinite(pid)) continue;` before the fall-through that unlinks, and the two
+  `Number.isFinite(pid) &&` guards below it went away. Deleting a sidecar claims "this command is over and
+  left no group to stop", and a record that cannot answer that question is not evidence for it; the age and
+  count rules collect it, exactly as pass 3 decided for the unreadable ones. This closes `{"pid": "123"}`,
+  `{"pid": null}` and `{}` — and `lifecycle.test.ts`'s hand-written `bg-old.json` of `{}` still disappears,
+  by the age rule rather than by a guess.
+- README: the sidecar paragraph says what "cannot be read" means now, and says the rule outright: "Deleting
+  a record is what an affirmative answer licenses … never the absence of one."
+
+### F22 — the suite is hermetic, in two layers, with a guard against rot
+
+- **Layer 1, `test/helpers/extension.ts`:** `EXTENSION_CONFIG_ENV_KEYS` (the ten variables the packages read)
+  is saved and deleted when a load starts and put back when the **last** load in the process is disposed —
+  counted, not snapshotted per load, because `PI_BG_TASKS_KEEP_RUNNING` is read at call time and because two
+  loads can be alive at once and disposed in any order: a per-load restore would hand the shell's value back
+  to a load that is still running. `loadExtension({ env })` is applied after the scrub, so a test's value
+  wins (pinned).
+- **That alone was not enough, and measuring found out.** With all ten variables set, the load-time scrub
+  left **20 tests red**: `test/load.test.ts` (2 — Pi's own loader never passes through `loadExtension`),
+  `packages/pi-memory/test/injection.test.ts` (17 — the file does `import { MEMORY_NOTE } from "../src/index.ts"`,
+  so the extension's module-level configuration was read when the _test file_ was imported, before any load),
+  and `packages/pi-takeover/test/session.test.ts` (1 — the real `pi` child inherits the test process's
+  environment).
+- **Layer 2, `test/helpers/hermetic-env.ts`, wired in as a Vitest `setupFiles` entry:** deletes the same list
+  before each test file is imported, which reaches all three of those paths (and the child processes, because
+  the values are simply gone from `process.env`). `docs/testing.md` says so and gives the check:
+  `PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npm test` —
+  measured 301/301, as green as a clean shell.
+- **Against rot:** `test/repo.test.ts` greps `process.env.PI_*` out of every package's `src` and fails if a
+  key is in neither harness list (`EXTENSION_CONFIG_ENV_KEYS`, or `HOST_ENV_KEYS` — Pi's own variables, which
+  `pi-bg-tasks` clears from its children itself) **or** if a scrubbed key is read by no extension. Both
+  directions, so the list cannot grow stale in either.
+
+### MEMORY.md
+
+No line added or changed. The two host facts this pass needed were already put there by the tester — the
+`getShellEnv` hand-off and the session-header cwd — and both are still exactly what the code now follows.
+What changed is in the code comments, the package README and `docs/testing.md`, which is where the harness
+conventions live; a line here duplicating them would cost prompt space in every session.
+
+### Tests I touched, and why
+
+- `test/sidecar-record-shapes.test.ts`: the body of the tester's `it.each` was moved **verbatim** into a named
+  function (`leavesTheReaderAlone`) so the new wrong-field-types `it.each` runs the same steps; assertions,
+  messages and the 197 marker are unchanged. No test assertion changed.
+- `test/log-dir-unusable.test.ts`: the `attempt()` helper now takes `string | Record<string, unknown>` so a
+  test can send `timeout: 0`; the tester's call sites are unchanged.
+- Nothing else of theirs. The other four red files (`shell-path-cwd`, `wait-listing-overflow`,
+  `env-hermetic`) were left exactly as written and made green by the source and harness changes.
+
+### New pins, all green
+
+- `test/shell-path-cwd.test.ts` (3). A **relative `PATH` entry** means the command's directory, as it does
+  for the child. One runtime, two command directories, one relative `shellPath`: the directory that has the
+  file runs, the one that does not answers `not found`, and the first answer is still there afterwards. And
+  the file that was found is the file that is spawned: a bare name resolved in one `PATH`, then a second
+  program of the same name put on the runtime's `PATH`, does not change which shell answers the next
+  command.
+- `test/log-dir-unusable.test.ts` (2). `timeout: 0` is refused the same way and leaves the log dir exactly as
+  it was — no log, no sidecar, no task in `bg_wait`. A file where the log dir belongs survives `session_start`
+  (adoption and the retention walk both catch the errno) and the command still answers with the directory.
+- `test/wait-listing-overflow.test.ts` (2). 15 running + 34 finished: all 15 running have rows, exactly the
+  30 **newest** finished have rows, and the note says "(4 older finished tasks not listed…)". 104 running:
+  the heading says 104, the table has 100 rows, and the note says "(4 running tasks not listed…)" — never
+  "finished".
+- `test/sidecar-record-shapes.test.ts` (3). `{"pid":"123456"}`, `{"pid":null}`, `{"command":"sleep"}` on a
+  live task's sidecar: left in place, not adopted, the command stays its owner's, and the age rule collects
+  it.
+- `test/env-hermetic.test.ts` (2). A variable a test names in `env:` beats the shell's value (needs
+  `vi.resetModules()`: pi-takeover takes its cap at module load, and the first test in the file already
+  imported it). And with two live loads, disposing the first does not put the shell's value back under the
+  second.
+- `test/repo.test.ts` (2). The scrub list covers everything the packages read, and contains nothing they do
+  not.
+
+### For pass 5 — what to attack
+
+- **F22's remaining boundary.** `HOST_ENV_KEYS` is an allowlist, not a scrub: a real `pi` child started by a
+  test still inherits `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_MODEL`, `PI_PROVIDER`, `PI_REASONING_LEVEL` —
+  and `PI_CACHE_RETENTION`, `PI_MANAGED_INSTALL_ROOT`, `PI_CODING_AGENT` — from the pi that ran the suite.
+  Green today; same class of leak as F22 with a different owner. If it is closed, the list to extend is
+  `HOST_ENV_KEYS` (and `hermetic-env.ts` follows it), and `test/load.test.ts` plus
+  `pi-takeover/test/session.test.ts` are where it would show.
+- **The `#!` hole is documented, not closed.** A mode-0755 script with a missing interpreter is a runnable
+  file by every question a `stat`/`access` pair can ask, and arrives as exit 127. Closing it means actually
+  spawning the shell once per resolution (`-c 'exit 0'`) and deciding what a probe process costs, and what it
+  does to a shell that reads stdin or takes an argv.
+- **F18's cache is a Map with no bound.** One entry per working directory a module instance has been asked
+  about, and a process keeps its module instance across every replacement (`bindExtensions`), so the entries
+  accumulate across sessions in one `pi`. A session has one or two; nothing caps it. `commandSearchDirs` also
+  re-splits and re-`resolve()`s the PATH on every resolution — cheap, and only per new directory.
+- **F18's message for a relative value still does not name the directory it resolved against**, and a `~` in
+  a configured value is expanded in the message (pass 3's cosmetic note, unchanged). `./x` refused in a
+  session whose cwd the user did not choose is the case where that matters.
+- **F20's numbers are chosen, not derived.** 100 running rows, 30 finished ones. And when running rows are
+  dropped, the ones kept are the first in the table — the oldest — which is a decision with no test saying it
+  is wrong either way. `details.tasks`/`structuredContent.tasks` are still uncapped: 300 tasks is 300
+  structured entries for a codemode caller, and nothing bounds that.
+- **F21's `pid: -1`.** `writeMeta` records `proc.pid ?? -1`; such a record is "usable" under the new rule,
+  reads as dead with no group, and is deleted. If "we never knew the pid" should be left alone rather than
+  deleted, `-1` is the case to argue about, and it is one comparison away.
+- **F19's one silent path is unchanged:** `appendToLog` swallows its failure, so the `failed to start command
+  with …` note for a session whose log dir broke _between_ the check and the spawn is lost entirely and the
+  command reports 127 with no explanation. Also: `unusableLogDir` runs `ensureLogDir()` per command, which
+  runs `tightenPrivate(LOG_DIR)` — a chmod on a file sitting in the log dir's place.
+- Carried forward, unchanged: everything in pass 3's list that is still open, including
+  `stopLeftoverGroup`'s early `return false`, `tightenPrivate` on another live runtime's files, the
+  recycled-`ownerPid` rule, Pi's `/bin/bash` → `bash` → `sh` fallback, retention driven by completions, the
+  numbers in a sidecar being trusted by the report, and Windows being POSIX-shaped and unexercised
+  (`PATHEXT` is still not consulted, so a configured `shellPath: "bash"` there finds only a file literally
+  named `bash`).
+
+### Harness notes
+
+- **Marker sleeps added this pass: 201 (`log-dir-unusable`), 205 (`wait-listing-overflow`), 209
+  (`env-hermetic`).** The sidecar file reuses 197 for its new `it.each` (same file, same shape).
+- **A Vitest `setupFiles` entry runs before the test file is imported**, which is what makes it able to
+  affect a module-level `process.env` read in the extension a test file imports statically. If a pass wants
+  to add to the scrubbed list, do it in `EXTENSION_CONFIG_ENV_KEYS` and the two consumers follow.
+- **A second load of a package that reads configuration at module load needs `vi.resetModules()` in the same
+  file**, even for harness-level tests: the first `loadExtension` in the file already imported the module, and
+  a `env:` value given to a later load is simply ignored. That is how the new `env-hermetic` pin was found.
+- **`wait-listing-overflow` now holds 104 concurrent `sleep 205` tasks.** The quit shutdown signals them all
+  before awaiting any, so it costs one grace window, not 104: that test — 104 spawns, the listing, the
+  shutdown — runs in under 0.9 s. If a future pass pushes the number up, that is the property to re-measure
+  rather than assume.
+- **Run the suite in a hostile shell too** (`PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md
+  PI_BG_TASKS_KEEP_RUNNING=0 npm test`). It is the only way to see a hermeticity regression, and one test
+  file's leak (a load never disposed) now shows up as another package's failure rather than as nothing.

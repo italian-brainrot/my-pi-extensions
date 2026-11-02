@@ -91,6 +91,76 @@ export interface LoadOptions {
 }
 
 /**
+ * Every environment variable an extension in this repository reads as configuration.
+ *
+ * A load is a fresh runtime, so the harness owns its environment: what the shell the tests run in exports
+ * must not reach an extension unless the test asks for it by name in `env:`. It did before, and the suite
+ * then meant different things in different shells — `PI_TAKEOVER_MAX_CHAIN=100` in a `.bashrc`, or
+ * `PI_MEMORY_FILENAME` set for one project, fails tests in packages no change touched. This is the guard
+ * `pi-bg-tasks` already applies to the commands it spawns ("no `PI_*` leftovers from a parent pi process"),
+ * pointed at the test process.
+ *
+ * `test/repo.test.ts` checks this list against what the packages read, so a new variable cannot join an
+ * extension without joining it here.
+ */
+export const EXTENSION_CONFIG_ENV_KEYS = [
+  "PI_BG_TASKS_KEEP_RUNNING",
+  "PI_MEMORY_DEBUG",
+  "PI_MEMORY_FILENAME",
+  "PI_MEMORY_MAX_BYTES",
+  "PI_SUBAGENT_DEPTH",
+  "PI_SUBAGENT_MAX_DEPTH",
+  "PI_TAKEOVER_CONFIRM",
+  "PI_TAKEOVER_DEBUG",
+  "PI_TAKEOVER_MAX_CHAIN",
+  "PI_TAKEOVER_NAME",
+] as const;
+
+/**
+ * Keys that are not an extension's own configuration, so an ambient one is either meaningless or the thing
+ * under test: `PI_CODING_AGENT_DIR` is set by `loadExtension` itself, and the session variables are Pi's,
+ * which `pi-bg-tasks` clears from the environment of every command it starts and re-derives from the context.
+ */
+export const HOST_ENV_KEYS = [
+  "PI_CODING_AGENT_DIR",
+  "PI_SESSION_ID",
+  "PI_SESSION_FILE",
+  "PI_PROVIDER",
+  "PI_MODEL",
+  "PI_REASONING_LEVEL",
+] as const;
+
+/**
+ * Scrubbed for as long as any load is alive.
+ *
+ * Counted rather than per-load because the variables are read at different times — `PI_BG_TASKS_KEEP_RUNNING`
+ * at call time, pi-takeover's at module load — and because two loads can be alive at once and disposed in any
+ * order: a per-load snapshot restored by the first dispose would put the shell's value back under a load that
+ * is still running.
+ */
+let activeLoads = 0;
+let ambientConfigEnv: Record<string, string | undefined> | undefined;
+
+function beginLoadEnvironment(): void {
+  ambientConfigEnv ??= {};
+  for (const key of EXTENSION_CONFIG_ENV_KEYS) {
+    if (!(key in ambientConfigEnv)) ambientConfigEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+  activeLoads++;
+}
+
+function endLoadEnvironment(): void {
+  activeLoads = Math.max(0, activeLoads - 1);
+  if (activeLoads > 0 || !ambientConfigEnv) return;
+  for (const [key, value] of Object.entries(ambientConfigEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  ambientConfigEnv = undefined;
+}
+
+/**
  * Load one extension in isolation.
  *
  * The agent dir is a temp directory, so anything the extension derives from `getAgentDir()`
@@ -112,6 +182,9 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
   const ownsCwd = options.cwd === undefined;
 
   const savedEnv: Record<string, string | undefined> = {};
+  // Scrubbed before anything is read, and before the test's own `env:` is applied, so a named value wins and
+  // the shell's value is what goes back when the last load in the file is disposed.
+  beginLoadEnvironment();
   const envKeys = ["PI_CODING_AGENT_DIR", ...Object.keys(options.env ?? {})];
   for (const key of envKeys) {
     savedEnv[key] = process.env[key];
@@ -202,6 +275,7 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
     await factory(api);
   } catch (error) {
     disposeState = false;
+    endLoadEnvironment();
     if (ownsAgentDir) rmSync(agentDir, { recursive: true, force: true });
     if (ownsCwd) rmSync(cwd, { recursive: true, force: true });
     throw error;
@@ -254,6 +328,7 @@ export async function loadExtension(options: LoadOptions): Promise<LoadedExtensi
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+      endLoadEnvironment();
       if (ownsAgentDir) rmSync(agentDir, { recursive: true, force: true });
       if (ownsCwd) rmSync(cwd, { recursive: true, force: true });
     },
