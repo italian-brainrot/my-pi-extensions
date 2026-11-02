@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { EXTENSION_CONFIG_ENV_KEYS } from "./config-env.mjs";
 
 export type ToolExecute = (
   toolCallId: string,
@@ -91,8 +92,10 @@ export interface LoadOptions {
 }
 
 /**
- * Every environment variable an extension in this repository reads as configuration.
+ * The scrub list lives in `config-env.mjs`, shared with the dev scripts that spawn a real `pi`; see
+ * `test/repo.test.ts`, which keeps it in step with what the packages read.
  *
+ * `EXTENSION_CONFIG_ENV_KEYS` are every variable an extension in this repository reads as configuration.
  * A load is a fresh runtime, so the harness owns its environment: what the shell the tests run in exports
  * must not reach an extension unless the test asks for it by name in `env:`. It did before, and the suite
  * then meant different things in different shells — `PI_TAKEOVER_MAX_CHAIN=100` in a `.bashrc`, or
@@ -100,35 +103,10 @@ export interface LoadOptions {
  * `pi-bg-tasks` already applies to the commands it spawns ("no `PI_*` leftovers from a parent pi process"),
  * pointed at the test process.
  *
- * `test/repo.test.ts` checks this list against what the packages read, so a new variable cannot join an
- * extension without joining it here.
+ * `HOST_ENV_KEYS` are not an extension's configuration: `PI_CODING_AGENT_DIR` is set by `loadExtension`
+ * itself, and the session variables are Pi's, which a `pi` running this suite has set for its extensions.
  */
-export const EXTENSION_CONFIG_ENV_KEYS = [
-  "PI_BG_TASKS_KEEP_RUNNING",
-  "PI_MEMORY_DEBUG",
-  "PI_MEMORY_FILENAME",
-  "PI_MEMORY_MAX_BYTES",
-  "PI_SUBAGENT_DEPTH",
-  "PI_SUBAGENT_MAX_DEPTH",
-  "PI_TAKEOVER_CONFIRM",
-  "PI_TAKEOVER_DEBUG",
-  "PI_TAKEOVER_MAX_CHAIN",
-  "PI_TAKEOVER_NAME",
-] as const;
-
-/**
- * Keys that are not an extension's own configuration, so an ambient one is either meaningless or the thing
- * under test: `PI_CODING_AGENT_DIR` is set by `loadExtension` itself, and the session variables are Pi's,
- * which `pi-bg-tasks` clears from the environment of every command it starts and re-derives from the context.
- */
-export const HOST_ENV_KEYS = [
-  "PI_CODING_AGENT_DIR",
-  "PI_SESSION_ID",
-  "PI_SESSION_FILE",
-  "PI_PROVIDER",
-  "PI_MODEL",
-  "PI_REASONING_LEVEL",
-] as const;
+export { EXTENSION_CONFIG_ENV_KEYS, HOST_ENV_KEYS } from "./config-env.mjs";
 
 /**
  * Scrubbed for as long as any load is alive.

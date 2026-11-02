@@ -77,6 +77,15 @@ real session, not assumed.
   throwing"). An extension re-implementing a host tool must read the two scopes key by key and treat
   "unset" as "the key is missing", never as "the value is empty".
 
+- The first session of any pi process starts with `session_start` reason `startup` — including one
+  launched with `--resume <file>` or `--session`: `main.js` computes `isInitialRuntime =
+  sessionStartEvent === undefined` and `createAgentSession` defaults the event to `startup`. `new`,
+  `resume` and `fork` are only emitted by a session replacement inside a live process, `reload` by
+  `/reload`. Outgoing mirror: `AgentSessionRuntime.newSession` tears the replaced session down with
+  `session_shutdown` reason `"new"`, never `quit`, so a handler that drops queued work on
+  `quit | resume | fork` must exclude `"new"` or it destroys its own takeover mid-apply. Anything keyed to
+  "a run began" keys on those events, not on the process.
+
 ## MEMORY.md itself
 
 pi-memory renders this file once per session and re-renders only at a session boundary, so an edit here

@@ -22,7 +22,7 @@ The 13 red tests sit in `test/queue-ownership.test.ts` (6), `test/chain-run.test
 `test/extension.test.ts` (4), `test/handoff.test.ts` (1).
 
 The shape of the pass: the queue and the chain are on disk so that they outlive a `/reload`, but the code
-that *mutates* them reads module-level memory, which does not survive a `/reload`. That is one root cause
+that _mutates_ them reads module-level memory, which does not survive a `/reload`. That is one root cause
 with three symptoms (F1, F2, F3), and it had survived the suite because the only reload test in the file
 never actually reloaded (F9).
 
@@ -75,7 +75,7 @@ and the prompt kept its `discarded-*.md` copy.
 
 Two halves, both in the module-level `pending`:
 
-- `peekHandoff()` copies whatever is in `pending.json` into `pending` *before* comparing session keys, and
+- `peekHandoff()` copies whatever is in `pending.json` into `pending` _before_ comparing session keys, and
   returns `undefined` on a mismatch. So a peek in an unrelated session — a settle there, the `/takeover`
   status command — parks another session's handoff in memory;
 - `discardHandoff()` then mutates that memory without asking who owns it: `input`, `session_shutdown`,
@@ -209,3 +209,133 @@ the cap, and a scenario can be silently changed by the shell it was typed in —
 No red test (it would mean spawning a real `pi` inside a test to check a dev script). Direction: move the
 scrub list out of `test/helpers/extension.ts` into a plain `.mjs` module both the harness and the scripts
 import, apply it in `extension-smoke.mjs`, and print the effective configuration at the top of a run.
+
+---
+
+## Pass 2 — fixer
+
+Started from `b8c6309` (326 green, 14 red). Finished: **344 green, 1 red** — the 13 red tests are green,
+and the only failure left is `test/pins.test.ts` (installed pi 1.5.0 vs the repo's 1.4.0 pins), untouched
+as instructed. One more pre-existing `npm run check` failure was quietly fixed: `AUDIT.md` as committed was
+not biome-clean (`*mutates*` → `_mutates_`), so `npm run lint` was red at the baseline too; `npm run fmt`
+normalized it, and it will keep normalizing this file.
+
+### The root cause, fixed once
+
+The module-level `let pending` is gone. **The queue is the file**: `readHandoff()` reads `pending.json` and
+nothing caches it, so there is no queue a `/reload` can hide from. That deletes F1 and F2 by construction
+rather than by adding a restore to each handler, and it makes every question about the queue cost one small
+file read (they are asked a handful of times per event, never in a loop).
+
+On top of it, ownership is explicit (F3):
+
+- `ownedHandoff(ctx)` — the queued handoff, and only when `handoff.sessionKey === sessionKey(ctx)`. A
+  foreign one is returned as nothing, untouched. It is now the only way anything reaches the queue: the
+  tool, the settle, `input`, `session_shutdown`, and all three commands.
+- The mutators are handed the thing they mutate — `claimHandoff(handoff)`, `putHandoffBack(handoff)`,
+  `discardHandoff(handoff, reason)` — and each re-reads first: if the file now holds a different `id`, they
+  do nothing. A mutator can no longer destroy a handoff that arrived after it was handed one.
+
+F1/F2/F4 were fixed by making the README's guard-rail claims true rather than by rewriting them. The header
+comment gained three paragraphs (the chain is one run; the queue is the file; a handoff belongs to the
+session that queued it) because those are now the invariants the code is built on.
+
+### Per finding
+
+- **F1, F2** — fixed by the above. The `input` handler and the `quit | resume | fork` branch of
+  `session_shutdown` now ask the file through `ownedHandoff(ctx)`. The `input` comment also records why
+  `/new` cannot be caught there (Pi dispatches commands before the input handlers), which is what pushes
+  that case into F4's reset.
+- **F3** — `ownedHandoff` plus the id-guarded mutators. Extra hardening in the same spirit: `queueHandoff`
+  pushes whatever is in the file, and if that handoff belongs to another session its prompt is written to
+  `discarded-*.md` before it is displaced, because destroying it is not this session's to do silently.
+  Covered by a new test in `test/chain-lineage.test.ts`.
+- **F4** — `session_start` resets the chain when the reason is `startup` or `new` **and** the session has no
+  takeover lineage (`lineageOf(ctx)`), which is the lineage-aware form the direction asked for. Chose not
+  to reset on `resume`/`fork`/`reload`: a chain survives a resume of the session it is standing in, and
+  `/reload` keeps the queue, so it keeps the count too. This is safe for a launched-and-resumed process
+  because the _first_ session of any pi process gets reason `startup` even under `--resume <file>` (recorded
+  in `MEMORY.md`).
+
+  Related, and new behaviour of mine: `nextChainPosition(ctx)` now takes the session, and the chain's
+  `used` count is `max(chain.json.count, this session's lineage position)`, with `chainId` preferring the
+  lineage's id over the file's. Without that, F4's reset and the input-reset give any other session sharing
+  the agent dir the power to zero the counter under a session that is mid-chain, and the cap — the loop's
+  only brake — could be walked straight through. `test/chain-lineage.test.ts` covers the position, the id,
+  and that a user-invoked `/takeover` still starts a chain at 1 whatever the lineage says.
+- **F5** — believed the README. `renderSection` adds a chain line: `takeover #N of C allowed in this chain;
+  K more will start, then the tool refuses`, a "the cap is reached, finish here and report" variant at the
+  cap, and "in a chain with no cap" when `maxChain` is 0 (which is what keeps the `no 0` test honest). Still
+  derived only from the lineage entry, so it stays byte-identical across runs of that session; verified in
+  the smoke output, where the section reaches a real model call.
+- **F6** — `notify(replacement ?? ctx, message, "error")`. `api` is still what _sends_ the fallback prompt,
+  because Pi gives `sendUserMessage` to the API and to a replacement context, never to a command context;
+  the two targets are now separate variables (`sender` / the notify target) instead of one `target`.
+- **F7** — the age check now lives in `ownedHandoff` and announces itself, so every path that finds a stale
+  handoff (settle, input, shutdown, the three commands) reports it once and retires it. Chose a UI notice
+  only, like the interrupted-run drop next to it, not a message into the session: a queued handoff that has
+  sat for an hour is not a reason to start a run.
+- **F8** — `MAX_DISCARDED_PROMPTS = 20`, pruned by mtime after every write, whole sweep wrapped in one
+  `try` so a vanishing file never costs the newest copy. `pi-bg-tasks`' `MAX_RETAINED_LOGS` was the model,
+  with no age rule and no throttle: at ≤ 20 files a scan is free.
+- **F9** — kept the tester's `resetModules` calls; added the sharper lesson to `docs/testing.md` ("a test
+  that models a `/reload` has to actually reload", with the paired assertion that distinguishes the two:
+  delete the file between loads and expect the second load to have forgotten it).
+- **F10** — the scrub list moved to `test/helpers/config-env.mjs` (with `config-env.d.mts` beside it:
+  `tsc` with no `allowJs` cannot type an imported `.mjs`, and the scripts are plain `node`, so a `.d.mts`
+  is the one arrangement that serves both — Node 22 here also cannot import a `.ts` from a `.mjs`).
+  `extension.ts` re-exports it, `hermetic-env.ts` imports it directly, and `extension-smoke.mjs` scrubs
+  both lists out of the `pi` it spawns, prints `config: …` and `scrubbed from this shell: …` before the run,
+  and cleans its temp dirs on `exit`/`SIGINT`/`SIGTERM` (the interrupted run used to leak them).
+  Guarded without a process: `test/repo.test.ts` now requires any script that spawns **and** makes a temp
+  dir to import the scrub list and to not spread `...process.env`. `scripts/dev.mjs` is deliberately outside
+  that rule — it starts the user's own pi, where their configuration is the point.
+
+Verified from this shell (`PI_TAKEOVER_MAX_CHAIN=100` exported by `.bashrc`): the printed config line says
+`PI_TAKEOVER_MAX_CHAIN unset`, the lineage entries say `"maxChain":12`, and the tool says
+`takeover 1/12`. Also ran the suite hostile:
+`PI_TAKEOVER_MAX_CHAIN=100 PI_MEMORY_FILENAME=HOST-NOTES.md PI_BG_TASKS_KEEP_RUNNING=0 npx vitest --run`
+→ the same 344 green / 1 pin red, and `ls /tmp` after it is empty of `pi-ext-`/`takeover-`/smoke dirs.
+
+### Decided against
+
+- Re-pinning pi, or touching `test/pins.test.ts`.
+- A test that spawns a real `pi` to check the smoke script: the assertion would either be a fixed sleep
+  (flaky on a loaded runner) or vacuous if the flow had not finished. The static guard + the manual run
+  above is what stands in for it.
+- Making the chain expire by age. A chain is now a run, so age barely matters, and a second rule for when a
+  counter resets is a second thing to get wrong.
+- Letting an `input` in a session that does not own the chain skip the chain reset. The chain is per agent
+  dir and has no owner to check; "a human typed something in this pi" is the rule the README states, and the
+  queue — the part that can actually be owned — is protected.
+- Turning the queue into a list so two sessions can each have a handoff. The state folder has never
+  supported that, the README says the queue holds one, and F3's rule is about not destroying what is not
+  yours, not about sharing.
+
+### For the next tester
+
+Things that are now true and were not, so they are worth attacking:
+
+1. Every read of the queue goes to disk. A test can write `pending.json` by hand and the extension will
+   answer to it in that same load — `sessionKey` is `file:<sessionFile>` or `id:<sessionId>` or the literal
+   `session:unknown`; anything that makes two contexts share a key shares a handoff.
+2. `claimHandoff`/`putHandoffBack`/`discardHandoff` no-op when the file holds a different `id`. A handoff
+   object obtained before something else moved the queue is inert — including inside `applyTakeover`, which
+   claims before it confirms, so a `PI_TAKEOVER_CONFIRM` decline re-arms a handoff only if the queue is
+   empty or still holding it.
+3. `nextChainPosition(ctx)` = `max(file.count, lineage.position) + 1`, `chainId` = lineage's, else the
+   file's, else new. A lineage entry with a large `position` therefore raises the count for that session
+   only; the file is still what other sessions read, and the tool's advertised position (from
+   `nextChainPosition`) and the position written at apply time are computed separately, in two different
+   contexts, which may not agree if the session changes between them.
+4. The chain reset fires at `session_start` on `startup`/`new` when `lineageOf(ctx)` is undefined. What
+   counts as lineage is "the last `custom`/`takeover` entry on `getBranch()` with a numeric `position`" —
+   an entry with `position` missing is not lineage, so such a session resets the chain even if it arrived by
+   takeover.
+5. The expiry notice comes out of `ownedHandoff`, so it fires from `/takeover` with no arguments too, and
+   it is UI-only: in `--print`/`--no-session` modes nothing says it at all.
+6. `pruneDiscardedPrompts` keeps 20 by mtime and only ever looks at `discarded-*.md`. A file the user puts
+   in that folder under a different name is never touched; one named `discarded-x.md` is fair game.
+7. The smoke script's own knobs are now scrubbed. Its scenario still re-applies `PI_TAKEOVER_DEBUG` from
+   the shell on purpose, and nothing else has a way through — so a smoke run cannot be told to use another
+   cap without editing the scenario.

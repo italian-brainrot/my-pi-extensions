@@ -11,6 +11,11 @@
  * and no dependency on what model you normally use. Everything — agent dir, working dir, sessions —
  * goes into a temporary folder that is removed on the way out.
  *
+ * The `pi` this spawns gets a scrubbed environment: every variable an extension here reads as
+ * configuration is removed before the scenario's own `env` is applied, so a `PI_TAKEOVER_MAX_CHAIN` in a
+ * `.bashrc` — or the `PI_SESSION_*` of the pi this script is typed into — cannot silently change what is
+ * being run. The configuration in force is printed at the top, because a smoke run is read by a human.
+ *
  * Useful for seeing a flow that unit tests can only describe: which session replaced which, what the
  * incoming agent was actually shown, and what landed in the transcript.
  */
@@ -20,6 +25,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EXTENSION_CONFIG_ENV_KEYS, withoutScrubbedEnv } from "../test/helpers/config-env.mjs";
 
 const repoRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
 const packageArg = process.argv.slice(2).find((arg) => !arg.startsWith("-")) ?? "pi-takeover";
@@ -38,6 +44,8 @@ const SCENARIOS = {
       },
       { respond: { toolCall: { name: "takeover", arguments: { prompt: "REVIEW: check the change and report blockers." } } } },
     ],
+    // The one knob of the package this script re-reads from the shell, and the only one it lets through
+    // the scrub: `PI_TAKEOVER_DEBUG=1 npm run smoke -- pi-takeover` is how the run is meant to be made loud.
     env: { PI_TAKEOVER_DEBUG: process.env.PI_TAKEOVER_DEBUG ?? "1" },
     // A model switch first: it belongs to the session that made it, so a takeover has to carry it over.
     setup: [
@@ -68,23 +76,72 @@ const agentDir = mkdtempSync(join(tmpdir(), `${packageArg}-smoke-agent-`));
 const cwd = mkdtempSync(join(tmpdir(), `${packageArg}-smoke-cwd-`));
 const logPath = join(agentDir, "model-calls.jsonl");
 
+// The run is disposable, and a script a human interrupts should leave nothing behind.
+let cleanedUp = false;
+function cleanup() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  rmSync(agentDir, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+}
+process.on("exit", cleanup);
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    child.kill("SIGKILL");
+    cleanup();
+    process.exit(0);
+  });
+}
+
 const bundledPi = join(repoRoot, "node_modules", ".bin", "pi");
 const pi = process.env.PI_BIN ?? (existsSync(bundledPi) ? bundledPi : "pi");
 
+const scrubbed = withoutScrubbedEnv(process.env);
+const childEnv = {
+  // Scrubbed first, so the shell this is typed into cannot configure the extension behind the scenario.
+  ...scrubbed.env,
+  ...scenario.env,
+  PI_CODING_AGENT_DIR: agentDir,
+  PI_OFFLINE: "1",
+  PI_SKIP_VERSION_CHECK: "1",
+  PI_TELEMETRY: "0",
+  PI_FAKE_RULES: JSON.stringify(scenario.rules),
+  PI_FAKE_LOG: logPath,
+};
+
 const child = spawn(pi, ["--mode", "rpc", "--model", "fake/fake", "-ne", "-e", extension, "-e", fakeModel], {
   cwd,
-  env: {
-    ...process.env,
-    ...scenario.env,
-    PI_CODING_AGENT_DIR: agentDir,
-    PI_OFFLINE: "1",
-    PI_SKIP_VERSION_CHECK: "1",
-    PI_TELEMETRY: "0",
-    PI_FAKE_RULES: JSON.stringify(scenario.rules),
-    PI_FAKE_LOG: logPath,
-  },
+  env: childEnv,
   stdio: ["pipe", "pipe", "inherit"],
 });
+
+/**
+ * The configuration variables the package under test reads, read out of its source the same way
+ * `test/repo.test.ts` does. A smoke run is read by a human, and the numbers it prints are only worth
+ * anything if the environment they were produced in is named: an ambient `PI_TAKEOVER_MAX_CHAIN` used to
+ * reach the extension, and every lineage entry reported the shell's cap instead of the extension's.
+ */
+function configurationKeysOf(dir) {
+  const read = new Set();
+  for (const file of readdirSync(dir, { recursive: true })) {
+    if (!String(file).endsWith(".ts")) continue;
+    const text = readFileSync(join(dir, String(file)), "utf8");
+    for (const match of text.matchAll(/process\.env\.(PI_[A-Z0-9_]+)\b/g)) {
+      if (EXTENSION_CONFIG_ENV_KEYS.includes(match[1])) read.add(match[1]);
+    }
+  }
+  return [...read].sort();
+}
+
+console.log(`pi: ${pi}`);
+console.log(`agent dir: ${agentDir}`);
+console.log(
+  `config: ${configurationKeysOf(join(packageDir, "src"))
+    .map((key) => (childEnv[key] === undefined ? `${key} unset` : `${key}=${childEnv[key]}`))
+    .join(", ")}`,
+);
+const inherited = scrubbed.removed.filter((key) => !(key in scenario.env));
+if (inherited.length) console.log(`scrubbed from this shell: ${inherited.join(", ")}`);
 
 let buffer = "";
 /** Ids of the rpc commands this script has seen the answer to, so the next one can wait for its turn. */
@@ -181,8 +238,7 @@ setTimeout(
     child.stdin.end();
     await new Promise((resolveExit) => child.once("close", resolveExit));
 
-    rmSync(agentDir, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    cleanup();
   },
   Number(process.env.SMOKE_MS ?? 12_000),
 );

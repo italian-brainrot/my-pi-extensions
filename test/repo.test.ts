@@ -123,6 +123,23 @@ describe("the environment the extensions read", () => {
     const read = new Set(envReadByPackages.map(({ key }) => key));
     for (const key of scrubbed) expect(read.has(key), `scrubbed key ${key} is read by no extension`).toBe(true);
   });
+
+  it("is scrubbed by every dev script that starts a throwaway pi", () => {
+    // A dev script prints evidence a human reads, so it has to be as hermetic as the suite: an ambient
+    // `PI_TAKEOVER_MAX_CHAIN` used to reach the `pi` `scripts/extension-smoke.mjs` spawns, and every
+    // lineage entry in its output reported the shell's cap as if it were the extension's.
+    //
+    // `scripts/dev.mjs` is deliberately out: it starts the user's own pi, where their own configuration is
+    // the point. The invariant is about a run pointed at a temporary agent dir — one that owns its whole
+    // environment and prints what it measured.
+    for (const name of readdirSync(resolve(repoRoot, "scripts")).filter((entry) => entry.endsWith(".mjs"))) {
+      const text = readFileSync(resolve(repoRoot, "scripts", name), "utf8");
+      if (!/spawn(Sync)?\(/.test(text) || !/mkdtemp/.test(text)) continue;
+
+      expect(text, `scripts/${name} runs a pi in a temp dir but does not import the scrub list`).toContain("test/helpers/config-env.mjs");
+      expect(text, `scripts/${name} spreads the shell's environment into the pi it spawns`).not.toMatch(/\.\.\.\s*process\.env/);
+    }
+  });
 });
 
 describe.each(packages.map((info) => ({ ...info, title: info.name })))("package $title", (info) => {

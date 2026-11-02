@@ -30,14 +30,18 @@ afterAll(() => ext?.dispose());
 
 - points `PI_CODING_AGENT_DIR` at a **temp agent dir** before importing, so anything the extension
   derives from `getAgentDir()` (log directories, settings lookups) is inside the test;
-- **deletes every extension-owned configuration variable** (`EXTENSION_CONFIG_ENV_KEYS` in the harness)
-  for the lifetime of the load, and puts the shell's values back when the last load in the file is
-  disposed. An ambient `PI_TAKEOVER_MAX_CHAIN` or `PI_MEMORY_FILENAME` therefore reaches an extension only
-  when the test names it in `env:` — read at module load or at call time. `test/helpers/hermetic-env.ts`
-  (a Vitest `setupFiles` entry) deletes the same list before each test file is imported, which covers the
-  three ways a load-time scrub cannot reach: a test file that imports its extension's source directly, Pi's
-  own loader in `test/load.test.ts`, and a child process a test starts, such as the real `pi` of
-  `pi-takeover`.
+- **deletes every extension-owned configuration variable** for the lifetime of the load, and puts the
+  shell's values back when the last load in the file is disposed. An ambient `PI_TAKEOVER_MAX_CHAIN` or
+  `PI_MEMORY_FILENAME` therefore reaches an extension only when the test names it in `env:` — read at
+  module load or at call time. `test/helpers/hermetic-env.ts` (a Vitest `setupFiles` entry) deletes the
+  same list before each test file is imported, which covers the three ways a load-time scrub cannot reach:
+  a test file that imports its extension's source directly, Pi's own loader in `test/load.test.ts`, and a
+  child process a test starts, such as the real `pi` of `pi-takeover`. The list itself lives in
+  `test/helpers/config-env.mjs` (a plain `.mjs` module with a `.d.mts` beside it, so `tsc` can see it and
+  a plain `node` script can import it), because the dev scripts that start a throwaway `pi` —
+  `scripts/extension-smoke.mjs` — have to scrub exactly what the suite scrubs. `test/repo.test.ts` checks
+  both: that the list matches what the packages read, and that any script which spawns a `pi` in a
+  temporary agent dir imports the list instead of spreading `process.env`.
 - imports the package entry point and calls its factory with a **recording `ExtensionAPI`** built on
   a Proxy: `registerTool`, `on`, `registerCommand`, and friends are captured, and any other member
   throws with a message telling you to add it to the harness, so tests never silently skip a code
@@ -85,6 +89,11 @@ The same fixture drives the manual version, which prints the whole flow instead 
 ```bash
 npm run smoke -- pi-takeover
 ```
+
+That `pi` gets a scrubbed environment (the same list as the suite, plus Pi's own `PI_SESSION_*`), and the
+run prints what it was configured with before anything happens — a smoke run is read as evidence, so the
+shell it was typed in has to be named. `PI_TAKEOVER_DEBUG` is the exception the scenario re-applies on
+purpose.
 
 ## Repo-level tests
 
@@ -136,6 +145,14 @@ per-component costs, and that context size is the largest single response rather
   from `getAgentDir()` at import time belongs to the _earlier_ load, so files land somewhere the
   test is not looking and every assertion on them is ENOENT. When a test asserts on such a path,
   pass an explicit `agentDir` (from `makeTempDir()`) to every load and reset modules before each one.
+- **A test that models a `/reload` has to actually reload.** Same cause as the last gotcha, but it fails
+  silently in the other direction: a second `loadExtension()` without `vi.resetModules()` hands back the
+  same module instance, so the test proves that a module-level variable survived a call to a helper. Any
+  assertion about behaviour that only exists on disk — a queue `pending.json` still holds — passes for the
+  wrong reason, and the module state the test was pretending to replace goes on masking bugs. The way to
+  tell a real reload from a cached one is an assertion the cached module cannot pass: delete the file
+  between the two loads and expect the second load to have forgotten it
+  (`packages/pi-takeover/test/extension.test.ts`).
 - **Environment is process-wide.** Load options set `process.env` before import and restore it in
   `dispose()`. Do not rely on env changes made after a load to affect module-level constants.
 - **The suite is hermetic against the shell that runs it.** Every package reads configuration from

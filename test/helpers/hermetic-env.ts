@@ -19,6 +19,6 @@
  * `test/repo.test.ts` keeps the list in step with what the packages actually read.
  */
 
-import { EXTENSION_CONFIG_ENV_KEYS } from "./extension.ts";
+import { EXTENSION_CONFIG_ENV_KEYS } from "./config-env.mjs";
 
 for (const key of EXTENSION_CONFIG_ENV_KEYS) delete process.env[key];
