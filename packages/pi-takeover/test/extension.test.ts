@@ -235,12 +235,19 @@ describe("what the incoming session is told", () => {
     prompt: HANDOFF,
   };
 
+  // One session file per lineage, and one counter to mint them. `sectionBySession` is keyed by session and
+  // this file loads the extension once, so every lineage built over the same session file after the first is
+  // never rendered: the cache answers with the first test's section and the assertions below end up about
+  // text this test did not cause. (Pass 3 found the no-cap test passing that way.)
+  let lineageSessions = 0;
+
   function sessionWithLineage(data: unknown = lineage) {
+    const file = `/tmp/incoming-${++lineageSessions}.jsonl`;
     return ext.makeContext({
-      sessionFile: "/tmp/incoming.jsonl",
+      sessionFile: file,
       sessionManager: {
-        getSessionFile: () => "/tmp/incoming.jsonl",
-        getSessionId: () => "incoming",
+        getSessionFile: () => file,
+        getSessionId: () => file,
         getBranch: () => [{ type: "custom", id: "e1", parentId: null, timestamp: new Date().toISOString(), customType: "takeover", data }],
       },
     });
@@ -293,9 +300,27 @@ describe("what the incoming session is told", () => {
       sessionWithLineage({ ...lineage, position: 3, maxChain: 0 }),
     );
 
-    const section = options.sections.takeover;
+    const section = options.sections.takeover!;
     expect(section).toMatch(/\b3\b/);
-    expect(section).not.toMatch(/\b0\b/);
+    // The wording, not just the absence of a digit: "0 more will start" satisfies the line above and is the
+    // thing this setting is meant to avoid.
+    expect(section.toLowerCase()).toContain("no cap");
+  });
+
+  it("says at the cap that no further takeover will start", async () => {
+    // Added in pass 3: the section is how an agent in an unattended loop learns the brake is down. The
+    // last session of a chain is the one that has to be told to wind down rather than hand off.
+    const options = { sections: {} as Record<string, string> };
+    await ext.emit(
+      { type: "before_agent_start", messageType: "user", prompt: HANDOFF, systemPrompt: "", systemPromptOptions: options },
+      sessionWithLineage({ ...lineage, position: 12, maxChain: 12 }),
+    );
+
+    const section = options.sections.takeover!;
+    expect(section).toMatch(/\b12\b/);
+    expect(section.toLowerCase()).toMatch(/no further|no more|reached|finish/);
+    // "0 more will start" would be the other way to say it, and is not what this branch does.
+    expect(section).not.toMatch(/0 more/);
   });
 
   it("adds nothing to a session that did not arrive by handoff", async () => {

@@ -339,3 +339,223 @@ Things that are now true and were not, so they are worth attacking:
 7. The smoke script's own knobs are now scrubbed. Its scenario still re-applies `PI_TAKEOVER_DEBUG` from
    the shell on purpose, and nothing else has a way through — so a smoke run cannot be told to use another
    cap without editing the scenario.
+
+---
+
+## Pass 3 — tester
+
+Started from `0aa3320` (344 green, 1 pin red). Finished: **346 green, 9 red** — 8 of the reds written here,
+plus the standing `test/pins.test.ts` failure. Two tests added here are green on purpose (a fence and a
+piece of missing coverage, both marked in place). Reproduce with `npx vitest --run packages/pi-takeover`.
+
+The reds sit in `test/apply-window.test.ts` (3), `test/chain-identity.test.ts` (1 red + 1 fence),
+`test/state-file-names.test.ts` (1), `test/config.test.ts` (3, one `it.each`). One existing test was repaired
+in place (F16) and one green coverage test added to `test/extension.test.ts`.
+
+Aimed at the pass-2 fixes, not at F1–F10. Most of what pass 2 built held up under attack; what did not is
+below. The shape of this pass: pass 2 moved the queue and the chain onto disk and made them the authority,
+and treated the files as the extension's own output. They are also **input** — `pending.json` is written by
+"another pi sharing this agent dir", which the README documents as a supported arrangement, and the design
+notes invite it. Two of the findings are that nothing validates what comes back out of it, and two more are
+windows where the disk copy is deliberately absent.
+
+### F11 — a handoff's `id` names a file, so a hand-written `pending.json` writes outside the state folder
+
+`discardHandoff()` names the copy after the handoff: `discarded-` plus the `id` field read out of the queue
+file, joined onto the state dir. `readHandoff()` checks that `id` is a non-empty string and nothing else,
+and `join` resolves `..` like any other segment. So a queue file whose id is `../../../../escape` makes the
+extension write a `.md` wherever the user running pi can write — three levels above the state folder, or as
+far as the id wants.
+
+That is a write primitive for any process that can write the state folder, which by design is more than one.
+It also breaks the promise that does not smell like security: the prompt is then _not_ in the folder the
+README and the extension's own notifications both point at ("The prompt is kept in the takeover state
+folder"), and `pruneDiscardedPrompts()` never sees it, since it reads `readdirSync(STATE_DIR)`.
+
+Same family, same fix: `readHandoff()` accepts any string `queuedAt`, so `ownedHandoff`'s age check runs on
+whatever `Date.parse` makes of it — `"yesterday"` is read as a timestamp in the current month (the handoff
+is kept, and its real age is unknown), and an unparseable one takes the `!Number.isFinite(age)` branch,
+discards the handoff, and announces "it had waited NaN minutes".
+
+Red: `test/state-file-names.test.ts` — a handoff written by someone else, owned by this session, with a
+path for an id; dropped through `/takeover-cancel`; the escaped path must not exist. It does:
+
+```
+AssertionError: dropping a handoff wrote outside the state folder: /tmp/pi-takeover-escape.md
+```
+
+Direction: validate the shape where it is read, not where it is used — a `pending.json` whose `id` is not a
+single safe token (`/^[A-Za-z0-9._-]+$/` or a UUID) is malformed, exactly like a missing `sessionKey`, and
+`queuedAt` should be parsed once, rejected if it is not a date. If instead the file name is sanitized while
+the handoff is kept, say so in the header comment: "left exactly where it is" and "sanitised on the way to
+disk" are different promises.
+
+### F12 — a handoff waiting for its confirmation exists nowhere on disk, and in rpc mode it never stops waiting
+
+`applyTakeover()` calls `claimHandoff()` — deleting `pending.json` — _before_ the `PI_TAKEOVER_CONFIRM`
+dialog. The prompt then lives only in the closure, and the chain file is not written until after the answer.
+Nothing recovers it:
+
+- Pi's rpc `ui.confirm` is `createDialogPromise(undefined, false, …)`: no timeout, no signal (pi-takeover
+  passes no `opts`), and it resolves only when the client answers `extension_ui_request`. An unattended rpc
+  driver — which is how this extension is driven, and what `session.test.ts` and `extension-smoke.mjs` are —
+  never answers. The takeover never happens, and there is nothing left on disk to find.
+- `session_shutdown` then finds an empty queue and drops nothing, so even a `/quit` leaves no
+  `discarded-*.md`, while the README promises "a prompt is never lost just because a session ended".
+- If the queue is taken by another session during the dialog, the decline's `putHandoffBack()` correctly
+  stands aside (different `id`) — and the handoff this session had is then gone from the queue, from memory
+  and from disk, while the session has just been told "the handoff is still queued".
+
+Evidence against a real `pi --mode rpc` with `PI_TAKEOVER_CONFIRM=1` and the scripted model: one
+`extension_ui_request` with `method":"confirm"` sent, `state folder: []`, `session files: 1`, `model calls: 2`
+— the agent finished its turn, the loop stopped, and the state folder holds neither `pending.json` nor
+`chain.json` nor a copy of the prompt.
+
+Red: `test/apply-window.test.ts`, two tests — while the dialog is open the prompt must be findable in the
+state folder; and after a decline with the queue taken over, the declined prompt must still be findable.
+Both assert one implementation-agnostic invariant: **a handoff stays recoverable until it is actually handed
+to a session.** `claim` after the confirmation (a double-apply is already prevented by `applying`, which the
+confirmation could set first), or write the prompt somewhere before asking. Either way, pass the signal or a
+timeout to `confirm` so a driver that never answers does not park a session forever, and stop telling the
+user a handoff is queued when the queue is empty.
+
+### F13 — the chain reset is gated on the session_start _reason_, so a resumed conversation inherits a spent chain
+
+`session_start` resets `chain.json` only for `startup` and `new`. A session that arrives by `resume` —
+`/resume` in the terminal, `switch_session` over rpc — never starts a fresh chain, whatever it is. For the
+session the chain is standing in that is right. For a _different_ conversation it is F4 again in miniature:
+a driver runs one loop to the cap in a process, switches to another session, and every `takeover` there is
+refused with "this chain already used 12 takeovers and the cap is 12" for takeovers it never made — for the
+whole life of the process, since rpc prompts are `source: "rpc"` and never produce the `input` reset. Only
+`/new` or a restart clears it.
+
+README: "A chain is one run: **a session that did not arrive by takeover starts a new one**." The code reads
+"…starts a new one when it starts a run". One of those two is wrong.
+
+The trap, and why a one-line fix is not enough: "reset whenever `lineageOf(ctx)` is undefined" walks the cap
+straight through. A session loses its takeover entry when its branch is trimmed — `/tree` navigation to
+before the entry, or a fork taken at an earlier point — and it is precisely that session whose count must
+survive. So the rule cannot be "no lineage ⇒ new chain"; it has to name the conversation the chain belongs
+to (`chain.json` already rewrites itself at every apply, so adding the session it belongs to costs one
+field), and reset only when the incoming session is not that one.
+
+Red + fence, `test/chain-identity.test.ts`, both after walking a real chain to a cap of 1:
+- red — `session_start reason: "resume"` for a session with its own transcript: the tool must accept at
+  `takeover 1/1`; today it refuses.
+- green fence — `session_start reason: "resume"` for the session the chain is standing in, with a branch that
+  no longer carries the takeover entry: still refused at the cap. This is what a naive fix breaks; keep it
+  green.
+
+If the answer is instead that the behaviour is right and the README is not, that is a decision the fixer may
+make — but then this test is the one thing in this pass they should rewrite rather than satisfy, and the
+README's sentence has to change with it.
+
+### F14 — `/takeover <prompt>` typed while a replacement is in flight silently does nothing, and leaves an orphan in the queue
+
+`applyTakeover()` returns early when `applying` is already set. The `/takeover <prompt>` command calls
+`queueHandoff()` _before_ `applyTakeover()`, so the human's prompt goes into the queue, the apply refuses,
+and the command reports nothing (the only trace is a `debugLog`). That queue entry is keyed to the session
+the in-flight replacement is about to tear down, so nothing will ever apply it; it sits until the hour-long
+expiry, and then the notice about it goes to a session that has moved on. Slash commands never reach the
+`input` handler, so nothing resets it either.
+
+Reachable through the window `newSession()` leaves — `teardownCurrent` aborts and settles the outgoing run
+before the replacement exists — and in rpc mode a second command is read the moment the first is queued.
+
+Red: `test/apply-window.test.ts` — the third test: with a `newSession()` left open, a user `/takeover` must
+say something to the user (it says nothing: `notices` is empty). Fixing the message is half of it; the other
+half is not leaving a queue entry that belongs to a session that is on its way out.
+
+### F15 — a cap that is not a plain number is read as one, in whichever direction is worst
+
+`configuredCount()` uses `parseInt(value, 10)` and rejects only `NaN` and negatives. `parseInt` stops where
+the string stops, so `PI_TAKEOVER_MAX_CHAIN=0x10` and `0b1` are read as `0` — which this extension spells as
+_no cap at all_ — and `1_000` or `1,000` are read as `1`, which refuses every takeover after the first. No
+warning is printed either way, unlike a value with no digits at all. A typo in the loop's only brake should
+not silently remove the brake.
+
+Red: `test/config.test.ts`, an `it.each` over `0x10`, `1_000`, `1,000`: at 12 takeovers used the refusal must
+name the default cap, 12. Today the first says "Takeover queued" and the others "the cap is 1".
+
+### F16 — the pass-1 F5 section tests stopped rendering (test defect, repaired in place)
+
+Every lineage test in `test/extension.test.ts` builds its context over the same session file, and
+`sectionBySession` is keyed by session and lives in the module the file loads once. So only the _first_
+`before_agent_start` in that describe renders anything; each later one is answered from the cache with the
+first test's text. `does not mention a cap there when the chain has none` was therefore asserting things
+about a section its own lineage never produced — it passed because the cached text happened to contain a 3
+and no 0, and it would still pass if `renderSection` printed `of 0 allowed; -9 more`. Probe: three lineages
+(position 3/maxChain 12, then maxChain 0, then position 12) under one session file all answer with the first
+section, verbatim.
+
+The same trap explains why `tells the incoming session where the chain stands` went red at the pass-1
+baseline and green now: at the baseline the _cached_ text was the old two-line section; now the cached text
+already has the numbers. It is a weak test rather than a false one, but it cannot fail for the lineage it
+builds.
+
+This is the F9 lesson again (a test that models something the code never does), so I repaired it as pass 1
+repaired F9: `sessionWithLineage` now mints one session file per lineage, and the no-cap test asserts the
+wording (`no cap`) rather than the absence of a digit, which is what makes cache poisoning fail loudly. This
+is the one pass-1 test edited in this pass; the numbers it asserts are unchanged.
+
+## Attacked, and holding
+
+Stated so the next pass does not spend time here. Each was probed, not assumed.
+
+- **`sessionKey` cannot collapse.** `SessionManager.getSessionFile()` is undefined only for a non-persisted
+  (`--no-session`) session, and `newSession()` always mints a `sessionId`, so such a session keys as
+  `id:<sessionId>` and each replacement gets a fresh one. `session:unknown` is unreachable in Pi, and two
+  live sessions in one process never share a key. The fallback order is also why an in-memory session's
+  handoff has no `fromSession` — matching what the README says about `--no-session`.
+- **The expiry check firing from `/takeover` with no arguments** is a read that mutates, but it announces
+  itself and retires exactly one handoff, which is what the command is for. Fine.
+- **A malformed `pending.json`** is rejected wholesale (`{}`, `null`, an array, a missing/empty `sessionKey`,
+  a non-string `prompt`/`queuedAt`) — only F11's two fields get through. A directory or an unreadable file
+  reads as no handoff.
+- **The cap cannot be walked through by the session-replacement reasons.** `/reload` and `resume`/`fork` keep
+  the file; `navigateTree` emits no `session_start`; a fork carries the takeover entry (it sits above the
+  first user message, and forking "before" a user message keeps its ancestors); and `nextChainPosition`'s
+  `max(file.count, lineage.position)` makes the count monotone along a lineage. The only walk-through I
+  could construct is the trimmed-branch one that F13's fence exists to block.
+- **`handoff.test.ts`'s "uses the new session when the replacement itself breaks partway" is not vacuous**,
+  which I suspected and checked: the fake's throwing `getSessionFile()` is reached by `sessionKey(next)` on
+  the first line of `withSession`, i.e. after `replacement` is assigned and before the prompt is sent —
+  exactly the branch F6's `replacement ?? ctx` is for. Instrumented: the replacement's `ui.notify` receives
+  "Takeover failed (the first message failed)…".
+- **`renderSection` and the README agree**, including the arithmetic ("#2 of 12 … 10 more will start" from a
+  real smoke run, and the section reaching the model inside `<takeover>…</takeover>`). `maxChain: 0`, the
+  byte-identical-across-runs property, and the deletion for a session with no lineage all behave.
+  `position > cap` and absurd caps are only reachable by hand-editing an entry or a config change mid-chain,
+  which the extension documents as needing a restart — not findings.
+- **The smoke script is clean.** A full run leaves no `pi-ext-`/`takeover-`/`*-smoke-*` directories, its
+  `config:` line reports `PI_TAKEOVER_MAX_CHAIN unset` from a shell that exports 100, and it names the six
+  shell variables it scrubbed. `SIGINT` kills the child and cleans up (`process.on("exit")` plus the signal
+  handlers); no `pi` was left running afterwards.
+- **`chain-lineage.test.ts` survives its own assumptions**: the lineage id beats the file's, the file's count
+  beats the lineage's, and a user-invoked `/takeover` still restarts at 1. `session.test.ts`'s expectations
+  (three session files, positions 1 and 2, `chain.count === 2`, the model and thinking level carried) match
+  what a real run writes, checked against the smoke output line by line.
+
+## Notes, not findings
+
+Things worth knowing that are not currently broken, so the fixer can spend the pass on F11–F16.
+
+1. `test/repo.test.ts`'s dev-script guard has the holes the fixer's note predicted, both latent: its trigger
+   is `/spawn(Sync)?\(/` **and** `/mkdtemp/`, so a script that spawns through an aliased import, `execFile`,
+   `fork`, or a temp dir made by anything other than `mkdtemp*` is invisible to it; and membership in
+   `HOST_ENV_KEYS` is an unconditional pass for a variable a package reads as configuration, while
+   `hermetic-env.ts` deletes only `EXTENSION_CONFIG_ENV_KEYS` — a config variable parked in the host list
+   would be both accepted by the guard and unscrubbed. I did not write red tests for either, since both would
+   mean inventing the offending script.
+2. `packages/pi-takeover/test/session.test.ts` still spreads `...process.env` into the `pi` it starts. It is
+   safe only because `hermetic-env.ts` has already deleted the configuration keys from the test process —
+   the `HOST_ENV_KEYS` (`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_MODEL`, …) of the pi running the suite do
+   reach the child. `config-env.mjs` already exports `withoutScrubbedEnv`; using it there is the cheap fix.
+3. `sectionBySession` assumes one lineage per session for the session's whole life. That holds everywhere
+   except a branch trimmed below the takeover entry, where a non-reloaded session keeps rendering the cached
+   section and a reloaded one renders nothing. Cosmetic; noted because it is the same root as F13's trap.
+4. `capAnnounced` is per module instance, so a `/reload` re-arms the "do not call takeover again" message for
+   a session that already got it. One extra message, and arguably the right thing after a reload.
+5. `refuseAtCap` and the cap at apply time are only reachable through the tool's own queue, since a
+   user-invoked `/takeover` forces position 1 — the human bypasses the brake by design; worth one line in the
+   README's configuration table if it is not already obvious.

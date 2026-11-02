@@ -139,6 +139,19 @@ describe("PI_TAKEOVER_MAX_CHAIN", () => {
     const result = await ext.callTool("takeover", { prompt: HANDOFF }, { context: { sessionFile: OUTGOING } });
     expect(result.isError).toBe(true);
   });
+
+  it.each(["0x10", "1_000", "1,000"])("reads no number at all into %s, and says which cap it settled on", async (value) => {
+    // `parseInt` stops where the string stops, so these are not rejected as the nonsense they are: `0x10`
+    // and `0b1` parse as 0, which is the sentinel for *no cap at all*, and `1_000` parses as 1, which
+    // refuses every takeover after the first. Either way the run is capped by something the user never
+    // wrote, silently. A value that is not a plain run of digits should land on the default, 12, and say so.
+    ext = await loadExtension({ packageDir: packageDir("pi-takeover"), env: { PI_TAKEOVER_MAX_CHAIN: value } });
+    seedChain(ext, 12);
+
+    const result = await ext.callTool("takeover", { prompt: HANDOFF }, { context: { sessionFile: OUTGOING } });
+
+    expect(result.content[0].text, `PI_TAKEOVER_MAX_CHAIN=${value} was read as a cap of its own`).toContain("cap is 12");
+  });
 });
 
 describe("PI_TAKEOVER_NAME", () => {
